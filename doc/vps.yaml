@@ -1,0 +1,277 @@
+# ═══════════════════════════════════════════════════════════════════
+# Clash / Mihomo 配置模板
+# 说明：基于真实 VPS 配置脱敏后生成，所有 YOUR_XXX 占位符需替换为实际值
+# 用法：替换占位符后重命名为 vps.yaml 或导入客户端
+# ═══════════════════════════════════════════════════════════════════
+
+# ── 基础设置 ────────────────────────────────────────────────────
+mixed-port: 7890
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+external-controller: '127.0.0.1:9090'
+unified-delay: true
+tcp-concurrent: true
+
+# ── DNS 配置 ────────────────────────────────────────────────────
+dns:
+    enable: true
+    ipv6: false
+    default-nameserver: [223.5.5.5, 119.29.29.29]
+    enhanced-mode: fake-ip
+    fake-ip-range: 198.18.0.1/16
+    use-hosts: true
+    # 海外服务走 Cloudflare DoH 解析，避免国内 DNS 污染
+    nameserver-policy: { +.google.com: 'https://dns.cloudflare.com/dns-query', +.googleapis.com: 'https://dns.cloudflare.com/dns-query', +.googleapis.cn: 'https://dns.cloudflare.com/dns-query', +.googlevideo.com: 'https://dns.cloudflare.com/dns-query', +.gstatic.com: 'https://dns.cloudflare.com/dns-query', +.youtube.com: 'https://dns.cloudflare.com/dns-query', +.youtu.be: 'https://dns.cloudflare.com/dns-query', +.facebook.com: 'https://dns.cloudflare.com/dns-query', +.twitter.com: 'https://dns.cloudflare.com/dns-query', +.x.com: 'https://dns.cloudflare.com/dns-query', +.github.com: 'https://dns.cloudflare.com/dns-query', +.githubusercontent.com: 'https://dns.cloudflare.com/dns-query', +.openai.com: 'https://dns.cloudflare.com/dns-query', +.chatgpt.com: 'https://dns.cloudflare.com/dns-query', +.anthropic.com: 'https://dns.cloudflare.com/dns-query' }
+    # 国内 DNS（默认）
+    nameserver: ['https://doh.pub/dns-query', 'https://dns.alidns.com/dns-query', 'tls://dot.pub:853', 'tls://dns.alidns.com:853']
+    # 海外 fallback DNS
+    fallback: ['https://dns.cloudflare.com/dns-query', 'https://dns.google/dns-query', 'tls://1.1.1.1:853', 'tls://8.8.8.8:853']
+    fallback-filter: { geoip: true, geoip-code: CN, ipcidr: [0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4], domain: [+.google.com, +.facebook.com, +.youtube.com, +.githubusercontent.com, +.googlevideo.com, +.googleapis.cn] }
+    fake-ip-filter: ['*.lan', '*.local', '*.localhost', '*.test', localhost.ptlogin2.qq.com, '+.stun.*.*', '+.stun.*.*.*', '+.stun.*.*.*.*', lens.l.google.com, '*.srv.nintendo.net', +.stun.playstation.net, 'xbox.*.*.microsoft.com', '*.*.xboxlive.com', +.msftncsi.com, +.msftconnecttest.com]
+
+# ── 代理节点（按需添加，本模板仅给出示例）─────────────────────
+# 注意事项：
+#   1. server / port / password 替换为实际值
+#   2. sni 可任意伪装域名（如 baidu.com / qq.com）
+#   3. skip-cert-verify: true 适用于自签证书
+proxies:
+    # ── 信息展示节点（伪节点）───────────────────────────────────
+    # 这些节点不会真正使用，只是借助客户端列表显示流量/到期信息
+    # 客户端会把节点名当作可点击的代理项，所以可以把信息嵌进去
+    # 通常机场会让订阅服务自动更新这些节点名
+    - { name: '剩余流量：YOUR_TRAFFIC GB', type: anytls, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, password: YOUR_PASSWORD, udp: true, sni: baidu.com, skip-cert-verify: true }
+    - { name: '距离下次重置：YOUR_RESET_DAYS 天', type: anytls, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, password: YOUR_PASSWORD, udp: true, sni: baidu.com, skip-cert-verify: true }
+    - { name: '套餐到期：YYYY-MM-DD', type: anytls, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, password: YOUR_PASSWORD, udp: true, sni: baidu.com, skip-cert-verify: true }
+
+    # ── 实际可用节点 ───────────────────────────────────────────
+    # AnyTLS 节点示例（适用于 sing-box AnyTLS 服务端）
+    - { name: Node-01, type: anytls, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, password: YOUR_PASSWORD, udp: true, sni: baidu.com, skip-cert-verify: true }
+    - { name: Node-02, type: anytls, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, password: YOUR_PASSWORD, udp: true, sni: qq.com, skip-cert-verify: true }
+    - { name: Node-03, type: anytls, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, password: YOUR_PASSWORD, udp: true, sni: bilibili.com, skip-cert-verify: true }
+    - { name: Node-04, type: anytls, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, password: YOUR_PASSWORD, udp: true, sni: weibo.com, skip-cert-verify: true }
+    - { name: Node-05, type: anytls, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, password: YOUR_PASSWORD, udp: true, sni: douyu.com, skip-cert-verify: true }
+
+    # VLESS Reality 节点示例
+    - { name: Node-Reality-01, type: vless, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, uuid: YOUR_UUID, alterId: 0, cipher: auto, udp: true, flow: xtls-rprx-vision, encryption: none, tls: true, skip-cert-verify: false, servername: apple.com, reality-opts: { public-key: YOUR_REALITY_PUBLIC_KEY, short-id: YOUR_SHORT_ID }, client-fingerprint: ios, network: tcp }
+    - { name: Node-Reality-02, type: vless, server: YOUR_SERVER_DOMAIN, port: YOUR_PORT, uuid: YOUR_UUID, alterId: 0, cipher: auto, udp: true, flow: xtls-rprx-vision, encryption: none, tls: true, skip-cert-verify: false, servername: apple.com, reality-opts: { public-key: YOUR_REALITY_PUBLIC_KEY, short-id: YOUR_SHORT_ID }, client-fingerprint: ios, network: tcp }
+
+# ── 代理分组 ────────────────────────────────────────────────────
+# 主选择组：把信息节点和实际节点都列进来
+# - 信息节点（剩余流量等）只用于显示，不需要切换
+# - 实际节点 Node-01 ~ Node-05 / Reality 用于翻墙
+proxy-groups:
+    - { name: 代理, type: select, proxies: [DIRECT, '剩余流量：YOUR_TRAFFIC GB', '距离下次重置：YOUR_RESET_DAYS 天', '套餐到期：YYYY-MM-DD', Node-01, Node-02, Node-03, Node-04, Node-05, Node-Reality-01, Node-Reality-02] }
+
+# ── 路由规则 ────────────────────────────────────────────────────
+rules:
+    # 订阅地址直连（替换为你的订阅域名）
+    - 'DOMAIN,YOUR_SUB_DOMAIN,DIRECT'
+
+    # 广告 / 跟踪域名拦截
+    - 'DOMAIN-KEYWORD,admarvel,REJECT'
+    - 'DOMAIN-KEYWORD,admaster,REJECT'
+    - 'DOMAIN-KEYWORD,adsage,REJECT'
+    - 'DOMAIN-KEYWORD,adsmogo,REJECT'
+    - 'DOMAIN-KEYWORD,adsrvmedia,REJECT'
+    - 'DOMAIN-KEYWORD,adwords,REJECT'
+    - 'DOMAIN-KEYWORD,adservice,REJECT'
+    - 'DOMAIN-KEYWORD,domob,REJECT'
+    - 'DOMAIN-KEYWORD,duomeng,REJECT'
+    - 'DOMAIN-KEYWORD,dwtrack,REJECT'
+    - 'DOMAIN-KEYWORD,guanggao,REJECT'
+    - 'DOMAIN-KEYWORD,lianmeng,REJECT'
+    - 'DOMAIN-KEYWORD,omgmta,REJECT'
+    - 'DOMAIN-KEYWORD,openx,REJECT'
+    - 'DOMAIN-KEYWORD,partnerad,REJECT'
+    - 'DOMAIN-KEYWORD,supersonicads,REJECT'
+    - 'DOMAIN-KEYWORD,umeng,REJECT'
+    - 'DOMAIN-KEYWORD,zjtoolbar,REJECT'
+    - 'DOMAIN-SUFFIX,appsflyer.com,REJECT'
+    - 'DOMAIN-SUFFIX,doubleclick.net,REJECT'
+    - 'DOMAIN-SUFFIX,mmstat.com,REJECT'
+
+    # 本地与内网直连
+    - 'DOMAIN-SUFFIX,local,DIRECT'
+    - 'DOMAIN-SUFFIX,localhost,DIRECT'
+    - 'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve'
+    - 'IP-CIDR,17.0.0.0/8,DIRECT,no-resolve'
+    - 'IP-CIDR,100.64.0.0/10,DIRECT,no-resolve'
+    - 'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve'
+    - 'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve'
+    - 'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve'
+    - 'IP-CIDR,198.18.0.0/16,DIRECT,no-resolve'
+    - 'IP-CIDR,224.0.0.0/4,DIRECT,no-resolve'
+    - 'IP-CIDR6,::1/128,DIRECT,no-resolve'
+    - 'IP-CIDR6,fc00::/7,DIRECT,no-resolve'
+    - 'IP-CIDR6,fe80::/10,DIRECT,no-resolve'
+
+    # Apple 商店走代理（解决加载慢问题）
+    - 'DOMAIN-SUFFIX,apps.apple.com,代理'
+    - 'DOMAIN-SUFFIX,itunes.apple.com,代理'
+    - 'DOMAIN-SUFFIX,blobstore.apple.com,代理'
+
+    # Apple / iCloud 直连
+    - 'DOMAIN,safebrowsing.urlsec.qq.com,DIRECT'
+    - 'DOMAIN-SUFFIX,apple.com,DIRECT'
+    - 'DOMAIN-SUFFIX,apple-cloudkit.com,DIRECT'
+    - 'DOMAIN-SUFFIX,icloud.com,DIRECT'
+    - 'DOMAIN-SUFFIX,icloud-content.com,DIRECT'
+    - 'DOMAIN-SUFFIX,mzstatic.com,DIRECT'
+    - 'DOMAIN-SUFFIX,aaplimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,cdn-apple.com,DIRECT'
+    - 'DOMAIN-SUFFIX,akadns.net,DIRECT'
+
+    # 国内常用服务直连
+    - 'DOMAIN-KEYWORD,baidu,DIRECT'
+    - 'DOMAIN-KEYWORD,alibaba,DIRECT'
+    - 'DOMAIN-KEYWORD,alicdn,DIRECT'
+    - 'DOMAIN-KEYWORD,alipay,DIRECT'
+    - 'DOMAIN-KEYWORD,taobao,DIRECT'
+    - 'DOMAIN-KEYWORD,tencent,DIRECT'
+    - 'DOMAIN-KEYWORD,bilibili,DIRECT'
+    - 'DOMAIN-KEYWORD,weibo,DIRECT'
+    - 'DOMAIN-KEYWORD,douyin,DIRECT'
+    - 'DOMAIN-KEYWORD,bytedance,DIRECT'
+    - 'DOMAIN-KEYWORD,xiaomi,DIRECT'
+    - 'DOMAIN-KEYWORD,huawei,DIRECT'
+    - 'DOMAIN-KEYWORD,netease,DIRECT'
+    - 'DOMAIN-KEYWORD,meituan,DIRECT'
+    - 'DOMAIN-KEYWORD,pinduoduo,DIRECT'
+    - 'DOMAIN-KEYWORD,kuaishou,DIRECT'
+    - 'DOMAIN-KEYWORD,jingdong,DIRECT'
+    - 'DOMAIN-KEYWORD,officecdn,DIRECT'
+    - 'DOMAIN-SUFFIX,qq.com,DIRECT'
+    - 'DOMAIN-SUFFIX,weixin.com,DIRECT'
+    - 'DOMAIN-SUFFIX,wechat.com,DIRECT'
+    - 'DOMAIN-SUFFIX,gtimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qcloud.com,DIRECT'
+    - 'DOMAIN-SUFFIX,myqcloud.com,DIRECT'
+    - 'DOMAIN-SUFFIX,qpic.cn,DIRECT'
+    - 'DOMAIN-SUFFIX,tenpay.com,DIRECT'
+    - 'DOMAIN-SUFFIX,tmall.com,DIRECT'
+    - 'DOMAIN-SUFFIX,jd.com,DIRECT'
+    - 'DOMAIN-SUFFIX,360buyimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,iqiyi.com,DIRECT'
+    - 'DOMAIN-SUFFIX,youku.com,DIRECT'
+    - 'DOMAIN-SUFFIX,ykimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,tudou.com,DIRECT'
+    - 'DOMAIN-SUFFIX,acfun.tv,DIRECT'
+    - 'DOMAIN-SUFFIX,hdslb.com,DIRECT'
+    - 'DOMAIN-SUFFIX,sohu.com,DIRECT'
+    - 'DOMAIN-SUFFIX,sogou.com,DIRECT'
+    - 'DOMAIN-SUFFIX,zhihu.com,DIRECT'
+    - 'DOMAIN-SUFFIX,zhimg.com,DIRECT'
+    - 'DOMAIN-SUFFIX,douban.com,DIRECT'
+    - 'DOMAIN-SUFFIX,doubanio.com,DIRECT'
+    - 'DOMAIN-SUFFIX,163.com,DIRECT'
+    - 'DOMAIN-SUFFIX,126.com,DIRECT'
+    - 'DOMAIN-SUFFIX,126.net,DIRECT'
+    - 'DOMAIN-SUFFIX,127.net,DIRECT'
+    - 'DOMAIN-SUFFIX,yeah.net,DIRECT'
+    - 'DOMAIN-SUFFIX,sina.com,DIRECT'
+    - 'DOMAIN-SUFFIX,sinaimg.cn,DIRECT'
+    - 'DOMAIN-SUFFIX,ximalaya.com,DIRECT'
+    - 'DOMAIN-SUFFIX,xmcdn.com,DIRECT'
+    - 'DOMAIN-SUFFIX,csdn.net,DIRECT'
+    - 'DOMAIN-SUFFIX,gitee.com,DIRECT'
+    - 'DOMAIN-SUFFIX,jianshu.com,DIRECT'
+    - 'DOMAIN-SUFFIX,cnblogs.com,DIRECT'
+    - 'DOMAIN-SUFFIX,oschina.net,DIRECT'
+    - 'DOMAIN-SUFFIX,ele.me,DIRECT'
+    - 'DOMAIN-SUFFIX,ctrip.com,DIRECT'
+    - 'DOMAIN-SUFFIX,suning.com,DIRECT'
+    - 'DOMAIN-SUFFIX,dianping.com,DIRECT'
+    - 'DOMAIN-SUFFIX,amap.com,DIRECT'
+    - 'DOMAIN-SUFFIX,autonavi.com,DIRECT'
+    - 'DOMAIN-SUFFIX,mi.com,DIRECT'
+    - 'DOMAIN-SUFFIX,miui.com,DIRECT'
+    - 'DOMAIN-SUFFIX,ifeng.com,DIRECT'
+    - 'DOMAIN-SUFFIX,youdao.com,DIRECT'
+    - 'DOMAIN-SUFFIX,iciba.com,DIRECT'
+    - 'DOMAIN-SUFFIX,xunlei.com,DIRECT'
+    - 'DOMAIN-SUFFIX,smzdm.com,DIRECT'
+    - 'DOMAIN-SUFFIX,sspai.com,DIRECT'
+    - 'DOMAIN-SUFFIX,36kr.com,DIRECT'
+    - 'DOMAIN-SUFFIX,speedtest.net,DIRECT'
+
+    # Microsoft 服务直连（在国内有 CDN）
+    - 'DOMAIN-SUFFIX,microsoft.com,DIRECT'
+    - 'DOMAIN-SUFFIX,microsoftonline.com,DIRECT'
+    - 'DOMAIN-SUFFIX,office.com,DIRECT'
+    - 'DOMAIN-SUFFIX,office365.com,DIRECT'
+    - 'DOMAIN-SUFFIX,windows.com,DIRECT'
+    - 'DOMAIN-SUFFIX,windowsupdate.com,DIRECT'
+    - 'DOMAIN-SUFFIX,live.com,DIRECT'
+    - 'DOMAIN-SUFFIX,msn.com,DIRECT'
+
+    # 国内域名/关键词通用规则
+    - 'DOMAIN-SUFFIX,cn,DIRECT'
+    - 'DOMAIN-KEYWORD,-cn,DIRECT'
+
+    # 海外服务走代理
+    - 'DOMAIN-KEYWORD,google,代理'
+    - 'DOMAIN-KEYWORD,gmail,代理'
+    - 'DOMAIN-KEYWORD,youtube,代理'
+    - 'DOMAIN-KEYWORD,facebook,代理'
+    - 'DOMAIN-KEYWORD,twitter,代理'
+    - 'DOMAIN-KEYWORD,instagram,代理'
+    - 'DOMAIN-KEYWORD,whatsapp,代理'
+    - 'DOMAIN-KEYWORD,telegram,代理'
+    - 'DOMAIN-KEYWORD,github,代理'
+    - 'DOMAIN-KEYWORD,blogspot,代理'
+    - 'DOMAIN-KEYWORD,dropbox,代理'
+    - 'DOMAIN-KEYWORD,wikipedia,代理'
+    - 'DOMAIN-KEYWORD,pinterest,代理'
+    - 'DOMAIN-KEYWORD,discord,代理'
+    - 'DOMAIN-KEYWORD,openai,代理'
+    - 'DOMAIN-KEYWORD,anthropic,代理'
+    - 'DOMAIN-KEYWORD,netflix,代理'
+    - 'DOMAIN-KEYWORD,spotify,代理'
+    - 'DOMAIN-KEYWORD,amazon,代理'
+    - 'DOMAIN-SUFFIX,t.co,代理'
+    - 'DOMAIN-SUFFIX,x.com,代理'
+    - 'DOMAIN-SUFFIX,twimg.com,代理'
+    - 'DOMAIN-SUFFIX,fb.me,代理'
+    - 'DOMAIN-SUFFIX,fbcdn.net,代理'
+    - 'DOMAIN-SUFFIX,youtu.be,代理'
+    - 'DOMAIN-SUFFIX,ytimg.com,代理'
+    - 'DOMAIN-SUFFIX,gstatic.com,代理'
+    - 'DOMAIN-SUFFIX,ggpht.com,代理'
+    - 'DOMAIN-SUFFIX,googlevideo.com,代理'
+    - 'DOMAIN-SUFFIX,v2ex.com,代理'
+    - 'DOMAIN-SUFFIX,medium.com,代理'
+    - 'DOMAIN-SUFFIX,reddit.com,代理'
+    - 'DOMAIN-SUFFIX,redd.it,代理'
+    - 'DOMAIN-SUFFIX,imgur.com,代理'
+    - 'DOMAIN-SUFFIX,pixiv.net,代理'
+    - 'DOMAIN-SUFFIX,nytimes.com,代理'
+    - 'DOMAIN-SUFFIX,nyt.com,代理'
+    - 'DOMAIN-SUFFIX,bbc.com,代理'
+    - 'DOMAIN-SUFFIX,bbc.co.uk,代理'
+    - 'DOMAIN-SUFFIX,steamcommunity.com,代理'
+    - 'DOMAIN-SUFFIX,twitch.tv,代理'
+    - 'DOMAIN-SUFFIX,vimeo.com,代理'
+    - 'DOMAIN-SUFFIX,tumblr.com,代理'
+    - 'DOMAIN-SUFFIX,linkedin.com,代理'
+    - 'DOMAIN-SUFFIX,licdn.com,代理'
+    - 'DOMAIN-SUFFIX,mega.nz,代理'
+    - 'DOMAIN-SUFFIX,archive.org,代理'
+    - 'DOMAIN-SUFFIX,wikimedia.org,代理'
+    - 'DOMAIN-SUFFIX,soundcloud.com,代理'
+
+    # Telegram IP 段走代理
+    - 'IP-CIDR,91.108.4.0/22,代理,no-resolve'
+    - 'IP-CIDR,91.108.8.0/21,代理,no-resolve'
+    - 'IP-CIDR,91.108.12.0/22,代理,no-resolve'
+    - 'IP-CIDR,91.108.16.0/22,代理,no-resolve'
+    - 'IP-CIDR,91.108.56.0/22,代理,no-resolve'
+    - 'IP-CIDR,149.154.160.0/20,代理,no-resolve'
+    - 'IP-CIDR6,2001:67c:4e8::/48,代理,no-resolve'
+    - 'IP-CIDR6,2001:b28:f23d::/48,代理,no-resolve'
+    - 'IP-CIDR6,2001:b28:f23f::/48,代理,no-resolve'
+
+    # 兜底规则
+    - 'GEOIP,CN,DIRECT'
+    - 'MATCH,代理'
