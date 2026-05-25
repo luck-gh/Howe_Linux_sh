@@ -334,7 +334,7 @@ S2ACFG
     cat >> "$BASE_DIR/docker-compose.yml" <<SVC
 
   sub2api:
-    image: xidahuang/sub2api:latest
+    image: weishaw/sub2api:0.1.130
     container_name: sub2api
     restart: unless-stopped
     depends_on:

@@ -417,9 +417,12 @@ upgrade_single_service() {
   # compose 中是否还存在该 service（防止 compose 文件被覆盖成空）
   if ! (cd "$BASE_DIR" && docker compose config --services 2>/dev/null | grep -Fxq "$_svc"); then
     warn "${BASE_DIR}/docker-compose.yml 中找不到 service '${_svc}'"
-    info "可能被覆盖成空文件。请先到主菜单 → 安装 / 更新 重新生成 compose"
+    info "可能被覆盖成空文件。请先到主菜单 → 安装 / 重新生成配置 重新生成 compose"
     return 1
   fi
+
+  # 升级前自动备份（受 /etc/howe-backup.conf::AUTO_BEFORE_UPGRADE 控制）
+  _upgrade_pre_backup_hook "$_svc" docker
 
   local _cur_ref _cur_id
   _cur_ref=$(_svc_image_ref "$_svc")
@@ -508,7 +511,7 @@ rollback_single_service() {
   # compose 中是否还存在该 service
   if ! (cd "$BASE_DIR" && docker compose config --services 2>/dev/null | grep -Fxq "$_svc"); then
     warn "${BASE_DIR}/docker-compose.yml 中找不到 service '${_svc}'"
-    info "请先到主菜单 → 安装 / 更新 重新生成 compose"
+    info "请先到主菜单 → 安装 / 重新生成配置 重新生成 compose"
     return 1
   fi
 
@@ -657,9 +660,143 @@ rollback_single_service() {
 # 顶层菜单：升级 / 回滚单服务
 # 列出已安装的 docker 类服务，选服务 → 选升级或回滚
 # ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# 顶层菜单：升级 / 回滚单服务（程序版本）
+#
+# 注意：本菜单只管"程序版本"——容器镜像 / 二进制版本的升级和回滚。
+#       数据 / 配置文件的备份恢复在主菜单的「备份 / 恢复」中。
+# ═══════════════════════════════════════════════════════════════════
+
+# ── 批量检查更新 ─────────────────────────────────────────────────
+# 并发查询每个已安装服务的当前版本与上游最新版本，输出对比表。
+# docker 服务用 buildx imagetools 拿 registry digest 与本地 RepoDigests 比对；
+# systemd 服务用各自的 latest_ver 函数。
+_check_one_update() {
+  local _key=$1 _name=$2 _type=$3 _svc=$4 _out=$5
+  local _cur="-" _new="-" _state="?"
+
+  if [[ "$_type" == "docker" ]]; then
+    # 镜像引用（带 tag）
+    local _ref _local_digest _remote_digest
+    _ref=$(_svc_image_ref "$_svc" 2>/dev/null)
+    [[ -z "$_ref" ]] && { echo "${_key}|${_name}|未运行|-|-" > "$_out"; return; }
+
+    # 本地 image 对应 registry 的 digest（来自 RepoDigests）
+    _local_digest=$(docker image inspect "$_ref" --format '{{if .RepoDigests}}{{(index .RepoDigests 0)}}{{end}}' 2>/dev/null | sed 's/.*@//')
+    # 上游 manifest digest（imagetools 返回 list digest，与 RepoDigests 同源）
+    _remote_digest=$(timeout 10 docker buildx imagetools inspect "$_ref" --format '{{.Manifest.Digest}}' 2>/dev/null)
+
+    _cur=$_ref
+    if [[ -z "$_remote_digest" ]]; then
+      _new="检查失败"
+      _state="?"
+    elif [[ -z "$_local_digest" ]]; then
+      _new="$_remote_digest"
+      _state="?"
+    elif [[ "$_local_digest" == "$_remote_digest" ]]; then
+      _new="${_remote_digest:0:19}…"
+      _state="✓"
+    else
+      _new="${_remote_digest:0:19}…"
+      _state="↑"
+    fi
+  else
+    case "$_svc" in
+      sing-box)
+        _cur=$(_singbox_cur_ver 2>/dev/null)
+        _new=$(timeout 10 bash -c '
+          curl -fsSL --max-time 8 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+            | jq -r ".tag_name" 2>/dev/null | tr -d "v"
+        ')
+        ;;
+      caddy)
+        _cur=$(caddy version 2>/dev/null | head -1 | awk '{print $1}' | tr -d 'v')
+        _new=$(timeout 10 bash -c '
+          curl -fsSL --max-time 8 "https://api.github.com/repos/caddyserver/caddy/releases/latest" 2>/dev/null \
+            | jq -r ".tag_name" 2>/dev/null | tr -d "v"
+        ')
+        ;;
+    esac
+    [[ -z "$_cur" ]] && _cur="-"
+    if [[ -z "$_new" ]]; then
+      _state="?"; _new="检查失败"
+    elif [[ "$_cur" == "$_new" ]]; then
+      _state="✓"
+    else
+      _state="↑"
+    fi
+  fi
+
+  echo "${_key}|${_name}|${_cur}|${_new}|${_state}" > "$_out"
+}
+
+check_all_updates() {
+  print_header "检查所有服务更新"
+  if [[ ! -f "$BASE_DIR/.env" ]]; then
+    warn "未找到配置文件，可能尚未安装"
+    echo ""; read -erp "  按回车返回..." _; return 0
+  fi
+  source "$BASE_DIR/.env" 2>/dev/null
+  detect_installed_services
+
+  local -a _SVCS=()
+  local _entry _key _name _type _target _var
+  for _entry in "${SVC_REGISTRY_STACK[@]}"; do
+    IFS='|' read -r _key _name _type _target <<< "$_entry"
+    [[ "$_type" != "docker" && "$_type" != "systemd" ]] && continue
+    _var="SVC_${_key}_INSTALLED"
+    [[ "${!_var}" == "true" ]] && _SVCS+=("${_key}|${_name}|${_type}|${_target}")
+  done
+
+  if [[ ${#_SVCS[@]} -eq 0 ]]; then
+    warn "未检测到已安装的服务"
+    echo ""; read -erp "  按回车返回..." _; return 0
+  fi
+
+  echo -e "  ${DIM}并发查询中（最多约 15 秒）...${N}"
+  echo ""
+
+  local _tmp; _tmp=$(mktemp -d /tmp/howe-upd.XXXXXX)
+  local _i
+  for (( _i=0; _i<${#_SVCS[@]}; _i++ )); do
+    IFS='|' read -r _key _name _type _target <<< "${_SVCS[$_i]}"
+    _check_one_update "$_key" "$_name" "$_type" "$_target" "$_tmp/$_i" &
+  done
+  wait
+
+  # 输出汇总
+  printf "  ${W}%-12s %-40s %-22s %s${N}\n" "服务" "当前" "最新" "状态"
+  echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────${N}"
+  local _n_upgrade=0
+  for (( _i=0; _i<${#_SVCS[@]}; _i++ )); do
+    [[ -f "$_tmp/$_i" ]] || continue
+    IFS='|' read -r _key _name _cur _new _state < "$_tmp/$_i"
+    local _color
+    case "$_state" in
+      "↑") _color=$Y; _n_upgrade=$((_n_upgrade+1)) ;;
+      "✓") _color=$G ;;
+      *)   _color=$DIM ;;
+    esac
+    printf "  %-12s %-40s %-22s ${_color}%s${N}\n" "$_name" "${_cur:0:38}" "${_new:0:20}" "$_state"
+  done
+  rm -rf "$_tmp"
+  echo ""
+  echo -e "  ${DIM}状态：${G}✓${N}${DIM} 已最新   ${Y}↑${N}${DIM} 可升级   ${DIM}? 检查失败${N}"
+  echo ""
+  if (( _n_upgrade > 0 )); then
+    echo -e "  ${Y}有 ${_n_upgrade} 个服务可升级${N}，可在下方菜单选择对应服务进行升级"
+  else
+    echo -e "  ${G}全部已是最新${N}"
+  fi
+  echo ""
+  read -erp "  按回车返回..." _
+}
+
 upgrade_rollback_menu() {
   while true; do
-    print_header "升级 / 回滚单服务"
+    print_header "升级 / 回滚单服务（程序版本）"
+    echo -e "  ${DIM}本菜单管理容器镜像 / 二进制版本。数据与配置的备份恢复见主菜单「备份 / 恢复」${N}"
+    echo ""
 
     if [[ ! -f "$BASE_DIR/.env" ]]; then
       warn "未找到配置文件，可能尚未安装"
@@ -706,7 +843,7 @@ upgrade_rollback_menu() {
         case "$_svc" in
           sing-box)
             command -v sing-box &>/dev/null && \
-              _ver="${C}sing-box $(sing-box version 2>/dev/null | awk '/sing-box/{print $2;exit}')${N}"
+              _ver="${C}sing-box $(sing-box version 2>/dev/null | awk 'NR==1{print $NF;exit}')${N}"
             ;;
           caddy)
             command -v caddy &>/dev/null && \
@@ -719,12 +856,17 @@ upgrade_rollback_menu() {
       [[ -n "$_desc" ]] && printf "         ${DIM}%s${N}\n" "$_desc"
     done
     echo ""
+    echo -e "    ${W}[c]${N}  ${DIM}检查所有服务更新（对比上游最新版本）${N}"
     echo -e "    ${DIM}[0] 返回上级菜单${N}"
     echo ""
 
     local _input
     read -erp "  选择服务：" _input
     [[ "$_input" == "0" || -z "$_input" ]] && break
+    if [[ "${_input,,}" == "c" ]]; then
+      check_all_updates
+      continue
+    fi
 
     if ! [[ "$_input" =~ ^[0-9]+$ ]] || (( _input < 1 || _input > _scnt )); then
       warn "无效编号"
@@ -751,7 +893,7 @@ upgrade_rollback_menu() {
         # systemd
         case "$_svc" in
           sing-box)
-            local _v; _v=$(sing-box version 2>/dev/null | awk '/sing-box/{print $2;exit}')
+            local _v; _v=$(sing-box version 2>/dev/null | awk 'NR==1{print $NF;exit}')
             [[ -n "$_v" ]] && echo -e "  当前版本：${C}sing-box ${_v}${N}" || echo -e "  ${Y}sing-box 未安装${N}"
             ;;
           caddy)
@@ -811,7 +953,8 @@ _BIN_BACKUP_DIR() { echo "$(_UPGRADE_DIR)/bin"; }
 
 _singbox_cur_ver() {
   command -v sing-box &>/dev/null || return 1
-  sing-box version 2>/dev/null | awk '/sing-box/{print $2;exit}'
+  # sing-box 输出："sing-box version 1.13.12" → 取第 3 字段
+  sing-box version 2>/dev/null | awk 'NR==1{print $NF;exit}'
 }
 _singbox_latest_ver() {
   curl -fsSL --max-time 8 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
@@ -824,11 +967,40 @@ _caddy_cur_ver() {
 
 upgrade_systemd_service() {
   local _name="$1" _svc="$2"
+  _upgrade_pre_backup_hook "$_svc" systemd
   case "$_svc" in
     sing-box) _upgrade_singbox "$_name" ;;
     caddy)    _upgrade_caddy "$_name" ;;
     *) warn "未知 systemd 服务：${_svc}"; return 1 ;;
   esac
+}
+
+# 升级前自动备份 hook
+# 备份范围统一读 DEFAULT_SCOPES（与设置页「默认备份范围」一致）
+_upgrade_pre_backup_hook() {
+  local _svc=$1 _type=$2
+  declare -F backup_conf_get >/dev/null 2>&1 || return 0
+  local _enabled; _enabled=$(backup_conf_get AUTO_BEFORE_UPGRADE "$BACKUP_AUTO_BEFORE_UPGRADE_DEFAULT")
+  [[ "$_enabled" != "true" ]] && return 0
+
+  local _csv; _csv=$(backup_conf_get DEFAULT_SCOPES "$BACKUP_DEFAULT_SCOPES_DEFAULT")
+  [[ -z "$_csv" ]] && { info "升级前自动备份已开启但默认备份范围为空，跳过"; return 0; }
+
+  local -a _scopes=()
+  local _s
+  for _s in ${_csv//,/ }; do _scopes+=("$_s"); done
+
+  echo ""
+  info "升级前自动备份：${_scopes[*]} （服务：$_svc）"
+  local _dir
+  _dir=$(backup_create "升级前自动备份：${_svc}" "${_scopes[@]}" 2>/dev/null)
+  if [[ -n "$_dir" ]]; then
+    log "已备份 → $(basename "$_dir")"
+    local _keep; _keep=$(backup_conf_get KEEP "$BACKUP_KEEP_DEFAULT")
+    backup_apply_retention "$_keep" >/dev/null 2>&1
+  else
+    warn "自动备份失败，但继续升级"
+  fi
 }
 
 rollback_systemd_service() {

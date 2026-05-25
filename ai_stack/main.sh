@@ -25,15 +25,22 @@ service_stack_menu() {
     fi
     echo ""
 
-    input_choose "服务栈操作" "安装 / 更新" "升级 / 回滚单服务" "卸载" "配置查询与修改" "服务管理"
+    input_choose "服务栈操作" \
+      "安装 / 重新生成配置" \
+      "升级 / 回滚单服务（程序版本：镜像 / 二进制）" \
+      "备份 / 恢复（数据 / 配置文件）" \
+      "配置查询与修改" \
+      "服务管理" \
+      "卸载"
     [[ $INPUT_RESULT -eq -1 ]] && break
 
     case $INPUT_RESULT in
       0) install_or_update ;;
       1) upgrade_rollback_menu ;;
-      2) uninstall_stack ;;
+      2) backup_menu ;;
       3) show_config ;;
       4) manage_services ;;
+      5) uninstall_stack ;;
     esac
   done
 }
@@ -146,8 +153,8 @@ install_single_agent() {
           ;;
         1)
           command -v docker &>/dev/null || { warn "Docker 未安装"; return 1; }
-          docker pull openclaw/openclaw:latest || { warn "镜像拉取失败"; return 1; }
-          log "OpenClaw Docker 镜像已拉取，运行：docker run -it openclaw/openclaw"
+          docker pull ghcr.io/openclaw/openclaw:latest || { warn "镜像拉取失败"; return 1; }
+          log "OpenClaw Docker 镜像已拉取，运行：docker run -it ghcr.io/openclaw/openclaw:latest"
           return 0
           ;;
         *) return 0 ;;
@@ -485,7 +492,7 @@ main() {
   [[ -f /etc/os-release ]] || err "无法识别操作系统"
 
   while true; do
-    print_header "AI 服务栈 一键安装脚本 v3"
+    print_header "AI 服务栈 一键安装脚本 V1.4"
 
     # 服务栈摘要
     if [[ -f "$BASE_DIR/.env" ]]; then

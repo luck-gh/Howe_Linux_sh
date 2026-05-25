@@ -91,11 +91,9 @@ input_choose() {
     echo "    $((i+1)). ${_opts[i]}"
   done
   echo ""
-  local _hint="输入编号（1-${_cnt}）"
+  local _hint="输入编号（1-${_cnt}），输入 0 / Enter 返回，输入 q / quit 退出"
   if [[ $_default -ge 0 ]]; then
-    _hint+="，直接回车选 $((_default+1))"
-  else
-    _hint+="，直接回车返回"
+    _hint="输入编号（1-${_cnt}），Enter 选 $((_default+1))，输入 0 返回，输入 q / quit 退出"
   fi
   echo -e "  ${DIM}${_hint}${N}"
   echo ""
@@ -103,8 +101,18 @@ input_choose() {
   local _input
   read -erp "  选择：" _input
 
+  case "${_input,,}" in
+    q|quit|exit)
+      reset_terminal 2>/dev/null || true
+      echo ""
+      exit 0
+      ;;
+  esac
+
   if [[ -z "$_input" ]] && [[ $_default -ge 0 ]]; then
     INPUT_RESULT=$_default
+  elif [[ -z "$_input" ]] || [[ "$_input" == "0" ]]; then
+    INPUT_RESULT=-1
   elif [[ "$_input" =~ ^[0-9]+$ ]] && (( _input >= 1 && _input <= _cnt )); then
     INPUT_RESULT=$((_input - 1))
   else

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ╔══════════════════════════════════════════════════════════════════
-# ║  AI 服务栈 一键安装脚本 v3 — 拆分版入口
+# ║  AI 服务栈 一键安装脚本 V1.4 — 拆分版入口
 # ║
 # ║  服务：New-API / OpenWebUI / LiteLLM / Sub2API / Dify / sing-box
 # ║  代理：Caddy (HTTPS) + frp (分布式穿透)
@@ -47,6 +47,10 @@ source "${_AI_STACK_ENTRY_DIR}/services.sh"
 source "${_AI_STACK_ENTRY_DIR}/local_pkg.sh"
 # shellcheck source=lifecycle.sh
 source "${_AI_STACK_ENTRY_DIR}/lifecycle.sh"
+# shellcheck source=backup_lib.sh
+source "${_AI_STACK_ENTRY_DIR}/backup_lib.sh"
+# shellcheck source=backup.sh
+source "${_AI_STACK_ENTRY_DIR}/backup.sh"
 # shellcheck source=view.sh
 source "${_AI_STACK_ENTRY_DIR}/view.sh"
 # shellcheck source=main.sh

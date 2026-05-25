@@ -17,7 +17,7 @@ install_singbox() {
 
   local _cur=""
   command -v sing-box &>/dev/null && \
-    _cur=$(sing-box version 2>/dev/null | awk '/sing-box/{print $2}') || true
+    _cur=$(sing-box version 2>/dev/null | awk 'NR==1{print $NF}') || true
 
   if [[ "$_cur" == "$_ver" ]]; then
     log "sing-box $_ver 已是最新，跳过"

@@ -51,9 +51,16 @@ source "${_AI_STACK_DIR}/../lib/utils.sh" 2>/dev/null || {
     echo -e "  ${DIM}────────────────────────────────${N}"
     for (( i=0; i<_cnt; i++ )); do echo "    $((i+1)). ${_opts[$i]}"; done
     echo ""
+    echo -e "  ${DIM}输入编号（1-${_cnt}），输入 0 / Enter 返回，输入 q / quit 退出${N}"
+    echo ""
     local _input
     read -erp "  选择：" _input
-    if [[ "$_input" =~ ^[0-9]+$ ]] && (( _input >= 1 && _input <= _cnt )); then
+    case "${_input,,}" in
+      q|quit|exit) echo ""; exit 0 ;;
+    esac
+    if [[ -z "$_input" ]] || [[ "$_input" == "0" ]]; then
+      INPUT_RESULT=-1
+    elif [[ "$_input" =~ ^[0-9]+$ ]] && (( _input >= 1 && _input <= _cnt )); then
       INPUT_RESULT=$((_input - 1))
     else
       INPUT_RESULT=-1
