@@ -748,14 +748,14 @@ def render_one(base, sub):
     info = []
     if expired:
         # 套餐到期：仅显示到期日，隐藏流量/重置信息
-        info.append(make_proxy(f"⚠ 套餐已到期(已断网)到期时间为:{sub['expire']}", head, pwd, sub_port))
+        info.append(make_proxy(f"[自建] ⚠ 套餐已到期(已断网)到期时间为:{sub['expire']}", head, pwd, sub_port))
     else:
         # 流量用完时显示"流量用完"，否则显示剩余字节数
         remain_label = "流量用完" if over_quota else fmt_bytes(remain)
-        info.append(make_proxy(f"剩余流量:{remain_label}", head, pwd, sub_port))
-        info.append(make_proxy(f"距离下次重置:{days_until_reset(int(sub['reset_day']))} 天", head, pwd, sub_port))
+        info.append(make_proxy(f"[自建] 剩余流量:{remain_label}", head, pwd, sub_port))
+        info.append(make_proxy(f"[自建] 距离下次重置:{days_until_reset(int(sub['reset_day']))} 天", head, pwd, sub_port))
         if sub.get("expire"):
-            info.append(make_proxy(f"套餐到期:{sub['expire']}", head, pwd, sub_port))
+            info.append(make_proxy(f"[自建] 套餐到期:{sub['expire']}", head, pwd, sub_port))
 
     # 套餐到期时不显示自建节点；流量用完时仍显示（nft 负责限流）
     real = [] if expired else [make_proxy(auto_node_name(n, base), n, pwd, sub_port) for n in nodes]
@@ -767,7 +767,8 @@ def render_one(base, sub):
     proxies = info + real + external
     tpl["proxies"] = proxies
 
-    # proxy-groups：有外购时拆 "VPS 节点" / "外购" 两个子组，主组只放子组+DIRECT/REJECT
+    # proxy-groups：始终拆 "VPS 节点" 子组（含信息节点+自建），有外购时再加 "外购" 子组；
+    # 主组只放子组入口 + REJECT/DIRECT
     groups = tpl.get("proxy-groups") or []
     if not groups:
         groups = [_FlowMap({"name": "代理", "type": "select"})]
@@ -792,12 +793,11 @@ def render_one(base, sub):
     groups[:] = [_FlowMap(g) if not isinstance(g, _FlowMap) else g for g in groups]
     first = groups[0]
 
+    sub_entries = ["VPS 节点"] + (["外购"] if external_names else [])
+    first["proxies"] = keep_front + sub_entries + keep_back
+    groups.append(_FlowMap({"name": "VPS 节点", "type": "select", "proxies": vps_names}))
     if external_names:
-        first["proxies"] = keep_front + ["VPS 节点", "外购"] + keep_back
-        groups.append(_FlowMap({"name": "VPS 节点", "type": "select", "proxies": vps_names}))
         groups.append(_FlowMap({"name": "外购", "type": "select", "proxies": ["DIRECT"] + external_names}))
-    else:
-        first["proxies"] = keep_front + vps_names + keep_back
 
     out_dir = os.path.join(p["output"], sub["token"])
     os.makedirs(out_dir, exist_ok=True)
