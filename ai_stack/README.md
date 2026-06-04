@@ -8,23 +8,26 @@
 | 文件 | 行数级别 | 主要负责的事 |
 |------|---------|-------------|
 | `ai-stack-setup.sh` | ~60 | **入口 / loader**。`set -uo pipefail`，stty trap，按顺序 `source` 下列模块，最后 `if BASH_SOURCE==$0; main "$@"`. |
-| `core.sh` | ~200 | 颜色 / `log` `warn` `err` `info` / `step` / `ask` `askyn` / `print_header` / `dc_cmd` / `multi_select_input` / 全局常量（`PREFIX_*` `BASE_DIR` `SINGBOX_DIR` 等）/ 加载 `lib/utils.sh`。**最先 source，所有模块都依赖。** |
-| `detect.sh` | ~290 | `detect_resources` / `assess_svc` / `preflight` / `choose_deploy_mode` / 服务安装状态探测（`SVC_REGISTRY_*` / `svc_check` / `svc_running` / `detect_installed_services` / `detect_ai_agents` / `has_*_service`）。 |
-| `select.sh` | ~470 | `select_services`（输入式服务多选）/ `assign_service_locations`（分布式 VPS 或本地）/ `collect_config`（域名 / frp / Clash 端口段 等）/ `check_dns`。 |
-| `base.sh` | ~80 | `install_deps` / `setup_dirs` / `sync_brand_assets` / `refresh_brand_assets`。**轻量公用步骤。** |
-| `clash.sh` | ~360 | Clash 多订阅子系统：路径辅助 (`_clash_dir/_clash_py/_clash_stats_py`)，端口段 (`_clash_port_range/_sync_clash_ufw`)，`setup_clash_subscription / setup_clash_stats_timer / render_clash_subscription`，订阅菜单 `_clash_menu_*` (`pick_one/show/add/edit/remove/defaults/refresh`)，`refresh_clash_subscription`。 |
-| `compose.sh` | ~390 | `write_env`（生成 `/opt/ai-stack/.env`）/ `write_compose`（生成 `docker-compose.yml`，按服务和分布式模式裁剪）/ `write_litellm_config`。 |
-| `caddy.sh` | ~300 | `install_caddy` / `write_caddyfile`（按已选服务渲染站点 + 注入 Clash caddy-blocks）/ `reconfigure_domain`（独立流程，复用 `write_caddyfile`/`check_dns`）。 |
-| `services.sh` | ~325 | `install_singbox`（含 anytls 多 inbound 渲染 + nft 表 + reload 钩子 `reload_clash_subscription` / `setup_clash_nft` / `write_singbox_config`）/ `install_frp_server` / `configure_firewall` / `start_services` / `health_check` / `setup_dify` / `sync_newapi_logo`。 |
+| `core.sh` | ~210 | 颜色 / `log` `warn` `err` `info` / `step` / `ask` `askyn` / `print_header` / `dc_cmd` / `multi_select_input` / 全局常量（`PREFIX_*` `BASE_DIR` `SINGBOX_DIR` 等）/ 加载 `lib/utils.sh`。**最先 source，所有模块都依赖。** |
+| `detect.sh` | ~310 | `detect_resources` / `assess_svc` / `preflight` / `choose_deploy_mode` / 服务安装状态探测（`SVC_REGISTRY_*` / `svc_check` / `svc_running` / `detect_installed_services` / `detect_ai_agents` / `has_*_service`）。 |
+| `select.sh` | ~480 | `select_services`（输入式服务多选）/ `assign_service_locations`（分布式 VPS 或本地）/ `collect_config`（域名 / frp / Clash 端口段 等）/ `check_dns`。 |
+| `base.sh` | ~85 | `install_deps` / `setup_dirs` / `sync_brand_assets` / `refresh_brand_assets`。**轻量公用步骤。** |
+| `clash.sh` | ~1010 | Clash 多订阅子系统：路径辅助 (`_clash_dir/_clash_py/_clash_stats_py`)，端口段 (`_clash_port_range/_sync_clash_ufw`)，`setup_clash_subscription / setup_clash_stats_timer / render_clash_subscription`，订阅菜单 `_clash_menu_*` (`pick_one/show/add/edit/remove/defaults/refresh/static`)，字段编辑循环 `_clash_field_loop`（支持「将继承默认值」与 [修改] 高亮），静态 IP 资源管理 `_static_menu_*`（list/add/remove/replace/clear/strategy）+ `_static_pick_target`（默认池 / 订阅池切换）+ `_static_apply_changes`（render + reload sing-box）。 |
+| `compose.sh` | ~400 | `write_env`（生成 `/opt/ai-stack/.env`）/ `write_compose`（生成 `docker-compose.yml`，按服务和分布式模式裁剪）/ `write_litellm_config`。 |
+| `caddy.sh` | ~305 | `install_caddy` / `write_caddyfile`（按已选服务渲染站点 + 注入 Clash caddy-blocks）/ `reconfigure_domain`（独立流程，复用 `write_caddyfile`/`check_dns`）。 |
+| `services.sh` | ~370 | `install_singbox`（含 anytls 多 inbound 渲染 + nft 表 + reload 钩子 `reload_clash_subscription` / `setup_clash_nft` / `write_singbox_config`，config 用 jq 拼装并注入静态 IP outbounds + `user→outbound` 路由）/ `install_frp_server` / `configure_firewall` / `start_services` / `health_check` / `setup_dify` / `sync_newapi_logo`。 |
 | `local_pkg.sh` | ~340 | `generate_local_package` — 生成分布式架构里跑在本地机器上的安装包（Linux `install-local.sh` / Windows `start.bat` / docker-compose / frpc.toml），含大段 HEREDOC。 |
-| `lifecycle.sh` | ~395 | `print_clash_link` / `print_summary` / `confirm_installation` / `install_or_update`（主安装流水线）/ `uninstall_stack`（多选卸载）。 |
-| `view.sh` | ~325 | `show_secrets` / `show_db_connection` / `show_config`（已安装栈的运行状态 + 可改项）/ 服务管理（启动/停止/重启）。 |
-| `main.sh` | ~505 | `service_stack_menu`（AI 服务栈子菜单：安装 / 配置 / 卸载 / 刷新 / 查看密钥 / 服务管理 / 订阅 ...）/ `ai_agent_menu`（智能体 CLI 工具：Claude Code / Codex / OpenCode / OpenClaw 安装管理）/ `main`（顶级两选一）。 |
+| `lifecycle.sh` | ~400 | `print_clash_link` / `print_summary` / `confirm_installation` / `install_or_update`（主安装流水线）/ `uninstall_stack`（多选卸载）。 |
+| `backup_lib.sh` | ~615 | 备份/恢复底层库：备份点扫描、tar 流式打包/解包、PG 容器内 pg_dump/pg_restore、Caddy/sing-box/frp/`/opt/ai-stack` 目录快照，幂等钩子。 |
+| `backup.sh` | ~540 | 备份子菜单与编排：`_backup_menu`（创建 / 列出 / 恢复 / 删除 / 计划任务）/ `do_backup` / `do_restore`，调用 `backup_lib.sh` 的低层函数。 |
+| `view.sh` | ~1480 | `show_secrets` / `show_db_connection` / `show_config`（已安装栈的运行状态 + 可改项）/ 服务管理（启动/停止/重启）/ 升级回滚菜单（含进入时检查上游版本）。 |
+| `main.sh` | ~540 | `service_stack_menu`（AI 服务栈子菜单：安装 / 配置 / 卸载 / 刷新 / 查看密钥 / 服务管理 / 订阅 ...）/ `ai_agent_menu`（智能体 CLI 工具：Claude Code / Codex / OpenCode / OpenClaw 安装管理）/ `main`（顶级两选一）。 |
 
 ## source 顺序约束（务必保持这个顺序）
 
 ```
-core → detect → select → base → clash → compose → caddy → services → local_pkg → lifecycle → view → main
+core → detect → select → base → clash → compose → caddy → services
+     → local_pkg → lifecycle → backup_lib → backup → view → main
 ```
 
 约束来源：
@@ -32,6 +35,8 @@ core → detect → select → base → clash → compose → caddy → services
 - `detect.sh` 定义 `INST_*` / `SVC_*_INSTALLED` 等运行时变量 — `select / view / lifecycle` 依赖。
 - `clash.sh` 用到的 `BASE_DIR` 在 `core.sh` 定义；`reload_clash_subscription`（在 `services.sh`）反向引用 `_sync_clash_ufw`（`clash.sh`）。bash 是动态作用域，只要调用前 source 完即可，所以 `clash → services` 这个顺序必须保持。
 - `lifecycle.sh` 调度上面所有写文件的函数，必须在它们之后 source。
+- `backup_lib.sh` 提供低层备份 / 恢复函数；`backup.sh` 是它的菜单和编排层，依赖前者。
+- `view.sh` 的升级回滚菜单调用 `backup.sh` 的恢复入口，所以排在 backup 之后。
 - `main.sh` 是顶层菜单，所有功能都从这里分发，最后 source。
 
 ## 共享变量（跨模块使用，避免重复定义）
