@@ -76,6 +76,20 @@ BUILTIN_DEFAULTS = {
     # 外购 Clash 订阅：默认 URL（空 = 不启用），节点显示前缀
     "external_url": "",
     "external_name_prefix": "[外购] ",
+    # 静态 IP 出口：远端 anytls 资源池 + 路由策略
+    # static_proxies 元素：{name, type, server, port, password, sni, skip_cert_verify, udp}
+    "static_proxies": [],
+    # off : 不渲染静态 IP 子组、不挂静态 user
+    # on  : 渲染 静态IP_ALL + 静态IP_Partial 两个子组；rules 头部注入
+    #       DOMAIN-KEYWORD,xxx,静态IP_Partial（关键词命中默认进 Partial 子组，
+    #       由用户在该子组里手动选静态节点 / 信息节点决定走静态还是 VPS）
+    "static_strategy": "off",
+    # on 模式下走静态 IP 的预设服务包（包名见 STATIC_SERVICE_PACKS）
+    "static_service_packs": [],
+    # on 模式下额外的 DOMAIN-KEYWORD 白名单
+    "static_custom_keywords": [],
+    # 静态 IP 子组节点显示前缀
+    "static_name_prefix": "[静态] ",
 }
 
 # 默认值字段类型（影响 cmd_defaults 转换）
@@ -83,6 +97,21 @@ INT_DEFAULT_KEYS = {
     "traffic_gb", "reset_day", "expire_days", "update_interval_hours",
     "stats_refresh_minutes", "port_min", "port_max",
 }
+
+# 静态 IP 字段（list[str|dict] 型，CLI 用逗号或 YAML 文本传入）
+LIST_DEFAULT_KEYS = {
+    "static_proxies", "static_service_packs", "static_custom_keywords",
+}
+
+# on 模式下的预设服务包：包名 → DOMAIN-KEYWORD 列表
+STATIC_SERVICE_PACKS = {
+    "ai":        ["openai", "anthropic", "claude", "chatgpt", "perplexity", "googleapis"],
+    "streaming": ["netflix", "disneyplus", "hulu", "primevideo", "spotify"],
+    "banking":   ["paypal", "wise", "stripe"],
+    "social":    ["twitter", "facebook", "instagram"],
+}
+
+STATIC_STRATEGIES = ("off", "on")
 
 
 # 让 proxies 列表里的每个节点以 flow style（一行一个）输出，其它结构保持 block。
@@ -251,6 +280,168 @@ def resolve_external_url(sub, defs):
     return defs.get("external_url", "") or ""
 
 
+# ─── 静态 IP 出口（远端 socks5 outbound 资源池 + 路由策略）──────────
+def _coerce_static_proxy(p):
+    """把单条静态 IP 资源标准化成 dict；非 dict / 缺关键字段时返回 None。
+    必填：server, port, password；type 默认 socks5；username 可选；name 缺省自动生成"""
+    if not isinstance(p, dict):
+        return None
+    server = (p.get("server") or "").strip()
+    try:
+        port = int(p.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    password = p.get("password")
+    if not server or not (1 <= port <= 65535) or not password:
+        return None
+    username = (p.get("username") or "").strip() or None
+    out = {
+        "name": (p.get("name") or "").strip(),
+        "type": (p.get("type") or "socks5").strip().lower(),
+        "server": server,
+        "port": port,
+        "password": str(password),
+    }
+    if username:
+        out["username"] = username
+    return out
+
+
+def parse_static_proxy_line(line):
+    """解析单行字符串 → 静态 IP 资源 dict。支持：
+      host:port:user:password   （4 段，标准格式）
+      host:port:password        （3 段，无认证用户名）
+    其它格式返回 None。
+    """
+    if line is None:
+        return None
+    s = str(line).strip()
+    if not s or s.startswith("#"):
+        return None
+    parts = s.split(":")
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+    elif len(parts) == 3:
+        host, port, pwd = parts
+        user = ""
+    else:
+        return None
+    try:
+        port_n = int(port)
+    except ValueError:
+        return None
+    return _coerce_static_proxy({
+        "server": host.strip(),
+        "port": port_n,
+        "username": user.strip() or None,
+        "password": pwd,
+    })
+
+
+def parse_static_proxies_blob(blob):
+    """解析多行 / 逗号分隔的静态 IP 字符串列表 → list[dict]。
+    分隔符兼容换行、逗号、分号。空行/'#' 起始行忽略。"""
+    if blob is None:
+        return []
+    s = str(blob)
+    # 统一分隔符
+    for sep in (",", ";"):
+        s = s.replace(sep, "\n")
+    out = []
+    for line in s.splitlines():
+        rec = parse_static_proxy_line(line)
+        if rec:
+            out.append(rec)
+    return out
+
+
+def _norm_static_list(raw):
+    """list/None → 标准化后的 list[dict]，过滤无效项。"""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for p in raw:
+        c = _coerce_static_proxy(p)
+        if c is not None:
+            out.append(c)
+    return out
+
+
+def resolve_static_proxies(sub, defs):
+    """订阅级 static_proxies：与 external_url 同语义。
+    返回标准化后的 list[dict]。"""
+    if "static_proxies" in sub:
+        return _norm_static_list(sub.get("static_proxies"))
+    return _norm_static_list(defs.get("static_proxies"))
+
+
+def resolve_static_strategy(sub, defs):
+    v = sub.get("static_strategy") if "static_strategy" in sub else defs.get("static_strategy")
+    v = (v or "off").strip().lower()
+    if v in ("all", "partial", "on"):
+        return "on"
+    return "off"
+
+
+def resolve_static_keywords(sub, defs):
+    """合并预设服务包关键词 + 自定义关键词，去重保序。"""
+    packs = sub.get("static_service_packs") if "static_service_packs" in sub else defs.get("static_service_packs")
+    custom = sub.get("static_custom_keywords") if "static_custom_keywords" in sub else defs.get("static_custom_keywords")
+    out = []
+    seen = set()
+    for pack in (packs or []):
+        for kw in STATIC_SERVICE_PACKS.get(str(pack).strip().lower(), []):
+            if kw not in seen:
+                seen.add(kw)
+                out.append(kw)
+    for kw in (custom or []):
+        kw = str(kw).strip()
+        if kw and kw not in seen:
+            seen.add(kw)
+            out.append(kw)
+    return out
+
+
+def resolve_static_name_prefix(defs):
+    return defs.get("static_name_prefix") or ""
+
+
+def _static_user_name(sub_name, idx, group="A"):
+    """sing-box inbound user 名 / clash 节点 name 的稳定生成规则。
+    group: "A" = ALL 子组流量；"P" = Partial 子组流量。两组各有自己的 inbound user
+    密码，但在 route.rules 里都映射到同一个远端 outbound（资源是同一份）。"""
+    return f"{sub_name}--static-{group}-{idx}"
+
+
+def _ensure_static_passwords(sub, defs=None):
+    """根据生效的静态 IP 资源数量补齐 sub["static_passwords"] 与 ["static_passwords_p"]。
+    static_passwords      → ALL 子组（[静态_A]）使用的 inbound user 密码
+    static_passwords_p    → Partial 子组（[静态_P]）使用的 inbound user 密码
+    生效池：sub 自己的 static_proxies；缺失则用 defs.static_proxies（继承）。
+    长度不足 → 追加 gen_password()；长度过多 → 截断尾部。
+    返回是否发生变更。"""
+    if "static_proxies" in sub:
+        proxies = _norm_static_list(sub.get("static_proxies"))
+    elif defs is not None:
+        proxies = _norm_static_list(defs.get("static_proxies"))
+    else:
+        proxies = []
+    target = len(proxies)
+    changed = False
+    for key in ("static_passwords", "static_passwords_p"):
+        pwds = sub.get(key)
+        if not isinstance(pwds, list):
+            pwds = []
+        while len(pwds) < target:
+            pwds.append(gen_password())
+            changed = True
+        if len(pwds) > target:
+            pwds = pwds[:target]
+            changed = True
+        sub[key] = pwds
+    return changed
+
+
 def load_external_proxies(base, sub, defs, ttl_seconds):
     """拉外购 yaml，提取 proxies 列表，加前缀 + 命名去重。"""
     url = resolve_external_url(sub, defs)
@@ -353,15 +544,12 @@ def lookup_ip_geo(ip, base):
         return result
 
 
-def auto_node_name(node, base):
-    """节点 name 为空时，根据 server 地址自动生成显示名。
-    格式：[自建] 🇺🇸 United States · Los Angeles (1.2.3.4)
-    name 非空则原样返回。
-    """
-    name = (node.get("name") or "").strip()
-    if name:
-        return name
-    server = node.get("server", "")
+def format_geo_label(server, base):
+    """根据 server 地址查 IP 地理位置，返回纯文本标签：
+        "🇺🇸 United States · Los Angeles (1.2.3.4)"
+    server 为空时返回空串；查询失败时退化为 server 本身。"""
+    if not server:
+        return ""
     flag, country, city = lookup_ip_geo(server, base)
     parts = []
     if flag:
@@ -372,8 +560,19 @@ def auto_node_name(node, base):
         parts.append(f"· {city}")
     if server:
         parts.append(f"({server})")
-    geo_str = " ".join(parts) if parts else server
-    return f"[自建] {geo_str}" if geo_str else "[自建]"
+    return " ".join(parts) if parts else server
+
+
+def auto_node_name(node, base):
+    """节点 name 为空时，根据 server 地址自动生成显示名。
+    格式：[自建] 🇺🇸 United States · Los Angeles (1.2.3.4)
+    name 非空则原样返回。
+    """
+    name = (node.get("name") or "").strip()
+    if name:
+        return name
+    label = format_geo_label(node.get("server", ""), base)
+    return f"[自建] {label}" if label else "[自建]"
 
 
 def _normalize_sub(sub, defs, subs_for_port_alloc=None):
@@ -396,6 +595,10 @@ def _normalize_sub(sub, defs, subs_for_port_alloc=None):
     if not u["period_started"]:
         u["period_started"] = expected_period_start(date.today(), sub["reset_day"]).isoformat()
     sub["usage"] = u
+    # 静态 IP：standardize 后回写 sub（去掉脏数据），并按数量补齐 inbound user 密码
+    if "static_proxies" in sub:
+        sub["static_proxies"] = _norm_static_list(sub.get("static_proxies"))
+    _ensure_static_passwords(sub, defs)
     return sub
 
 
@@ -428,6 +631,10 @@ def dump_yaml(path, data):
 def read_defaults(base):
     d = load_yaml(paths(base)["defaults"]).get("defaults", {})
     out = dict(BUILTIN_DEFAULTS)
+    # list/dict 型字段拷副本，避免 BUILTIN_DEFAULTS 被外部 mutation
+    for k, v in BUILTIN_DEFAULTS.items():
+        if isinstance(v, (list, dict)):
+            out[k] = list(v) if isinstance(v, list) else dict(v)
     out.update({k: d[k] for k in BUILTIN_DEFAULTS if k in d})
     return out
 
@@ -500,6 +707,31 @@ def fmt_sub(s, defs=None):
     else:
         gdef = (defs or {}).get("external_url", "")
         ext_line = f"(继承默认: {gdef})" if gdef else "(未启用)"
+    # 静态 IP 出口显示
+    strategy = resolve_static_strategy(s, defs or {})
+    own_static = "static_proxies" in s
+    static_list = resolve_static_proxies(s, defs or {})
+    if own_static and not static_list:
+        static_src = "(显式禁用)"
+    elif own_static:
+        static_src = "(订阅独立)"
+    elif static_list:
+        static_src = "(继承默认)"
+    else:
+        static_src = "(未配置)"
+    static_lines = []
+    static_lines.append(f"      静态 IP 策略: {strategy}  {static_src}")
+    if static_list:
+        for i, p in enumerate(static_list, 1):
+            user = p.get("username") or "-"
+            static_lines.append(f"        [{i}] {p['server']}:{p['port']} user={user}")
+    else:
+        static_lines.append("        (无资源)")
+    # 服务包 / 关键词（仅 on 模式生效，但都展示）
+    packs = s.get("static_service_packs") if "static_service_packs" in s else (defs or {}).get("static_service_packs") or []
+    kws = s.get("static_custom_keywords") if "static_custom_keywords" in s else (defs or {}).get("static_custom_keywords") or []
+    static_lines.append(f"      静态 IP 服务包: {','.join(packs) if packs else '(无)'}")
+    static_lines.append(f"      静态 IP 关键词: {','.join(kws) if kws else '(无)'}")
     return (
         f"  - {s['name']}\n"
         f"      token       : {s['token']}\n"
@@ -515,7 +747,8 @@ def fmt_sub(s, defs=None):
         f"      到期        : {s.get('expire', '?')}\n"
         f"      客户端拉取  : 每 {s.get('update_interval_hours', '?')} 小时\n"
         f"      节点过滤    : {s.get('nodes') or '(全部)'}\n"
-        f"      外购源      : {ext_line}"
+        f"      外购源      : {ext_line}\n"
+        + "\n".join(static_lines)
     )
 
 
@@ -611,6 +844,85 @@ def apply_fields(sub, args, defs, creating, all_subs):
             sub.pop("external_url", None)
         else:
             sub["external_url"] = args.external_url
+    # ── 静态 IP 出口 ────────────────────────────────────────────────
+    if getattr(args, "static_strategy", None) is not None:
+        v = args.static_strategy
+        if v == "-":
+            sub.pop("static_strategy", None)
+        else:
+            v = v.strip().lower()
+            if v not in STATIC_STRATEGIES:
+                raise SystemExit(f"static_strategy 必须是 {'/'.join(STATIC_STRATEGIES)}")
+            sub["static_strategy"] = v
+    if getattr(args, "static_service_packs", None) is not None:
+        v = args.static_service_packs
+        if v == "-":
+            sub.pop("static_service_packs", None)
+        else:
+            packs = [p.strip().lower() for p in v.split(",") if p.strip()]
+            unknown = [p for p in packs if p not in STATIC_SERVICE_PACKS]
+            if unknown:
+                raise SystemExit(f"未知服务包: {', '.join(unknown)}（可选: {', '.join(sorted(STATIC_SERVICE_PACKS))}）")
+            sub["static_service_packs"] = packs
+    if getattr(args, "static_custom_keywords", None) is not None:
+        v = args.static_custom_keywords
+        if v == "-":
+            sub.pop("static_custom_keywords", None)
+        else:
+            kws = [k.strip() for k in v.split(",") if k.strip()]
+            sub["static_custom_keywords"] = kws
+    if getattr(args, "static_proxies", None) is not None:
+        v = args.static_proxies
+        if v == "-":
+            # 清空 → 回继承全局 + 重置每订阅密码
+            sub.pop("static_proxies", None)
+            sub.pop("static_passwords", None)
+            sub.pop("static_passwords_p", None)
+        else:
+            parsed = parse_static_proxies_blob(v)
+            sub["static_proxies"] = parsed
+            # 资源数量变了，密码列表跟着重算
+            sub.pop("static_passwords", None)
+            sub.pop("static_passwords_p", None)
+            _ensure_static_passwords(sub, defs)
+    # 增量追加：--static-proxy-add 可多次出现
+    adds = getattr(args, "static_proxy_add", None) or []
+    rems = getattr(args, "static_proxy_remove", None) or []
+    if adds or rems:
+        # 在现有基础上增删；若 sub 还没显式 static_proxies，则从默认值拷一份当起点
+        cur = list(_norm_static_list(sub.get("static_proxies"))) if "static_proxies" in sub \
+              else list(_norm_static_list(defs.get("static_proxies")))
+        # 删除：支持索引（1 起算）或 server:port 匹配
+        for token in rems:
+            t = str(token).strip()
+            if not t:
+                continue
+            removed = False
+            if t.isdigit():
+                idx = int(t) - 1
+                if 0 <= idx < len(cur):
+                    cur.pop(idx)
+                    removed = True
+            if not removed and ":" in t:
+                host, _, port = t.partition(":")
+                try:
+                    port_n = int(port)
+                except ValueError:
+                    port_n = -1
+                for i, p in enumerate(cur):
+                    if p.get("server") == host and int(p.get("port", 0)) == port_n:
+                        cur.pop(i)
+                        removed = True
+                        break
+            if not removed:
+                raise SystemExit(f"未找到要删除的静态 IP: {t}（用 1 起算的索引或 host:port）")
+        # 追加：每个 token 可能含多行/多条
+        for blob in adds:
+            for rec in parse_static_proxies_blob(blob):
+                cur.append(rec)
+        sub["static_proxies"] = cur
+        # 数量变了 → 让 _ensure_static_passwords 按新长度补齐 / 截断
+        _ensure_static_passwords(sub, defs)
 
 
 def cmd_add(args):
@@ -674,11 +986,66 @@ def cmd_defaults(args):
         ("port_max", "port_max"),
         ("external_url", "external_url"),
         ("external_name_prefix", "external_name_prefix"),
+        ("static_strategy", "static_strategy"),
+        ("static_name_prefix", "static_name_prefix"),
     ):
         v = getattr(args, attr, None)
         if v is None:
             continue
         defs[key] = int(v) if key in INT_DEFAULT_KEYS else str(v)
+        changed = True
+    # 静态 IP 策略校验
+    if "static_strategy" in defs:
+        if str(defs["static_strategy"]).strip().lower() not in STATIC_STRATEGIES:
+            raise SystemExit(f"static_strategy 必须是 {'/'.join(STATIC_STRATEGIES)}")
+    # 列表型字段：逗号分隔 → list
+    for key, attr in (
+        ("static_service_packs", "static_service_packs"),
+        ("static_custom_keywords", "static_custom_keywords"),
+    ):
+        v = getattr(args, attr, None)
+        if v is None:
+            continue
+        items = [x.strip() for x in str(v).split(",") if x.strip()]
+        if key == "static_service_packs":
+            unknown = [p for p in items if p.lower() not in STATIC_SERVICE_PACKS]
+            if unknown:
+                raise SystemExit(f"未知服务包: {', '.join(unknown)}（可选: {', '.join(sorted(STATIC_SERVICE_PACKS))}）")
+            items = [p.lower() for p in items]
+        defs[key] = items
+        changed = True
+    # 静态 IP 资源池（默认值）：blob 解析或增量
+    if getattr(args, "static_proxies", None) is not None:
+        defs["static_proxies"] = parse_static_proxies_blob(args.static_proxies)
+        changed = True
+    adds = getattr(args, "static_proxy_add", None) or []
+    rems = getattr(args, "static_proxy_remove", None) or []
+    if adds or rems:
+        cur = list(_norm_static_list(defs.get("static_proxies")))
+        for token in rems:
+            t = str(token).strip()
+            if not t:
+                continue
+            removed = False
+            if t.isdigit():
+                idx = int(t) - 1
+                if 0 <= idx < len(cur):
+                    cur.pop(idx); removed = True
+            if not removed and ":" in t:
+                host, _, port = t.partition(":")
+                try:
+                    port_n = int(port)
+                except ValueError:
+                    port_n = -1
+                for i, p in enumerate(cur):
+                    if p.get("server") == host and int(p.get("port", 0)) == port_n:
+                        cur.pop(i); removed = True; break
+            if not removed:
+                raise SystemExit(f"未找到要删除的静态 IP: {t}（用 1 起算的索引或 host:port）")
+        for blob in adds:
+            for rec in parse_static_proxies_blob(blob):
+                cur.append(rec)
+        defs["static_proxies"] = cur
         changed = True
     if changed:
         write_defaults(args.base, defs)
@@ -711,6 +1078,21 @@ def make_proxy(name, n, password=None, port=None):
         "udp": True,
         "sni": n.get("sni", "baidu.com"),
         "skip-cert-verify": bool(n.get("skip_cert_verify", True)),
+    })
+
+
+def make_static_proxy(name, sub_password, sub_port, vps_server, sni):
+    """静态 IP 节点：客户端看到的还是连本机 anytls，server/port 都是本机；
+    password 用 sub["static_passwords"][i]，让 sing-box 据此把流量路由去对应的远端 outbound。"""
+    return _FlowMap({
+        "name": name,
+        "type": "anytls",
+        "server": vps_server,
+        "port": sub_port,
+        "password": sub_password,
+        "udp": True,
+        "sni": sni or vps_server,
+        "skip-cert-verify": True,
     })
 
 
@@ -764,7 +1146,76 @@ def render_one(base, sub):
     ttl = int(defs.get("stats_refresh_minutes", 10)) * 60
     external = load_external_proxies(base, sub, defs, ttl)
 
-    proxies = info + real + external
+    # ── 静态 IP 出口节点 ─────────────────────────────────────────────
+    # 客户端看到的还是连本机的 anytls 节点（server=VPS_IP, port=订阅端口）；
+    # password 取自 sub["static_passwords"][i] (ALL 组) 或 ["static_passwords_p"][i] (Partial 组)，
+    # sing-box inbound 多挂的 user 在 route.rules 里被映射到对应的远端 outbound。
+    # A 组与 P 组共用同一份资源池 → route 把两套 user 都路由到同一个远端 outbound，
+    # 但子组分开方便客户端在 ALL/Partial 两种策略间切换。
+    static_strategy = "off" if expired else resolve_static_strategy(sub, defs)
+    static_proxies = resolve_static_proxies(sub, defs)
+    static_pwds_a = sub.get("static_passwords") or []
+    static_pwds_p = sub.get("static_passwords_p") or []
+    static_nodes_a = []  # ALL  子组真实节点（前缀 [静态_A]）
+    static_nodes_p = []  # Partial 子组真实节点（前缀 [静态_P]）
+    if static_strategy == "on" and static_proxies and static_pwds_a and static_pwds_p:
+        # 真实 vps server / sni 取自首个自建节点（同 head）
+        vps_server = head.get("server")
+        sni = head.get("sni")
+        seen_names = set(pp.get("name") for pp in info + real + external)
+        def _uniq(name):
+            if name not in seen_names:
+                seen_names.add(name)
+                return name
+            j = 1
+            while True:
+                j += 1
+                cand = f"{name} #{j}"
+                if cand not in seen_names:
+                    seen_names.add(cand)
+                    return cand
+        for i, sp in enumerate(static_proxies):
+            if i >= min(len(static_pwds_a), len(static_pwds_p)):
+                break
+            # 节点显示名复用 VPS 节点的 geo 命名规则
+            label = format_geo_label(sp.get("server", ""), base) or sp.get("server") or ""
+            name_a = _uniq(f"[静态_A] {label}")
+            name_p = _uniq(f"[静态_P] {label}")
+            static_nodes_a.append(make_static_proxy(
+                name=name_a, sub_password=static_pwds_a[i],
+                sub_port=sub_port, vps_server=vps_server, sni=sni,
+            ))
+            static_nodes_p.append(make_static_proxy(
+                name=name_p, sub_password=static_pwds_p[i],
+                sub_port=sub_port, vps_server=vps_server, sni=sni,
+            ))
+
+    # Partial 子组顶部的"信息说明节点"：用主 password（不是静态密码），所以
+    # sing-box 把它识别为主 user，流量沿 final=direct 出去 = VPS 出口。
+    # 名字本身是说明文本（参照 head 信息节点风格）。
+    partial_info_nodes = []
+    if static_nodes_p:
+        packs_for_info = sub.get("static_service_packs") if "static_service_packs" in sub \
+                         else (defs or {}).get("static_service_packs") or []
+        custom_for_info = sub.get("static_custom_keywords") if "static_custom_keywords" in sub \
+                          else (defs or {}).get("static_custom_keywords") or []
+        lines = []
+        if packs_for_info:
+            lines.append(f"[Partial] 服务包: {','.join(packs_for_info)}")
+        if custom_for_info:
+            lines.append(f"[Partial] 关键词: {','.join(custom_for_info)}")
+        if not lines:
+            lines.append("[Partial] 未配服务包/关键词")
+        for ln in lines:
+            partial_info_nodes.append(make_static_proxy(
+                name=ln,
+                sub_password=sub["password"],  # 主 user → final: direct → VPS
+                sub_port=sub_port,
+                vps_server=head.get("server"),
+                sni=head.get("sni"),
+            ))
+
+    proxies = info + real + static_nodes_a + static_nodes_p + partial_info_nodes + external
     tpl["proxies"] = proxies
 
     # proxy-groups：始终拆 "VPS 节点" 子组（含信息节点+自建），有外购时再加 "外购" 子组；
@@ -780,9 +1231,13 @@ def render_one(base, sub):
 
     vps_names = [pp["name"] for pp in (info + real)]
     external_names = [pp["name"] for pp in external]
+    static_a_names = [pp["name"] for pp in static_nodes_a]
+    static_p_names = [pp["name"] for pp in static_nodes_p]
+    partial_info_names = [pp["name"] for pp in partial_info_nodes]
 
-    # 移除上一次渲染遗留的子组（idempotent）
-    groups[:] = [g for g in groups if g.get("name") not in ("VPS 节点", "外购")]
+    # 移除上一次渲染遗留的子组（idempotent）；旧版 "静态 IP" 名字也清掉
+    _legacy = {"VPS 节点", "外购", "静态 IP", "静态IP_ALL", "静态IP_Partial"}
+    groups[:] = [g for g in groups if g.get("name") not in _legacy]
     # first 可能因为上一行被剔除（如果它就叫 "VPS 节点"），重新拿
     first = groups[0] if groups else _FlowMap({"name": "代理", "type": "select"})
     if not groups:
@@ -793,17 +1248,50 @@ def render_one(base, sub):
     groups[:] = [_FlowMap(g) if not isinstance(g, _FlowMap) else g for g in groups]
     first = groups[0]
 
-    sub_entries = ["VPS 节点"] + (["外购"] if external_names else [])
+    # 主组 entries 顺序：
+    #   off / 无静态资源 → [VPS 节点]
+    #   on               → [VPS 节点, 静态IP_Partial, 静态IP_ALL]   （默认仍以 VPS 优先）
+    sub_entries = ["VPS 节点"]
+    if static_a_names:
+        sub_entries.append("静态IP_Partial")
+        sub_entries.append("静态IP_ALL")
+    if external_names:
+        sub_entries.append("外购")
     first["proxies"] = keep_front + sub_entries + keep_back
+
     groups.append(_FlowMap({"name": "VPS 节点", "type": "select", "proxies": vps_names}))
+    if static_a_names:
+        # ALL 子组：纯 [静态_A] 节点 + DIRECT 兜底
+        groups.append(_FlowMap({
+            "name": "静态IP_ALL", "type": "select",
+            "proxies": static_a_names + ["DIRECT"],
+        }))
+        # Partial 子组：信息节点（=走 VPS）+ [静态_P] 节点 + DIRECT
+        groups.append(_FlowMap({
+            "name": "静态IP_Partial", "type": "select",
+            "proxies": partial_info_names + static_p_names + ["DIRECT"],
+        }))
     if external_names:
         groups.append(_FlowMap({"name": "外购", "type": "select", "proxies": ["DIRECT"] + external_names}))
+
+    # ── on 模式：在 rules 头部注入 DOMAIN-KEYWORD,xxx,静态IP_Partial ─────
+    if static_a_names:
+        keywords = resolve_static_keywords(sub, defs)
+        if keywords:
+            existing_rules = list(tpl.get("rules") or [])
+            injected = [f"DOMAIN-KEYWORD,{kw},静态IP_Partial" for kw in keywords]
+            tpl["rules"] = injected + existing_rules
 
     out_dir = os.path.join(p["output"], sub["token"])
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "clash.yaml")
     dump_yaml(out_path, tpl)
-    extra = f", 外购 {len(external)}" if external else ""
+    extra_parts = []
+    if external:
+        extra_parts.append(f"外购 {len(external)}")
+    if static_nodes_a:
+        extra_parts.append(f"静态 IP {len(static_nodes_a)}/{static_strategy}")
+    extra = (", " + ", ".join(extra_parts)) if extra_parts else ""
     print(f"rendered: {sub['name']} → {out_path} ({len(real)} 节点{extra}, port={sub_port})")
 
 
@@ -853,20 +1341,49 @@ def cmd_caddy_blocks(args):
 
 
 # ─── sing-box / nftables / 计费（多端口、按订阅统计） ─────────────
+def _outbound_tag(sp):
+    """根据资源 (server, port, username, password) 算出稳定 outbound tag。
+    同一份资源被多个订阅引用时复用同一个 outbound，避免重复挂连接。"""
+    h = hashlib.sha1(
+        f"{sp['server']}|{sp['port']}|{sp.get('username') or ''}|{sp['password']}".encode("utf-8")
+    ).hexdigest()[:10]
+    return f"static-{h}"
+
+
 def cmd_sing_box_inbounds(args):
     """输出 sing-box config.json 的 inbounds[] 数组（多 anytls inbound，每订阅一个端口）。
-    所有订阅都输出，限流交给 nftables drop（避免 restart sing-box 冲断在线连接）。
+    每订阅可挂多个 user：默认 user（走 direct）+ 每个静态 IP 资源 2 个 user
+    （static-A-N 走 ALL 子组对应远端 outbound、static-P-N 走 Partial 子组同一远端 outbound）。
+    限流交给 nftables drop（避免 restart sing-box 冲断在线连接）。
     --tls-cert / --tls-key / --server-name 必填，由 sh 脚本统一传入。"""
     import json as _json
     subs = read_subs_normalized(args.base)
+    defs = read_defaults(args.base)
     inbounds = []
     for s in subs:
+        users = [{"name": s["name"], "password": s["password"]}]
+        # 静态 IP user（仅在策略不是 off 且有资源 + 密码时挂）
+        if resolve_static_strategy(s, defs) != "off":
+            sps = resolve_static_proxies(s, defs)
+            pwds_a = s.get("static_passwords") or []
+            pwds_p = s.get("static_passwords_p") or []
+            for i, _sp in enumerate(sps):
+                if i >= min(len(pwds_a), len(pwds_p)):
+                    break
+                users.append({
+                    "name": _static_user_name(s["name"], i, "A"),
+                    "password": pwds_a[i],
+                })
+                users.append({
+                    "name": _static_user_name(s["name"], i, "P"),
+                    "password": pwds_p[i],
+                })
         inbounds.append({
             "type": "anytls",
             "tag": f"in-{s['name']}",
             "listen": "0.0.0.0",
             "listen_port": int(s["port"]),
-            "users": [{"name": s["name"], "password": s["password"]}],
+            "users": users,
             "padding_scheme": [],
             "tls": {
                 "enabled": True,
@@ -876,6 +1393,83 @@ def cmd_sing_box_inbounds(args):
             },
         })
     print(_json.dumps(inbounds, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_sing_box_outbounds(args):
+    """输出 sing-box config.json 的 outbounds[] 数组。
+    固定 direct + 全局/订阅去重后的静态 IP outbound（按 (server,port,user,pwd) 去重）。
+    所有静态 IP 资源都按 socks5 outbound 注入：远端是公网 SOCKS5 服务器。"""
+    import json as _json
+    subs = read_subs_normalized(args.base)
+    defs = read_defaults(args.base)
+    outbounds = [{"type": "direct", "tag": "direct"}]
+    seen = set()
+    pool = []
+    # 默认值池 + 各订阅自有池都收集（即使该订阅 strategy=off，资源对应的 outbound 也可保留无害）
+    for s in subs:
+        if resolve_static_strategy(s, defs) == "off":
+            continue
+        pool.extend(resolve_static_proxies(s, defs))
+    for sp in pool:
+        tag = _outbound_tag(sp)
+        if tag in seen:
+            continue
+        seen.add(tag)
+        kind = (sp.get("type") or "socks5").strip().lower()
+        ob = {
+            "type": kind,
+            "tag": tag,
+            "server": sp["server"],
+            "server_port": int(sp["port"]),
+        }
+        # socks 在 sing-box 里走 username/password；anytls 用 password；其他先按 socks5 兜底
+        if kind in ("socks", "socks5"):
+            ob["type"] = "socks"
+            ob["version"] = "5"
+            if sp.get("username"):
+                ob["username"] = sp["username"]
+            ob["password"] = sp["password"]
+        elif kind == "http":
+            if sp.get("username"):
+                ob["username"] = sp["username"]
+            ob["password"] = sp["password"]
+        else:
+            # anytls / 其它带 password 的
+            ob["password"] = sp["password"]
+        outbounds.append(ob)
+    print(_json.dumps(outbounds, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_sing_box_route_rules(args):
+    """输出 sing-box config.json 的 route.rules[] 增量片段（auth_user → outbound 映射）。
+    sh 脚本拼接到 route.rules 的尾部（在 sniff / dns hijack 之后、final=direct 之前）。
+    sing-box 1.13+ 用 auth_user 匹配 inbound 已认证用户名，且需要显式 action=route。
+    A/P 两套 user 都映射到同一份资源对应的远端 outbound（同一份资源、不同子组）。"""
+    import json as _json
+    from collections import OrderedDict
+    subs = read_subs_normalized(args.base)
+    defs = read_defaults(args.base)
+    by_ob = OrderedDict()
+    for s in subs:
+        if resolve_static_strategy(s, defs) == "off":
+            continue
+        sps = resolve_static_proxies(s, defs)
+        pwds_a = s.get("static_passwords") or []
+        pwds_p = s.get("static_passwords_p") or []
+        for i, sp in enumerate(sps):
+            if i >= min(len(pwds_a), len(pwds_p)):
+                break
+            tag = _outbound_tag(sp)
+            users = by_ob.setdefault(tag, [])
+            users.append(_static_user_name(s["name"], i, "A"))
+            users.append(_static_user_name(s["name"], i, "P"))
+    rules = [
+        {"auth_user": users, "action": "route", "outbound": tag}
+        for tag, users in by_ob.items()
+    ]
+    print(_json.dumps(rules, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1080,6 +1674,95 @@ def cmd_clear_external_cache(args):
     return 0
 
 
+def cmd_field_values(args):
+    """输出某条订阅（或默认值）的当前字段，供 shell 菜单显示原值。
+    每行 "<key>=<value>"，value 可能为空（表示未设置/继承）。
+    """
+    defs = read_defaults(args.base)
+    if args.name:
+        subs = read_subs_normalized(args.base)
+        s = find_sub(subs, args.name)
+        if not s:
+            print(f"未找到订阅: {args.name}", file=sys.stderr)
+            return 1
+        out = {
+            "rename": s.get("name", ""),
+            "traffic_gb": str(s.get("traffic_gb", "")),
+            "reset_day": str(s.get("reset_day", "")),
+            "expire": s.get("expire", ""),
+            "interval": str(s.get("update_interval_hours", "")),
+            "password": s.get("password", ""),
+            "port": str(s.get("port", "")),
+        }
+        if "external_url" in s:
+            out["external_url"] = s["external_url"] or "(显式禁用)"
+        else:
+            gdef = defs.get("external_url", "") or ""
+            out["external_url"] = f"(继承: {gdef})" if gdef else "(继承: 未启用)"
+        if "static_strategy" in s:
+            out["static_strategy"] = str(s.get("static_strategy") or "")
+        else:
+            out["static_strategy"] = f"(继承: {defs.get('static_strategy','off')})"
+        if "static_service_packs" in s:
+            out["static_service_packs"] = ",".join(s.get("static_service_packs") or []) or "(空)"
+        else:
+            gv = defs.get("static_service_packs") or []
+            out["static_service_packs"] = f"(继承: {','.join(gv) if gv else '空'})"
+        if "static_custom_keywords" in s:
+            out["static_custom_keywords"] = ",".join(s.get("static_custom_keywords") or []) or "(空)"
+        else:
+            gv = defs.get("static_custom_keywords") or []
+            out["static_custom_keywords"] = f"(继承: {','.join(gv) if gv else '空'})"
+    else:
+        # defaults 视图
+        out = {
+            "traffic_gb": str(defs.get("traffic_gb", "")),
+            "reset_day": str(defs.get("reset_day", "")),
+            "expire_days": str(defs.get("expire_days", "")),
+            "interval": str(defs.get("update_interval_hours", "")),
+            "stats_refresh_minutes": str(defs.get("stats_refresh_minutes", "")),
+            "port_min": str(defs.get("port_min", "")),
+            "port_max": str(defs.get("port_max", "")),
+            "external_url": defs.get("external_url", "") or "(未启用)",
+            "external_name_prefix": defs.get("external_name_prefix", ""),
+            "static_strategy": str(defs.get("static_strategy", "off")),
+            "static_service_packs": ",".join(defs.get("static_service_packs") or []) or "(空)",
+            "static_custom_keywords": ",".join(defs.get("static_custom_keywords") or []) or "(空)",
+            "static_name_prefix": defs.get("static_name_prefix", ""),
+        }
+    for k, v in out.items():
+        # 显示用，包括 "(继承: …)" 这种带空格/括号的字符串都安全
+        print(f"{k}={v}")
+    return 0
+
+
+def cmd_static_list(args):
+    """列出某订阅当前生效的静态 IP 资源池（含索引），脚本可读格式。
+    输出格式：每行 "<idx> <server>:<port> <user> <来源>"。
+    --name 留空 = 列默认值。"""
+    defs = read_defaults(args.base)
+    if args.name:
+        subs = read_subs_normalized(args.base)
+        s = find_sub(subs, args.name)
+        if not s:
+            print(f"未找到订阅: {args.name}", file=sys.stderr)
+            return 1
+        proxies = resolve_static_proxies(s, defs)
+        src = "订阅独立" if "static_proxies" in s and s["static_proxies"] else (
+              "继承默认" if proxies else "未配置")
+    else:
+        proxies = _norm_static_list(defs.get("static_proxies"))
+        src = "默认值"
+    if not proxies:
+        print(f"(无静态 IP 资源)  [{src}]")
+        return 0
+    print(f"共 {len(proxies)} 条静态 IP  [{src}]")
+    for i, p in enumerate(proxies, 1):
+        user = p.get("username") or "-"
+        print(f"  {i}  {p['server']}:{p['port']}  user={user}  type={p.get('type','socks5')}")
+    return 0
+
+
 # ─── argparse 装配 ─────────────────────────────────────────────────
 def build_parser():
     p = argparse.ArgumentParser(description="Clash 订阅管理 + 渲染")
@@ -1107,6 +1790,18 @@ def build_parser():
     a.add_argument("--port", type=int)
     a.add_argument("--external-url", dest="external_url",
                    help='外购 URL；"-" 表示清空回继承全局；空串表示显式禁用')
+    a.add_argument("--static-strategy", dest="static_strategy",
+                   help='off/on；"-" = 清空回继承')
+    a.add_argument("--static-service-packs", dest="static_service_packs",
+                   help='on 模式预设服务包，逗号分隔（如 ai,streaming）；"-" = 清空回继承')
+    a.add_argument("--static-custom-keywords", dest="static_custom_keywords",
+                   help='on 模式自定义 DOMAIN-KEYWORD，逗号分隔；"-" = 清空回继承')
+    a.add_argument("--static-proxies", dest="static_proxies",
+                   help='整体替换静态 IP 资源池；多行格式 host:port:user:password；"-" = 清空回继承')
+    a.add_argument("--static-proxy-add", dest="static_proxy_add", action="append", default=[],
+                   help='追加单条/多条静态 IP（host:port:user:password；可重复 / 多行 / 逗号分隔）')
+    a.add_argument("--static-proxy-remove", dest="static_proxy_remove", action="append", default=[],
+                   help='删除静态 IP，参数为 1 起算的索引或 host:port；可重复')
 
     e = sub.add_parser("edit")
     e.add_argument("name")
@@ -1119,6 +1814,18 @@ def build_parser():
     e.add_argument("--port", type=int)
     e.add_argument("--external-url", dest="external_url",
                    help='外购 URL；"-" 表示清空回继承全局；空串表示显式禁用')
+    e.add_argument("--static-strategy", dest="static_strategy",
+                   help='off/on；"-" = 清空回继承')
+    e.add_argument("--static-service-packs", dest="static_service_packs",
+                   help='on 模式预设服务包，逗号分隔；"-" = 清空回继承')
+    e.add_argument("--static-custom-keywords", dest="static_custom_keywords",
+                   help='on 模式自定义关键词，逗号分隔；"-" = 清空回继承')
+    e.add_argument("--static-proxies", dest="static_proxies",
+                   help='整体替换静态 IP 资源池；"-" = 清空回继承')
+    e.add_argument("--static-proxy-add", dest="static_proxy_add", action="append", default=[],
+                   help='追加静态 IP；可重复')
+    e.add_argument("--static-proxy-remove", dest="static_proxy_remove", action="append", default=[],
+                   help='删除静态 IP（索引或 host:port）；可重复')
 
     r = sub.add_parser("remove")
     r.add_argument("name")
@@ -1136,6 +1843,20 @@ def build_parser():
                    help="默认外购 URL（空字符串 = 不启用）")
     d.add_argument("--external-name-prefix", dest="external_name_prefix",
                    help="外购节点显示前缀")
+    d.add_argument("--static-strategy", dest="static_strategy",
+                   help="默认静态 IP 策略 off/on")
+    d.add_argument("--static-service-packs", dest="static_service_packs",
+                   help="默认 on 服务包，逗号分隔")
+    d.add_argument("--static-custom-keywords", dest="static_custom_keywords",
+                   help="默认 on 自定义关键词，逗号分隔")
+    d.add_argument("--static-proxies", dest="static_proxies",
+                   help="默认静态 IP 资源池，多行 host:port:user:password")
+    d.add_argument("--static-proxy-add", dest="static_proxy_add", action="append", default=[],
+                   help="追加默认静态 IP；可重复")
+    d.add_argument("--static-proxy-remove", dest="static_proxy_remove", action="append", default=[],
+                   help="删除默认静态 IP（索引或 host:port）；可重复")
+    d.add_argument("--static-name-prefix", dest="static_name_prefix",
+                   help="静态 IP 节点显示前缀")
 
     rd = sub.add_parser("render")
     g = rd.add_mutually_exclusive_group()
@@ -1149,6 +1870,9 @@ def build_parser():
     sbi.add_argument("--tls-cert", dest="tls_cert", required=True)
     sbi.add_argument("--tls-key", dest="tls_key", required=True)
     sbi.add_argument("--server-name", dest="server_name", required=True)
+
+    sub.add_parser("sing-box-outbounds")
+    sub.add_parser("sing-box-route-rules")
 
     sub.add_parser("nft-config")
     sub.add_parser("nft-disabled-ports")
@@ -1174,6 +1898,12 @@ def build_parser():
 
     sub.add_parser("clear-external-cache")
 
+    fv = sub.add_parser("field-values", help="输出 edit 菜单要显示的当前字段值（key=value 行）")
+    fv.add_argument("--name", help="订阅名；省略则输出 defaults 字段")
+
+    sl = sub.add_parser("static-list", help="列出静态 IP 资源（含索引）")
+    sl.add_argument("--name", help="订阅名；省略则列默认值")
+
     return p
 
 
@@ -1188,6 +1918,8 @@ HANDLERS = {
     "render": cmd_render,
     "caddy-blocks": cmd_caddy_blocks,
     "sing-box-inbounds": cmd_sing_box_inbounds,
+    "sing-box-outbounds": cmd_sing_box_outbounds,
+    "sing-box-route-rules": cmd_sing_box_route_rules,
     "nft-config": cmd_nft_config,
     "nft-disabled-ports": cmd_nft_disabled_ports,
     "usage-from-nft": cmd_usage_from_nft,
@@ -1197,6 +1929,8 @@ HANDLERS = {
     "set-disabled": cmd_set_disabled,
     "get-setting": cmd_get_setting,
     "clear-external-cache": cmd_clear_external_cache,
+    "field-values": cmd_field_values,
+    "static-list": cmd_static_list,
 }
 
 

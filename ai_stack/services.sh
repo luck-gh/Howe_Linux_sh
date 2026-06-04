@@ -134,12 +134,22 @@ write_singbox_config() {
 
   # 多 inbound：每订阅独立 anytls 端口；clash_subs.py 输出 inbounds[] JSON
   local _inbounds_json="[]"
+  local _outbounds_json='[{"type":"direct","tag":"direct"}]'
+  local _user_route_rules_json="[]"
   if [[ -x "$(_clash_py)" ]] && [[ -f "$(_clash_dir)/subs.yaml" ]]; then
     _inbounds_json=$(python3 "$(_clash_py)" --base "$(_clash_dir)" \
                        sing-box-inbounds \
                        --tls-cert "$SINGBOX_DIR/cert.pem" \
                        --tls-key  "$SINGBOX_DIR/key.pem" \
                        --server-name "${VPS_IP:-localhost}" 2>/dev/null || echo "[]")
+    # 静态 IP 出口：远端 socks5/anytls outbound + user→outbound 路由规则
+    local _ob _rr
+    _ob=$(python3 "$(_clash_py)" --base "$(_clash_dir)" sing-box-outbounds 2>/dev/null) \
+      && echo "$_ob" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1 \
+      && _outbounds_json="$_ob"
+    _rr=$(python3 "$(_clash_py)" --base "$(_clash_dir)" sing-box-route-rules 2>/dev/null) \
+      && echo "$_rr" | jq -e 'type == "array"' >/dev/null 2>&1 \
+      && _user_route_rules_json="$_rr"
   fi
   # sing-box 至少要有一个 inbound 才能起。空时塞一个监听 127.0.0.1 的占位 inbound
   if ! echo "$_inbounds_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
@@ -148,32 +158,36 @@ write_singbox_config() {
       {"type":"direct","tag":"placeholder","listen":"127.0.0.1","listen_port":1}
     ]')
   fi
-
-  cat > "$SINGBOX_DIR/config.json" <<EOF
-{
-  "log": { "level": "info", "timestamp": true, "output": "/var/log/sing-box.log" },
-  "dns": {
-    "servers": [
-      { "tag": "cf",  "type": "tls", "server": "1.1.1.1" },
-      { "tag": "ali", "type": "udp", "server": "223.5.5.5" }
-    ],
-    "final": "cf"
-  },
-  "inbounds": ${_inbounds_json},
-  "outbounds": [
-    { "type": "direct", "tag": "direct" }
-  ],
-  "route": {
-    "default_domain_resolver": "cf",
-    "rules": [
-      { "action": "sniff" },
-      { "protocol": "dns", "action": "hijack-dns" }
-    ],
-    "final": "direct",
-    "auto_detect_interface": true
-  }
-}
-EOF
+  # 静态 IP 路由规则拼到固定的 sniff / dns hijack 之后，final 仍是 direct
+  local _route_rules_json
+  _route_rules_json=$(jq -nc --argjson user_rules "$_user_route_rules_json" '
+    [{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"}] + $user_rules
+  ')
+  # 用 jq 拼出完整 config（避免手拼 JSON 出错），再写盘
+  local _cfg_json
+  _cfg_json=$(jq -n \
+    --argjson inbounds  "$_inbounds_json" \
+    --argjson outbounds "$_outbounds_json" \
+    --argjson rules     "$_route_rules_json" \
+    '{
+      log: { level: "info", timestamp: true, output: "/var/log/sing-box.log" },
+      dns: {
+        servers: [
+          { tag: "cf",  type: "tls", server: "1.1.1.1" },
+          { tag: "ali", type: "udp", server: "223.5.5.5" }
+        ],
+        final: "cf"
+      },
+      inbounds:  $inbounds,
+      outbounds: $outbounds,
+      route: {
+        default_domain_resolver: "cf",
+        rules: $rules,
+        final: "direct",
+        auto_detect_interface: true
+      }
+    }')
+  printf '%s\n' "$_cfg_json" > "$SINGBOX_DIR/config.json"
   chmod 600 "$SINGBOX_DIR/config.json"
 
   cat > /etc/systemd/system/sing-box.service <<'UNIT'

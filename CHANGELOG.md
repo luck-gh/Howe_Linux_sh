@@ -7,6 +7,30 @@
 
 ## [Unreleased]
 
+## [V1.5] - 2026-06-04
+
+### Added
+- **Clash 订阅静态 IP 出口**：每订阅可配置远端 socks5/anytls 静态 IP 资源池，
+  按策略路由（`off` / `on`），流量仍通过本机 sing-box 中转，nft 计额逻辑零变化。
+  - 资源录入格式：`host:port:user:password`（无认证时 `host:port:password`）
+  - 资源池两层结构：默认池（`defaults.yaml`）+ 订阅独立池（覆盖默认）
+  - 同一份资源被多个订阅引用会自动去重为同一个 sing-box outbound
+  - `on` 模式渲染 `静态IP_ALL` + `静态IP_Partial` 两个子组；预设服务包
+    （ai / streaming / banking / social）+ 自定义 DOMAIN-KEYWORD 列表，
+    render 时注入 Clash `rules` 头部，命中关键词的服务走「静态IP_Partial」
+    子组（用户在该子组里手动选静态节点 / 信息节点决定走静态还是 VPS）
+  - 主菜单新增第 7 项「静态 IP 资源管理」：列表 / 添加（单条或多行粘贴）/
+    删除（按编号，多个用逗号或空格分隔）/ 整体替换 / 清空回继承
+  - 新 CLI：`clash_subs.py {add,edit,defaults} --static-strategy/--static-service-packs/
+    --static-custom-keywords/--static-proxies/--static-proxy-add/--static-proxy-remove`，
+    新子命令 `static-list`、`sing-box-outbounds`、`sing-box-route-rules`
+  - sing-box `inbounds[].users[]` 多挂静态 user，`route.rules` 用 `user→outbound`
+    把流量路由到对应远端，client 永远看不到原始静态 IP 凭据
+
+### Changed
+- **菜单字段编辑体验**：新增 / 编辑订阅 / 修改默认值的字段循环现在显示
+  「将继承的默认值」与「[修改] 高亮」，留空字段可预知最终生效值。
+
 ## [V1.4] - 2026-05-25
 
 ### Security

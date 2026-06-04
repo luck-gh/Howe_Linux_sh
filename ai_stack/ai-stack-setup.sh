@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ╔══════════════════════════════════════════════════════════════════
-# ║  AI 服务栈 一键安装脚本 V1.4 — 拆分版入口
+# ║  AI 服务栈 一键安装脚本 V1.5 — 拆分版入口
 # ║
 # ║  服务：New-API / OpenWebUI / LiteLLM / Sub2API / Dify / sing-box
 # ║  代理：Caddy (HTTPS) + frp (分布式穿透)

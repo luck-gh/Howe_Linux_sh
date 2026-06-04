@@ -492,7 +492,7 @@ main() {
   [[ -f /etc/os-release ]] || err "无法识别操作系统"
 
   while true; do
-    print_header "AI 服务栈 一键安装脚本 V1.4"
+    print_header "AI 服务栈 一键安装脚本 V1.5"
 
     # 服务栈摘要
     if [[ -f "$BASE_DIR/.env" ]]; then
