@@ -667,6 +667,90 @@ rollback_single_service() {
 #       数据 / 配置文件的备份恢复在主菜单的「备份 / 恢复」中。
 # ═══════════════════════════════════════════════════════════════════
 
+# ── 更新结果缓存 ─────────────────────────────────────────────────
+# 缓存目录与 TTL：
+#   /tmp/howe-upd-cache/<key>     单服务一行：<key>|<name>|<cur>|<new>|<state>
+#   /tmp/howe-upd-cache/.ts       最近一次完整刷新的时间戳（秒）
+# 默认 TTL 600 秒（10 分钟），同会话进入菜单时不重复跑网络查询。
+_UPDATE_CACHE_DIR="/tmp/howe-upd-cache"
+_UPDATE_CACHE_TTL=600
+
+_update_cache_ts_file() { echo "${_UPDATE_CACHE_DIR}/.ts"; }
+
+_update_cache_valid() {
+  local _ts_file; _ts_file=$(_update_cache_ts_file)
+  [[ -s "$_ts_file" ]] || return 1
+  local _ts _now
+  _ts=$(cat "$_ts_file" 2>/dev/null) || return 1
+  [[ "$_ts" =~ ^[0-9]+$ ]] || return 1
+  _now=$(date +%s)
+  (( _now - _ts < _UPDATE_CACHE_TTL ))
+}
+
+_update_cache_get() {
+  local _key=$1 _f="${_UPDATE_CACHE_DIR}/${_key}"
+  [[ -s "$_f" ]] || return 1
+  local _ck _cn _cur _new _state
+  IFS='|' read -r _ck _cn _cur _new _state < "$_f"
+  echo "${_cur}|${_new}|${_state}"
+}
+
+_update_cache_invalidate() {
+  rm -f "$(_update_cache_ts_file)" 2>/dev/null
+}
+
+# 后台并发刷新缓存：把所有已安装服务的检查结果写入 _UPDATE_CACHE_DIR
+# 网络全部失败时不写时间戳，避免假"已检查"卡住 TTL。
+_update_cache_refresh() {
+  mkdir -p "$_UPDATE_CACHE_DIR" 2>/dev/null || return 1
+
+  local -a _SVCS=()
+  local _entry _key _name _type _target _var
+  for _entry in "${SVC_REGISTRY_STACK[@]:-}"; do
+    [[ -z "$_entry" ]] && continue
+    IFS='|' read -r _key _name _type _target <<< "$_entry"
+    [[ "$_type" != "docker" && "$_type" != "systemd" ]] && continue
+    _var="SVC_${_key}_INSTALLED"
+    [[ "${!_var:-}" == "true" ]] && _SVCS+=("${_key}|${_name}|${_type}|${_target}")
+  done
+
+  [[ ${#_SVCS[@]} -eq 0 ]] && return 0
+
+  local _i
+  for (( _i=0; _i<${#_SVCS[@]}; _i++ )); do
+    IFS='|' read -r _key _name _type _target <<< "${_SVCS[$_i]}"
+    # 包一层子 shell + 失败兜底，确保哪怕命令异常也写出"检查失败"行
+    (
+      _check_one_update "$_key" "$_name" "$_type" "$_target" "${_UPDATE_CACHE_DIR}/${_key}" 2>/dev/null \
+        || echo "${_key}|${_name}|-|检查失败|?" > "${_UPDATE_CACHE_DIR}/${_key}"
+      [[ -s "${_UPDATE_CACHE_DIR}/${_key}" ]] \
+        || echo "${_key}|${_name}|-|检查失败|?" > "${_UPDATE_CACHE_DIR}/${_key}"
+    ) &
+  done
+  wait
+
+  # 是否至少有一项检查成功（state 为 ✓ 或 ↑）
+  local _ok=0 _f _ck _cn _ccur _cnew _cstate
+  for (( _i=0; _i<${#_SVCS[@]}; _i++ )); do
+    IFS='|' read -r _key _ _ _ <<< "${_SVCS[$_i]}"
+    _f="${_UPDATE_CACHE_DIR}/${_key}"
+    [[ -s "$_f" ]] || continue
+    IFS='|' read -r _ck _cn _ccur _cnew _cstate < "$_f"
+    if [[ "$_cstate" == "✓" || "$_cstate" == "↑" ]]; then
+      _ok=1
+      break
+    fi
+  done
+
+  if (( _ok )); then
+    date +%s > "$(_update_cache_ts_file)"
+  else
+    # 全部失败：不写时间戳，下次进菜单会自动重试（避免假"已检查"）
+    _update_cache_invalidate
+  fi
+  return 0
+}
+
 # ── 批量检查更新 ─────────────────────────────────────────────────
 # 并发查询每个已安装服务的当前版本与上游最新版本，输出对比表。
 # docker 服务用 buildx imagetools 拿 registry digest 与本地 RepoDigests 比对；
@@ -718,8 +802,12 @@ _check_one_update() {
         ;;
     esac
     [[ -z "$_cur" ]] && _cur="-"
-    if [[ -z "$_new" ]]; then
+    # 把 jq 在 API 失败时返回的 "null" / 非数字字符串当作失败
+    if [[ -z "$_new" || "$_new" == "null" || ! "$_new" =~ ^[0-9] ]]; then
       _state="?"; _new="检查失败"
+    elif [[ "$_cur" == "-" ]]; then
+      # 拿到了上游版本但本地未安装/读不到 → 不要显示为"可升级"
+      _state="?"
     elif [[ "$_cur" == "$_new" ]]; then
       _state="✓"
     else
@@ -731,6 +819,8 @@ _check_one_update() {
 }
 
 check_all_updates() {
+  # 第一个参数：force=1 强制刷新缓存（[c] 入口默认强制刷新）
+  local _force=${1:-1}
   print_header "检查所有服务更新"
   if [[ ! -f "$BASE_DIR/.env" ]]; then
     warn "未找到配置文件，可能尚未安装"
@@ -753,24 +843,27 @@ check_all_updates() {
     echo ""; read -erp "  按回车返回..." _; return 0
   fi
 
-  echo -e "  ${DIM}并发查询中（最多约 15 秒）...${N}"
-  echo ""
-
-  local _tmp; _tmp=$(mktemp -d /tmp/howe-upd.XXXXXX)
-  local _i
-  for (( _i=0; _i<${#_SVCS[@]}; _i++ )); do
-    IFS='|' read -r _key _name _type _target <<< "${_SVCS[$_i]}"
-    _check_one_update "$_key" "$_name" "$_type" "$_target" "$_tmp/$_i" &
-  done
-  wait
+  if [[ "$_force" == "1" ]] || ! _update_cache_valid; then
+    echo -e "  ${DIM}并发查询中（最多约 15 秒）...${N}"
+    echo ""
+    _update_cache_refresh
+  else
+    local _ts; _ts=$(cat "$(_update_cache_ts_file)" 2>/dev/null)
+    local _age=$(( $(date +%s) - _ts ))
+    echo -e "  ${DIM}使用 ${_age} 秒前的检查结果（按 r 强制刷新）${N}"
+    echo ""
+  fi
 
   # 输出汇总
   printf "  ${W}%-12s %-40s %-22s %s${N}\n" "服务" "当前" "最新" "状态"
   echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────${N}"
-  local _n_upgrade=0
+  local _n_upgrade=0 _i
   for (( _i=0; _i<${#_SVCS[@]}; _i++ )); do
-    [[ -f "$_tmp/$_i" ]] || continue
-    IFS='|' read -r _key _name _cur _new _state < "$_tmp/$_i"
+    IFS='|' read -r _key _name _type _target <<< "${_SVCS[$_i]}"
+    local _f="${_UPDATE_CACHE_DIR}/${_key}"
+    [[ -f "$_f" ]] || continue
+    local _ck _cn _cur _new _state
+    IFS='|' read -r _ck _cn _cur _new _state < "$_f"
     local _color
     case "$_state" in
       "↑") _color=$Y; _n_upgrade=$((_n_upgrade+1)) ;;
@@ -779,7 +872,6 @@ check_all_updates() {
     esac
     printf "  %-12s %-40s %-22s ${_color}%s${N}\n" "$_name" "${_cur:0:38}" "${_new:0:20}" "$_state"
   done
-  rm -rf "$_tmp"
   echo ""
   echo -e "  ${DIM}状态：${G}✓${N}${DIM} 已最新   ${Y}↑${N}${DIM} 可升级   ${DIM}? 检查失败${N}"
   echo ""
@@ -789,10 +881,16 @@ check_all_updates() {
     echo -e "  ${G}全部已是最新${N}"
   fi
   echo ""
-  read -erp "  按回车返回..." _
+  read -erp "  按回车返回（输入 r 强制刷新）：" _ans
+  if [[ "${_ans,,}" == "r" ]]; then
+    _update_cache_invalidate
+    check_all_updates 1
+  fi
 }
 
 upgrade_rollback_menu() {
+  # 进入菜单时若缓存无效则先做一次检查（仅首次或过期时打印提示）
+  local _need_initial_check=1
   while true; do
     print_header "升级 / 回滚单服务（程序版本）"
     echo -e "  ${DIM}本菜单管理容器镜像 / 二进制版本。数据与配置的备份恢复见主菜单「备份 / 恢复」${N}"
@@ -826,9 +924,32 @@ upgrade_rollback_menu() {
       return 0
     fi
 
+    # 首次进入或缓存过期：在原地展示「检查中…」，跑完再继续渲染
+    if (( _need_initial_check )) && ! _update_cache_valid; then
+      echo -e "  ${DIM}正在检查上游最新版本（最多约 15 秒）...${N}"
+      _update_cache_refresh
+      # 重绘以避免上面那行检查中提示残留
+      print_header "升级 / 回滚单服务（程序版本）"
+      echo -e "  ${DIM}本菜单管理容器镜像 / 二进制版本。数据与配置的备份恢复见主菜单「备份 / 恢复」${N}"
+      echo ""
+      # 若刷新后仍然没拿到时间戳（即全部失败），就别再下次循环里又自动重试
+      _update_cache_valid || _need_initial_check=0
+    fi
+    _need_initial_check=0
+
+    local _cache_age_hint=""
+    if _update_cache_valid; then
+      local _ts; _ts=$(cat "$(_update_cache_ts_file)" 2>/dev/null)
+      local _age=$(( $(date +%s) - _ts ))
+      _cache_age_hint="  ${DIM}（版本检查 ${_age} 秒前 · [r] 强制刷新）${N}"
+    else
+      _cache_age_hint="  ${Y}（版本检查未完成或网络不通 · [r] 重试）${N}"
+    fi
+
     local _scnt=${#_SVCS[@]} _i
-    echo -e "  ${DIM}选择要升级或回滚的服务${N}"
+    echo -e "  ${DIM}选择要升级或回滚的服务${N}${_cache_age_hint}"
     echo ""
+    local _n_upgrade=0
     for (( _i=0; _i<_scnt; _i++ )); do
       local _key _name _type _svc
       IFS='|' read -r _key _name _type _svc <<< "${_SVCS[$_i]}"
@@ -851,12 +972,33 @@ upgrade_rollback_menu() {
             ;;
         esac
       fi
+
+      # 从缓存读取最新版本与状态，拼成「最新版本」标签
+      local _latest_label=""
+      local _cf="${_UPDATE_CACHE_DIR}/${_key}"
+      if [[ -s "$_cf" ]]; then
+        local _ck _cn _ccur _cnew _cstate
+        IFS='|' read -r _ck _cn _ccur _cnew _cstate < "$_cf"
+        case "$_cstate" in
+          "↑") _latest_label="  ${Y}↑ 可升级 → ${_cnew:0:32}${N}"; _n_upgrade=$((_n_upgrade+1)) ;;
+          "✓") _latest_label="  ${G}✓ 已是最新${N}" ;;
+          *)   _latest_label="  ${DIM}? 检查失败${N}" ;;
+        esac
+      else
+        _latest_label="  ${DIM}? 网络不可用${N}"
+      fi
+
       local _desc; _desc=$(svc_desc_by_key "$_key")
-      printf "    ${W}[%d]${N}  %-12s  %b\n" "$((_i+1))" "$_name" "$_ver"
+      printf "    ${W}[%d]${N}  %-12s  %b%b\n" "$((_i+1))" "$_name" "$_ver" "$_latest_label"
       [[ -n "$_desc" ]] && printf "         ${DIM}%s${N}\n" "$_desc"
     done
     echo ""
-    echo -e "    ${W}[c]${N}  ${DIM}检查所有服务更新（对比上游最新版本）${N}"
+    if (( _n_upgrade > 0 )); then
+      echo -e "  ${Y}有 ${_n_upgrade} 个服务可升级${N}"
+      echo ""
+    fi
+    echo -e "    ${W}[c]${N}  ${DIM}查看更新检查详情${N}"
+    echo -e "    ${W}[r]${N}  ${DIM}重新检查所有服务更新${N}"
     echo -e "    ${DIM}[0] 返回上级菜单${N}"
     echo ""
 
@@ -864,7 +1006,13 @@ upgrade_rollback_menu() {
     read -erp "  选择服务：" _input
     [[ "$_input" == "0" || -z "$_input" ]] && break
     if [[ "${_input,,}" == "c" ]]; then
-      check_all_updates
+      # 复用现有详情页（默认强制刷新一次，与原行为一致）
+      check_all_updates 1
+      continue
+    fi
+    if [[ "${_input,,}" == "r" ]]; then
+      _update_cache_invalidate
+      _need_initial_check=1
       continue
     fi
 
@@ -909,6 +1057,18 @@ upgrade_rollback_menu() {
       else
         echo -e "  历史代数：${DIM}0（升级一次后即可回滚）${N}"
       fi
+
+      # 从缓存读取最新版本/状态
+      local _cf="${_UPDATE_CACHE_DIR}/${_key}"
+      if [[ -s "$_cf" ]]; then
+        local _ck _cn _ccur _cnew _cstate
+        IFS='|' read -r _ck _cn _ccur _cnew _cstate < "$_cf"
+        case "$_cstate" in
+          "↑") echo -e "  最新版本：${Y}${_cnew}${N}  ${Y}↑ 可升级${N}" ;;
+          "✓") echo -e "  最新版本：${G}${_cnew}${N}  ${G}✓ 已是最新${N}" ;;
+          *)   echo -e "  最新版本：${DIM}检查失败${N}" ;;
+        esac
+      fi
       echo ""
 
       if [[ "$_type" == "docker" ]]; then
@@ -926,6 +1086,10 @@ upgrade_rollback_menu() {
           else
             upgrade_systemd_service "$_name" "$_svc" || true
           fi
+          # 升级后让缓存失效，回到菜单时自动重新检查
+          _update_cache_invalidate
+          rm -f "${_UPDATE_CACHE_DIR}/${_key}" 2>/dev/null
+          _need_initial_check=1
           ;;
         1)
           if [[ "$_type" == "docker" ]]; then
@@ -933,6 +1097,9 @@ upgrade_rollback_menu() {
           else
             rollback_systemd_service "$_name" "$_svc" || true
           fi
+          _update_cache_invalidate
+          rm -f "${_UPDATE_CACHE_DIR}/${_key}" 2>/dev/null
+          _need_initial_check=1
           ;;
       esac
       break_end
