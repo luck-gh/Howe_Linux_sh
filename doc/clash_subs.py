@@ -76,13 +76,13 @@ BUILTIN_DEFAULTS = {
     # 外购 Clash 订阅：默认 URL（空 = 不启用），节点显示前缀
     "external_url": "",
     "external_name_prefix": "[外购] ",
-    # 静态 IP 出口：远端 anytls 资源池 + 路由策略
+    # 静态 IP 出口：远端 socks5 资源池 + 路由策略
     # static_proxies 元素：{name, type, server, port, password, sni, skip_cert_verify, udp}
     "static_proxies": [],
-    # off : 不渲染静态 IP 子组、不挂静态 user
-    # on  : 渲染 静态IP_ALL + 静态IP_Partial 两个子组；rules 头部注入
-    #       DOMAIN-KEYWORD,xxx,静态IP_Partial（关键词命中默认进 Partial 子组，
-    #       由用户在该子组里手动选静态节点 / 信息节点决定走静态还是 VPS）
+    # off : 不渲染 静态IP 子组、不挂静态 user
+    # on  : 渲染单一 静态IP 子组（节点信息(服务包) + 节点信息(关键词) + VPS引用 + 外购引用
+    #       + 静态节点 + DIRECT）；rules 头部注入 DOMAIN-KEYWORD,xxx,静态IP
+    #       关键词命中后由用户在该组里手选目标节点决定走 VPS / 外购 / 静态
     "static_strategy": "off",
     # on 模式下走静态 IP 的预设服务包（包名见 STATIC_SERVICE_PACKS）
     "static_service_packs": [],
@@ -109,6 +109,8 @@ STATIC_SERVICE_PACKS = {
     "streaming": ["netflix", "disneyplus", "hulu", "primevideo", "spotify"],
     "banking":   ["paypal", "wise", "stripe"],
     "social":    ["twitter", "facebook", "instagram"],
+    "ip":        ["ippure", "ipapi", "ipinfo", "myip", "ip.sb", "ipify",
+                  "icanhazip", "ifconfig.me", "ipchaxun", "whatismyip"],
 }
 
 STATIC_STRATEGIES = ("off", "on")
@@ -406,19 +408,19 @@ def resolve_static_name_prefix(defs):
     return defs.get("static_name_prefix") or ""
 
 
-def _static_user_name(sub_name, idx, group="A"):
+def _static_user_name(sub_name, idx):
     """sing-box inbound user 名 / clash 节点 name 的稳定生成规则。
-    group: "A" = ALL 子组流量；"P" = Partial 子组流量。两组各有自己的 inbound user
-    密码，但在 route.rules 里都映射到同一个远端 outbound（资源是同一份）。"""
-    return f"{sub_name}--static-{group}-{idx}"
+    每条静态资源对应一个 user，密码取 sub["static_passwords"][idx]。
+    sing-box 据此把流量路由到同一份资源对应的远端 socks5 outbound。"""
+    return f"{sub_name}--static-{idx}"
 
 
 def _ensure_static_passwords(sub, defs=None):
-    """根据生效的静态 IP 资源数量补齐 sub["static_passwords"] 与 ["static_passwords_p"]。
-    static_passwords      → ALL 子组（[静态_A]）使用的 inbound user 密码
-    static_passwords_p    → Partial 子组（[静态_P]）使用的 inbound user 密码
+    """根据生效的静态 IP 资源数量补齐 sub["static_passwords"]。
+    静态 IP 节点共用一组 inbound user 密码（A/P 拆分已合并为单一 静态IP 组）。
     生效池：sub 自己的 static_proxies；缺失则用 defs.static_proxies（继承）。
     长度不足 → 追加 gen_password()；长度过多 → 截断尾部。
+    遗留的 static_passwords_p 字段会被清掉。
     返回是否发生变更。"""
     if "static_proxies" in sub:
         proxies = _norm_static_list(sub.get("static_proxies"))
@@ -428,17 +430,19 @@ def _ensure_static_passwords(sub, defs=None):
         proxies = []
     target = len(proxies)
     changed = False
-    for key in ("static_passwords", "static_passwords_p"):
-        pwds = sub.get(key)
-        if not isinstance(pwds, list):
-            pwds = []
-        while len(pwds) < target:
-            pwds.append(gen_password())
-            changed = True
-        if len(pwds) > target:
-            pwds = pwds[:target]
-            changed = True
-        sub[key] = pwds
+    pwds = sub.get("static_passwords")
+    if not isinstance(pwds, list):
+        pwds = []
+    while len(pwds) < target:
+        pwds.append(gen_password())
+        changed = True
+    if len(pwds) > target:
+        pwds = pwds[:target]
+        changed = True
+    sub["static_passwords"] = pwds
+    if "static_passwords_p" in sub:
+        sub.pop("static_passwords_p", None)
+        changed = True
     return changed
 
 
@@ -843,7 +847,9 @@ def apply_fields(sub, args, defs, creating, all_subs):
         if args.external_url == "-":
             sub.pop("external_url", None)
         else:
-            sub["external_url"] = args.external_url
+            # 与当前生效值完全相同则跳过，避免触发不必要的重渲染 / reload
+            if sub.get("external_url") != args.external_url:
+                sub["external_url"] = args.external_url
     # ── 静态 IP 出口 ────────────────────────────────────────────────
     if getattr(args, "static_strategy", None) is not None:
         v = args.static_strategy
@@ -917,9 +923,22 @@ def apply_fields(sub, args, defs, creating, all_subs):
             if not removed:
                 raise SystemExit(f"未找到要删除的静态 IP: {t}（用 1 起算的索引或 host:port）")
         # 追加：每个 token 可能含多行/多条
+        # 完全相同的 (server, port, username, password) 跳过，避免重复
+        def _sp_key(p):
+            return (p.get("server"), int(p.get("port", 0)),
+                    p.get("username") or "", p.get("password") or "")
+        seen_keys = {_sp_key(p) for p in cur}
+        skipped = 0
         for blob in adds:
             for rec in parse_static_proxies_blob(blob):
+                k = _sp_key(rec)
+                if k in seen_keys:
+                    skipped += 1
+                    continue
+                seen_keys.add(k)
                 cur.append(rec)
+        if skipped:
+            print(f"[static_proxies] 跳过 {skipped} 条重复资源（同 host:port:user:pwd）")
         sub["static_proxies"] = cur
         # 数量变了 → 让 _ensure_static_passwords 按新长度补齐 / 截断
         _ensure_static_passwords(sub, defs)
@@ -992,7 +1011,10 @@ def cmd_defaults(args):
         v = getattr(args, attr, None)
         if v is None:
             continue
-        defs[key] = int(v) if key in INT_DEFAULT_KEYS else str(v)
+        new_v = int(v) if key in INT_DEFAULT_KEYS else str(v)
+        if defs.get(key) == new_v:
+            continue
+        defs[key] = new_v
         changed = True
     # 静态 IP 策略校验
     if "static_strategy" in defs:
@@ -1042,9 +1064,21 @@ def cmd_defaults(args):
                         cur.pop(i); removed = True; break
             if not removed:
                 raise SystemExit(f"未找到要删除的静态 IP: {t}（用 1 起算的索引或 host:port）")
+        def _sp_key(p):
+            return (p.get("server"), int(p.get("port", 0)),
+                    p.get("username") or "", p.get("password") or "")
+        seen_keys = {_sp_key(p) for p in cur}
+        skipped = 0
         for blob in adds:
             for rec in parse_static_proxies_blob(blob):
+                k = _sp_key(rec)
+                if k in seen_keys:
+                    skipped += 1
+                    continue
+                seen_keys.add(k)
                 cur.append(rec)
+        if skipped:
+            print(f"[static_proxies] 跳过 {skipped} 条重复资源（同 host:port:user:pwd）")
         defs["static_proxies"] = cur
         changed = True
     if changed:
@@ -1148,17 +1182,13 @@ def render_one(base, sub):
 
     # ── 静态 IP 出口节点 ─────────────────────────────────────────────
     # 客户端看到的还是连本机的 anytls 节点（server=VPS_IP, port=订阅端口）；
-    # password 取自 sub["static_passwords"][i] (ALL 组) 或 ["static_passwords_p"][i] (Partial 组)，
-    # sing-box inbound 多挂的 user 在 route.rules 里被映射到对应的远端 outbound。
-    # A 组与 P 组共用同一份资源池 → route 把两套 user 都路由到同一个远端 outbound，
-    # 但子组分开方便客户端在 ALL/Partial 两种策略间切换。
+    # password 取自 sub["static_passwords"][i]，sing-box inbound 多挂的 user 在
+    # route.rules 里被映射到对应的远端 socks5 outbound。
     static_strategy = "off" if expired else resolve_static_strategy(sub, defs)
     static_proxies = resolve_static_proxies(sub, defs)
-    static_pwds_a = sub.get("static_passwords") or []
-    static_pwds_p = sub.get("static_passwords_p") or []
-    static_nodes_a = []  # ALL  子组真实节点（前缀 [静态_A]）
-    static_nodes_p = []  # Partial 子组真实节点（前缀 [静态_P]）
-    if static_strategy == "on" and static_proxies and static_pwds_a and static_pwds_p:
+    static_pwds = sub.get("static_passwords") or []
+    static_nodes = []  # 真实静态节点（前缀 [静态]）
+    if static_strategy == "on" and static_proxies and static_pwds:
         # 真实 vps server / sni 取自首个自建节点（同 head）
         vps_server = head.get("server")
         sni = head.get("sni")
@@ -1175,39 +1205,31 @@ def render_one(base, sub):
                     seen_names.add(cand)
                     return cand
         for i, sp in enumerate(static_proxies):
-            if i >= min(len(static_pwds_a), len(static_pwds_p)):
+            if i >= len(static_pwds):
                 break
             # 节点显示名复用 VPS 节点的 geo 命名规则
             label = format_geo_label(sp.get("server", ""), base) or sp.get("server") or ""
-            name_a = _uniq(f"[静态_A] {label}")
-            name_p = _uniq(f"[静态_P] {label}")
-            static_nodes_a.append(make_static_proxy(
-                name=name_a, sub_password=static_pwds_a[i],
-                sub_port=sub_port, vps_server=vps_server, sni=sni,
-            ))
-            static_nodes_p.append(make_static_proxy(
-                name=name_p, sub_password=static_pwds_p[i],
+            name = _uniq(f"[静态] {label}")
+            static_nodes.append(make_static_proxy(
+                name=name, sub_password=static_pwds[i],
                 sub_port=sub_port, vps_server=vps_server, sni=sni,
             ))
 
-    # Partial 子组顶部的"信息说明节点"：用主 password（不是静态密码），所以
-    # sing-box 把它识别为主 user，流量沿 final=direct 出去 = VPS 出口。
-    # 名字本身是说明文本（参照 head 信息节点风格）。
-    partial_info_nodes = []
-    if static_nodes_p:
+    # 静态IP 组顶部的"信息说明节点"：用主 password（不是静态密码），所以 sing-box
+    # 把它识别为主 user，流量沿 final=direct 出去 = VPS 出口。两条永远渲染：
+    # 服务包列表 / 关键词列表，无内容时显示 (无)。
+    static_info_nodes = []
+    if static_nodes:
         packs_for_info = sub.get("static_service_packs") if "static_service_packs" in sub \
                          else (defs or {}).get("static_service_packs") or []
         custom_for_info = sub.get("static_custom_keywords") if "static_custom_keywords" in sub \
                           else (defs or {}).get("static_custom_keywords") or []
-        lines = []
-        if packs_for_info:
-            lines.append(f"[Partial] 服务包: {','.join(packs_for_info)}")
-        if custom_for_info:
-            lines.append(f"[Partial] 关键词: {','.join(custom_for_info)}")
-        if not lines:
-            lines.append("[Partial] 未配服务包/关键词")
-        for ln in lines:
-            partial_info_nodes.append(make_static_proxy(
+        info_lines = [
+            f"[静态] 服务包: {','.join(packs_for_info) if packs_for_info else '(无)'}",
+            f"[静态] 关键词: {','.join(custom_for_info) if custom_for_info else '(无)'}",
+        ]
+        for ln in info_lines:
+            static_info_nodes.append(make_static_proxy(
                 name=ln,
                 sub_password=sub["password"],  # 主 user → final: direct → VPS
                 sub_port=sub_port,
@@ -1215,7 +1237,7 @@ def render_one(base, sub):
                 sni=head.get("sni"),
             ))
 
-    proxies = info + real + static_nodes_a + static_nodes_p + partial_info_nodes + external
+    proxies = info + real + static_nodes + static_info_nodes + external
     tpl["proxies"] = proxies
 
     # proxy-groups：始终拆 "VPS 节点" 子组（含信息节点+自建），有外购时再加 "外购" 子组；
@@ -1231,12 +1253,11 @@ def render_one(base, sub):
 
     vps_names = [pp["name"] for pp in (info + real)]
     external_names = [pp["name"] for pp in external]
-    static_a_names = [pp["name"] for pp in static_nodes_a]
-    static_p_names = [pp["name"] for pp in static_nodes_p]
-    partial_info_names = [pp["name"] for pp in partial_info_nodes]
+    static_node_names = [pp["name"] for pp in static_nodes]
+    static_info_names = [pp["name"] for pp in static_info_nodes]
 
-    # 移除上一次渲染遗留的子组（idempotent）；旧版 "静态 IP" 名字也清掉
-    _legacy = {"VPS 节点", "外购", "静态 IP", "静态IP_ALL", "静态IP_Partial"}
+    # 移除上一次渲染遗留的子组（idempotent）；旧版命名一并清掉
+    _legacy = {"VPS 节点", "外购", "静态 IP", "静态IP", "静态IP_ALL", "静态IP_Partial"}
     groups[:] = [g for g in groups if g.get("name") not in _legacy]
     # first 可能因为上一行被剔除（如果它就叫 "VPS 节点"），重新拿
     first = groups[0] if groups else _FlowMap({"name": "代理", "type": "select"})
@@ -1250,36 +1271,39 @@ def render_one(base, sub):
 
     # 主组 entries 顺序：
     #   off / 无静态资源 → [VPS 节点]
-    #   on               → [VPS 节点, 静态IP_Partial, 静态IP_ALL]   （默认仍以 VPS 优先）
+    #   on               → [VPS 节点, 静态IP, 外购?]   （默认仍以 VPS 优先）
     sub_entries = ["VPS 节点"]
-    if static_a_names:
-        sub_entries.append("静态IP_Partial")
-        sub_entries.append("静态IP_ALL")
+    if static_node_names:
+        sub_entries.append("静态IP")
     if external_names:
         sub_entries.append("外购")
     first["proxies"] = keep_front + sub_entries + keep_back
 
     groups.append(_FlowMap({"name": "VPS 节点", "type": "select", "proxies": vps_names}))
-    if static_a_names:
-        # ALL 子组：纯 [静态_A] 节点 + DIRECT 兜底
+    if static_node_names:
+        # 静态IP 组成员顺序：
+        #   节点信息(服务包) + 节点信息(关键词)（用主密码 → 选中=回 VPS）
+        #   → "VPS 节点" 子组引用 → "外购" 子组引用（仅在外购存在时）
+        #   → 真静态节点 → DIRECT
+        static_members = list(static_info_names)
+        static_members.append("VPS 节点")
+        if external_names:
+            static_members.append("外购")
+        static_members.extend(static_node_names)
+        static_members.append("DIRECT")
         groups.append(_FlowMap({
-            "name": "静态IP_ALL", "type": "select",
-            "proxies": static_a_names + ["DIRECT"],
-        }))
-        # Partial 子组：信息节点（=走 VPS）+ [静态_P] 节点 + DIRECT
-        groups.append(_FlowMap({
-            "name": "静态IP_Partial", "type": "select",
-            "proxies": partial_info_names + static_p_names + ["DIRECT"],
+            "name": "静态IP", "type": "select",
+            "proxies": static_members,
         }))
     if external_names:
         groups.append(_FlowMap({"name": "外购", "type": "select", "proxies": ["DIRECT"] + external_names}))
 
-    # ── on 模式：在 rules 头部注入 DOMAIN-KEYWORD,xxx,静态IP_Partial ─────
-    if static_a_names:
+    # ── on 模式：在 rules 头部注入 DOMAIN-KEYWORD,xxx,静态IP ─────────────
+    if static_node_names:
         keywords = resolve_static_keywords(sub, defs)
         if keywords:
             existing_rules = list(tpl.get("rules") or [])
-            injected = [f"DOMAIN-KEYWORD,{kw},静态IP_Partial" for kw in keywords]
+            injected = [f"DOMAIN-KEYWORD,{kw},静态IP" for kw in keywords]
             tpl["rules"] = injected + existing_rules
 
     out_dir = os.path.join(p["output"], sub["token"])
@@ -1289,8 +1313,8 @@ def render_one(base, sub):
     extra_parts = []
     if external:
         extra_parts.append(f"外购 {len(external)}")
-    if static_nodes_a:
-        extra_parts.append(f"静态 IP {len(static_nodes_a)}/{static_strategy}")
+    if static_nodes:
+        extra_parts.append(f"静态 IP {len(static_nodes)}/{static_strategy}")
     extra = (", " + ", ".join(extra_parts)) if extra_parts else ""
     print(f"rendered: {sub['name']} → {out_path} ({len(real)} 节点{extra}, port={sub_port})")
 
@@ -1352,8 +1376,8 @@ def _outbound_tag(sp):
 
 def cmd_sing_box_inbounds(args):
     """输出 sing-box config.json 的 inbounds[] 数组（多 anytls inbound，每订阅一个端口）。
-    每订阅可挂多个 user：默认 user（走 direct）+ 每个静态 IP 资源 2 个 user
-    （static-A-N 走 ALL 子组对应远端 outbound、static-P-N 走 Partial 子组同一远端 outbound）。
+    每订阅可挂多个 user：默认 user（走 direct）+ 每个静态 IP 资源 1 个 user
+    （static-N 经 route.rules 路由到对应远端 socks5 outbound）。
     限流交给 nftables drop（避免 restart sing-box 冲断在线连接）。
     --tls-cert / --tls-key / --server-name 必填，由 sh 脚本统一传入。"""
     import json as _json
@@ -1365,18 +1389,13 @@ def cmd_sing_box_inbounds(args):
         # 静态 IP user（仅在策略不是 off 且有资源 + 密码时挂）
         if resolve_static_strategy(s, defs) != "off":
             sps = resolve_static_proxies(s, defs)
-            pwds_a = s.get("static_passwords") or []
-            pwds_p = s.get("static_passwords_p") or []
+            pwds = s.get("static_passwords") or []
             for i, _sp in enumerate(sps):
-                if i >= min(len(pwds_a), len(pwds_p)):
+                if i >= len(pwds):
                     break
                 users.append({
-                    "name": _static_user_name(s["name"], i, "A"),
-                    "password": pwds_a[i],
-                })
-                users.append({
-                    "name": _static_user_name(s["name"], i, "P"),
-                    "password": pwds_p[i],
+                    "name": _static_user_name(s["name"], i),
+                    "password": pwds[i],
                 })
         inbounds.append({
             "type": "anytls",
@@ -1446,7 +1465,7 @@ def cmd_sing_box_route_rules(args):
     """输出 sing-box config.json 的 route.rules[] 增量片段（auth_user → outbound 映射）。
     sh 脚本拼接到 route.rules 的尾部（在 sniff / dns hijack 之后、final=direct 之前）。
     sing-box 1.13+ 用 auth_user 匹配 inbound 已认证用户名，且需要显式 action=route。
-    A/P 两套 user 都映射到同一份资源对应的远端 outbound（同一份资源、不同子组）。"""
+    每条静态资源一个 user（static-N），同一份资源被多订阅引用时合并到同一条规则。"""
     import json as _json
     from collections import OrderedDict
     subs = read_subs_normalized(args.base)
@@ -1456,15 +1475,13 @@ def cmd_sing_box_route_rules(args):
         if resolve_static_strategy(s, defs) == "off":
             continue
         sps = resolve_static_proxies(s, defs)
-        pwds_a = s.get("static_passwords") or []
-        pwds_p = s.get("static_passwords_p") or []
+        pwds = s.get("static_passwords") or []
         for i, sp in enumerate(sps):
-            if i >= min(len(pwds_a), len(pwds_p)):
+            if i >= len(pwds):
                 break
             tag = _outbound_tag(sp)
             users = by_ob.setdefault(tag, [])
-            users.append(_static_user_name(s["name"], i, "A"))
-            users.append(_static_user_name(s["name"], i, "P"))
+            users.append(_static_user_name(s["name"], i))
     rules = [
         {"auth_user": users, "action": "route", "outbound": tag}
         for tag, users in by_ob.items()

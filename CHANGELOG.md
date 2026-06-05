@@ -7,6 +7,34 @@
 
 ## [Unreleased]
 
+### Changed
+- **Clash 静态 IP 子组架构精简**：原 `静态IP_ALL` + `静态IP_Partial` 双子组
+  合并为单一 `静态IP` 组，节点前缀从 `[静态_A]` / `[静态_P]` 统一为 `[静态]`，
+  每条静态资源由 2 个 sing-box user（A/P）减为 1 个，`route.rules` 注入目标
+  从 `静态IP_Partial` 改为 `静态IP`。
+  - 静态IP 组内成员顺序：信息节点（服务包 / 关键词，永远渲染，无内容显示
+    "(无)"）→ "VPS 节点" 引用 → "外购" 引用（仅在外购存在时）→ 真静态节点
+    → DIRECT
+  - 字段 `static_passwords_p` 废弃；下次 render 自动迁移并清掉
+  - 远端 outbound 协议固定为 socks5（先前注释里出现的 anytls 是误述）
+- **静态 IP 服务包新增 `ip` 包**：`ippure` / `ipapi` / `ipinfo` / `myip` /
+  `ip.sb` / `ipify` / `icanhazip` / `ifconfig.me` / `ipchaxun` / `whatismyip`，
+  方便切静态后直接访问 IP 检测站验证出口是否生效。服务包菜单同步加详细
+  中文说明，解释每条预设关键词为什么需要静态 IP。
+
+### Added
+- **静态 IP 子菜单 `[q] 退出菜单` 快捷键**：策略 / 添加 / 删除 / 整体替换
+  / 清空 五个子菜单全部支持 `q` 一路退出到 Clash 主菜单（用 `_STATIC_QUIT`
+  标志协调），中途误进可一键撤离。
+- **取消语义统一**：所有静态 IP 子菜单的 `0` / `y` / `Y` / `n` / `N` /
+  回车都视为取消，避免按惯性回 `y` 把空值写进去。
+- **资源去重保护**：`apply_fields` 与 `cmd_defaults` 追加静态 IP 时按
+  `(server, port, username, password)` 去重，重复条目自动跳过并提示数量。
+
+### Fixed
+- **defaults / apply_fields 无变更也写盘**：相同值赋值前先比较，避免触发
+  下游 reload 与文件 mtime 抖动。
+
 ## [V1.5] - 2026-06-04
 
 ### Added

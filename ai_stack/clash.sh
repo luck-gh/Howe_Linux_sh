@@ -606,12 +606,13 @@ _static_pick_target() {
     printf "    ${W}[%d]${N} 订阅: %s\n" "$_i" "$_n"
     _i=$((_i+1))
   done <<< "$_names"
-  echo -e "    ${DIM}[0 / 回车] 取消${N}"
+  echo -e "    ${DIM}[0 / 回车] 取消    [q] 退出菜单${N}"
   echo ""
   local _in
   read -erp "  编号：" _in
   case "$_in" in
-    ""|0) STATIC_TARGET=""; return 1 ;;
+    ""|0|y|Y|n|N) STATIC_TARGET=""; return 1 ;;
+    q|Q) STATIC_TARGET=""; _STATIC_QUIT=1; return 1 ;;
     1) STATIC_TARGET=""; return 0 ;;
     *)
       if [[ "$_in" =~ ^[0-9]+$ ]] && (( _in >= 2 && _in - 1 <= ${#_arr[@]} )); then
@@ -642,11 +643,16 @@ _static_menu_add() {
   echo ""
   _static_input_hint
   echo -e "  ${DIM}单条：直接粘贴一行；多条：粘贴多行后按 Ctrl-D 结束${N}"
+  echo -e "  ${DIM}[0 / 直接 Ctrl-D] 取消    [q 后 Ctrl-D] 退出菜单${N}"
   echo ""
   echo -e "  ${W}请输入静态 IP（按 Ctrl-D 结束，留空取消）：${N}"
   local _blob
   _blob=$(cat) || true
-  if [[ -z "${_blob//[[:space:]]/}" ]]; then
+  local _trim="${_blob//[[:space:]]/}"
+  if [[ "$_trim" =~ ^[qQ]$ ]]; then
+    _STATIC_QUIT=1; return
+  fi
+  if [[ -z "$_trim" || "$_trim" =~ ^[0yYnN]$ ]]; then
     info "已取消"
     return
   fi
@@ -673,9 +679,15 @@ _static_menu_remove() {
   fi
   echo ""
   echo -e "  ${DIM}多个编号用空格或逗号分隔，例如：1 3 或 1,3${N}"
+  echo -e "  ${DIM}[0 / 回车] 取消    [q] 退出菜单${N}"
   local _in
   ask _in "要删除的编号"
-  [[ -z "$_in" ]] && { info "已取消"; return; }
+  if [[ "$_in" =~ ^[qQ]$ ]]; then
+    _STATIC_QUIT=1; return
+  fi
+  if [[ -z "$_in" || "$_in" == "0" || "$_in" =~ ^[yYnN]$ ]]; then
+    info "已取消"; return
+  fi
   # 校验全是数字
   local _tok
   for _tok in $(echo "$_in" | tr ',;' ' '); do
@@ -707,11 +719,16 @@ _static_menu_replace() {
   echo ""
   echo -e "  ${W}替换静态 IP 资源池（覆盖现有）${N}"
   _static_input_hint
+  echo -e "  ${DIM}[0 / 直接 Ctrl-D] 取消    [q 后 Ctrl-D] 退出菜单${N}"
   echo ""
   echo -e "  ${W}请输入新资源（按 Ctrl-D 结束，留空取消）：${N}"
   local _blob
   _blob=$(cat) || true
-  if [[ -z "${_blob//[[:space:]]/}" ]]; then
+  local _trim="${_blob//[[:space:]]/}"
+  if [[ "$_trim" =~ ^[qQ]$ ]]; then
+    _STATIC_QUIT=1; return
+  fi
+  if [[ -z "$_trim" || "$_trim" =~ ^[0yYnN]$ ]]; then
     info "已取消"
     return
   fi
@@ -840,15 +857,28 @@ _static_menu_strategy() {
     if [[ -n "$_kws" ]]; then _v3="${G}[修改]${N} $_kws"
     else _v3="${DIM}${_cur[static_custom_keywords]:-(空)}${N}"; fi
     echo -e "    ${W}[1]${N} 静态 IP 策略 off/on                         : $_v1"
-    echo -e "    ${W}[2]${N} 静态 IP 服务包 ai,streaming,banking,social  : $_v2"
+    echo -e "    ${W}[2]${N} 静态 IP 服务包 ai,streaming,banking,social,ip : $_v2"
     echo -e "    ${W}[3]${N} 静态 IP 自定义关键词（如 openai,claude）    : $_v3"
-    echo -e "    ${DIM}[0] 完成并保存${N}"
+    echo -e "    ${DIM}[0/Y/回车] 完成并保存    [N] 放弃修改返回    [q] 退出菜单${N}"
     echo ""
     local _in
     read -erp "  编号：" _in
 
     case "$_in" in
-      0|"")
+      q|Q)
+        if [[ -n "$_strat$_packs$_kws" ]]; then
+          info "已放弃未保存的修改"
+        fi
+        _STATIC_QUIT=1
+        return
+        ;;
+      n|N)
+        if [[ -n "$_strat$_packs$_kws" ]]; then
+          info "已放弃未保存的修改"
+        fi
+        return
+        ;;
+      0|y|Y|"")
         if [[ -z "$_strat" && -z "$_packs" && -z "$_kws" ]]; then
           info "未修改任何字段"
           return
@@ -867,9 +897,9 @@ _static_menu_strategy() {
       1)
         echo ""
         echo -e "    ${W}[1]${N} off  不启用静态 IP"
-        echo -e "    ${W}[2]${N} on   启用静态 IP（生成 静态IP_ALL 与 静态IP_Partial 子组）"
+        echo -e "    ${W}[2]${N} on   启用静态 IP（生成 静态IP 子组并按关键词注入 rules）"
         [[ -n "$_target" ]] && echo -e "    ${W}[3]${N} 清空回继承默认"
-        echo -e "    ${DIM}[0 / 回车] 取消${N}"
+        echo -e "    ${DIM}[0 / 回车] 取消    [q] 退出菜单${N}"
         echo ""
         local _x
         read -erp "  策略编号：" _x
@@ -877,31 +907,64 @@ _static_menu_strategy() {
           1) _strat="off" ;;
           2) _strat="on" ;;
           3) [[ -n "$_target" ]] && _strat="-" || warn "全局默认无可继承对象" ;;
-          0|"") ;;
+          q|Q) _STATIC_QUIT=1; return ;;
+          0|y|Y|n|N|"") ;;
           *) warn "无效编号" ;;
         esac
         ;;
       2)
         echo ""
-        echo -e "    ${W}[1]${N} ai         openai/anthropic/claude/chatgpt/perplexity/googleapis"
-        echo -e "    ${W}[2]${N} streaming  netflix/disneyplus/hulu/primevideo/spotify"
-        echo -e "    ${W}[3]${N} banking    paypal/wise/stripe"
-        echo -e "    ${W}[4]${N} social     twitter/facebook/instagram"
-        [[ -n "$_target" ]] && echo -e "    ${W}[5]${N} 清空回继承默认"
-        echo -e "    ${DIM}[0 / 回车] 取消（多选编号用空格或逗号分隔，例如 1 2）${N}"
+        echo -e "  ${DIM}选中后这些预设关键词会被注入 rules，命中即走 静态IP 组${N}"
+        echo -e "  ${DIM}（DOMAIN-KEYWORD 子串匹配；多个服务包合并去重，原 rules 顺序保留在后）${N}"
+        echo ""
+        echo -e "    ${W}[1] ai${N}        AI 推理 / 助手类，按地区风控严格，常需固定海外住宅 IP"
+        echo -e "        ${DIM}openai     ChatGPT / GPT API：账号封禁敏感，IP 跳变易触发风控${N}"
+        echo -e "        ${DIM}anthropic  Claude API / claude.ai：地区限制 + IP 信誉检查${N}"
+        echo -e "        ${DIM}claude     claude.ai 主域名${N}"
+        echo -e "        ${DIM}chatgpt    chat.openai.com 历史域名${N}"
+        echo -e "        ${DIM}perplexity perplexity.ai：部分功能要求稳定 IP${N}"
+        echo -e "        ${DIM}googleapis Gemini / Vertex / Google Cloud API：账号常绑 IP${N}"
+        echo ""
+        echo -e "    ${W}[2] streaming${N} 流媒体平台，按授权地区放内容，IP 国别决定可看片库"
+        echo -e "        ${DIM}netflix      Netflix：检测代理 IP 严，住宅 IP 才稳${N}"
+        echo -e "        ${DIM}disneyplus   Disney+：地区授权严格${N}"
+        echo -e "        ${DIM}hulu         Hulu：仅美国可看，必须美国 IP${N}"
+        echo -e "        ${DIM}primevideo   Amazon Prime Video：按区放内容${N}"
+        echo -e "        ${DIM}spotify      Spotify：账号注册地与 IP 绑定，跳区会被锁${N}"
+        echo ""
+        echo -e "    ${W}[3] banking${N}   支付 / 跨境金融，登录强校验 IP 一致性，跳变易冻结账户"
+        echo -e "        ${DIM}paypal     PayPal：账号风控对 IP 漂移极敏感${N}"
+        echo -e "        ${DIM}wise       Wise (TransferWise)：跨境汇款 KYC 验 IP${N}"
+        echo -e "        ${DIM}stripe     Stripe Dashboard：商户后台、登录验 IP${N}"
+        echo ""
+        echo -e "    ${W}[4] social${N}    海外社交，账号注册期/敏感操作要求 IP 稳定不闪变"
+        echo -e "        ${DIM}twitter    twitter.com / x.com：注册/改资料/发文易触发挑战${N}"
+        echo -e "        ${DIM}facebook   facebook.com：登录验 IP 严，跨国跳易锁号${N}"
+        echo -e "        ${DIM}instagram  instagram.com：与 facebook 共用风控基础设施${N}"
+        echo ""
+        echo -e "    ${W}[5] ip${N}        IP 检测站，专门用来验证当前出口 IP 是否真的走了静态"
+        echo -e "        ${DIM}ippure / ipapi / ipinfo / myip / ip.sb / ipify${N}"
+        echo -e "        ${DIM}icanhazip / ifconfig.me / ipchaxun / whatismyip${N}"
+        echo -e "        ${DIM}选中后访问这些站点会自动走 静态IP 组，方便边切边验证${N}"
+        echo ""
+        [[ -n "$_target" ]] && echo -e "    ${W}[6]${N} 清空回继承默认"
+        echo -e "    ${DIM}[0 / 回车] 取消    [q] 退出菜单${N}"
         echo ""
         local _x
         read -erp "  服务包编号：" _x
-        if [[ -z "$_x" || "$_x" == "0" ]]; then
+        if [[ "$_x" =~ ^[qQ]$ ]]; then
+          _STATIC_QUIT=1; return
+        fi
+        if [[ -z "$_x" || "$_x" == "0" || "$_x" =~ ^[yYnN]$ ]]; then
           :
         else
-          local -a _pn=(ai streaming banking social) _picked=()
+          local -a _pn=(ai streaming banking social ip) _picked=()
           local _tok _has_clear=0 _has_bad=0
           for _tok in $(echo "$_x" | tr ',' ' '); do
             [[ -z "$_tok" ]] && continue
-            if [[ "$_tok" == "5" && -n "$_target" ]]; then
+            if [[ "$_tok" == "6" && -n "$_target" ]]; then
               _has_clear=1
-            elif [[ "$_tok" =~ ^[1-4]$ ]]; then
+            elif [[ "$_tok" =~ ^[1-5]$ ]]; then
               _picked+=("${_pn[$((_tok-1))]}")
             else
               _has_bad=1; warn "无效编号: $_tok"
@@ -924,13 +987,20 @@ _static_menu_strategy() {
       3)
         echo ""
         if [[ -n "$_target" ]]; then
-          echo -e "  ${DIM}留空 = 不修改；输入 - = 清空回继承默认${N}"
+          echo -e "  ${DIM}留空 = 不修改；输入 - = 清空回继承默认；输入 q = 退出菜单${N}"
         else
-          echo -e "  ${DIM}留空 = 不修改${N}"
+          echo -e "  ${DIM}留空 = 不修改；输入 q = 退出菜单${N}"
         fi
         local _x
         ask _x "自定义关键词（逗号分隔，如 openai,claude）"
-        _kws="$_x"
+        if [[ "$_x" =~ ^[qQ]$ ]]; then
+          _STATIC_QUIT=1; return
+        fi
+        if [[ "$_x" =~ ^[yYnN]$ ]]; then
+          :
+        else
+          _kws="$_x"
+        fi
         ;;
       *) warn "无效编号" ;;
     esac
@@ -939,6 +1009,7 @@ _static_menu_strategy() {
 
 # 静态 IP 资源管理子菜单
 _clash_menu_static() {
+  _STATIC_QUIT=0
   while true; do
     print_header "静态 IP 资源管理"
     _static_print_overview
@@ -950,7 +1021,7 @@ _clash_menu_static() {
     echo -e "    ${W}[5]${N} 整体替换"
     echo -e "    ${W}[6]${N} 清空（订阅级 = 回继承）"
     echo ""
-    echo -e "    ${DIM}[0] 返回${N}"
+    echo -e "    ${DIM}[0 / 回车] 返回    [q] 退出菜单${N}"
     echo ""
     local _in
     read -erp "  选择：" _in
@@ -961,9 +1032,11 @@ _clash_menu_static() {
       4) _static_menu_remove ;;
       5) _static_menu_replace ;;
       6) _static_menu_clear ;;
-      0|"") break ;;
+      0|y|Y|n|N|"") break ;;
+      q|Q) _STATIC_QUIT=1 ;;
       *) warn "无效选项" ;;
     esac
+    (( _STATIC_QUIT == 1 )) && { _STATIC_QUIT=0; break; }
     echo ""
     read -erp "  按回车继续..." _
   done

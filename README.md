@@ -13,8 +13,8 @@ Linux VPS 管理工具箱，集成 AI 服务栈一键部署与 sing-box + Clash 
 - sing-box AnyTLS 多订阅，每订阅独立端口 + 密码
 - nftables 流量统计 + 超额自动限流（无需重启）
 - Clash / Mihomo 订阅渲染，支持外购节点合并
-- 静态 IP 出口：每订阅可挂载远端 socks5/anytls 资源池，按服务关键词
-  分流（AI / 流媒体 / 银行 / 社交），客户端只看到 sing-box 不暴露原始凭据
+- 静态 IP 出口：每订阅可挂载远端 socks5 资源池，按服务关键词
+  分流（AI / 流媒体 / 银行 / 社交 / IP 检测），客户端只看到 sing-box 不暴露原始凭据
 - 订阅 URL 格式：`https://<domain>/sub/<token>/<name>.yaml`
 - 自动生成节点显示名（IP 地理位置 → `[自建] 🇺🇸 美国 · 洛杉矶`）
 
