@@ -8,7 +8,7 @@
 | 文件 | 行数级别 | 主菜单项 | 主要负责的事 |
 |------|---------|---------|-------------|
 | `mod_system.sh` | ~280 | 1. 系统管理 | `show_system_info` / `system_update` / `system_clean`（apt clean + autoremove + journal vacuum）/ `fix_dpkg` / `create_backup` / `restore_backup` / `list_backups` / `delete_backup`。`manage_swap` 函数体保留但已从子菜单摘除（迁去 `mod_memmgr`）。 |
-| `mod_memmgr.sh` | ~130 | 2. 内存管理 | `mem_status`（只读：free / swapon / sysctl 参数 / 可回收缓存估算 / Top RSS / Top Swap / Docker stats）。子菜单 2-7 项为占位（救援 / 常规清理 / sysctl 调优 / `/swap` 文件管理 / zram / earlyoom），按 PR 渐进实装。 |
+| `mod_memmgr.sh` | ~915 | 2. 内存管理 | 完整内存运维工具集，专为 1GB 等小内存 VPS 设计。`mem_status`（只读诊断：free / swapon / sysctl 参数 / 可回收缓存估算 / Top RSS / Top Swap / Docker stats）/ `mem_triage`（内存救援：诊断报告 + kill 候选列表 + 逐项确认；自动标记当前 SSH 会话祖先链避免误杀，过滤系统派生进程）/ `mem_clean`（drop_caches + apt clean + journal vacuum 7d，每项独立确认）/ `sysctl_tune`（写 `/etc/sysctl.d/99-howe-mem.conf`，幂等）/ `swap_resize`（自动检测 `/swap` 或 `/swapfile`，dd 重建 + fstab 持久化）/ `zram_setup`（zram-tools 安装 + 配置 ALGO/SIZE/PRIORITY）/ `earlyoom_setup`（可选预防：内存+swap 双低于阈值时主动 kill 最大进程）。 |
 | `mod_docker.sh` | ~270 | 3. Docker 管理 | 容器管理（启停 / 重启 / 查看日志）/ 镜像管理（拉取 / 删除 / 清理）/ 网络管理 / IPv6 开关。源自 `kejilion.sh`，已去除遥测。 |
 | `mod_security.sh` | ~550 | 4. 安全加固 | SSH 加固（端口 / 密钥 / 禁 root）/ fail2ban / iptables 防火墙 / DDoS 防御 / 国家 IP 封锁。源自 `kejilion.sh`，已去除遥测和 `gh_proxy`。 |
 | `mod_network.sh` | ~360 | 5. 网络优化 | DNS 管理 / BBR 拥塞控制 / 内核参数调优 / IPv4 优先。源自 `kejilion.sh`。**注意**：sysctl 写入与 `mod_memmgr` 的 swappiness / vfs_cache_pressure 不重叠，分别落在 `99-howe-bbr.conf` 和 `99-howe-mem.conf`。 |
