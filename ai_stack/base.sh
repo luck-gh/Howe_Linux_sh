@@ -46,7 +46,7 @@ setup_dirs() {
 # - 返回值：0=同步过有变化或同步成功，1=没源文件可同步（用于上层判断是否要 reload Caddy）
 # ═══════════════════════════════════════════════════════════════════
 sync_brand_assets() {
-  local _repo_doc="${_AI_STACK_DIR%/}/../doc"
+  local _repo_doc="${_AI_STACK_DIR%/}/doc"
   local _dst="$BASE_DIR/caddy/static"
   [[ -d "$_repo_doc" ]] || return 1
   mkdir -p "$_dst"
@@ -67,7 +67,7 @@ sync_brand_assets() {
 
 # ═══════════════════════════════════════════════════════════════════
 # 用户入口：刷新品牌资源（菜单调用）
-# - 把仓库 doc/ 下最新的 logo 等同步到 caddy/static/
+# - 把 ai_stack/doc/ 下最新的 logo 等同步到 caddy/static/
 # - 因为文件系统直接被 Caddy 的 file_server 读取，无需 reload Caddy
 # - 浏览器侧需要清缓存才能看到（ico 通常会被缓存得很久）
 # ═══════════════════════════════════════════════════════════════════
@@ -78,6 +78,6 @@ refresh_brand_assets() {
     info "Caddy 直接从文件系统读取，无需 reload"
     info "浏览器有强缓存时请用 Ctrl+Shift+R 强刷"
   else
-    warn "未在 ${_AI_STACK_DIR%/}/../doc 下找到任何品牌资源（AAPI_LOGO.ico / favicon.ico / logo.png）"
+    warn "未在 ${_AI_STACK_DIR%/}/doc 下找到任何品牌资源（AAPI_LOGO.ico / favicon.ico / logo.png）"
   fi
 }

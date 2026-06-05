@@ -46,7 +46,7 @@ core → detect → select → base → clash → compose → caddy → services
 | `BASE_DIR` | core.sh | 部署根目录，固定 `/opt/ai-stack` |
 | `PREFIX_VPS` 等 | core.sh | 子域名前缀（`vps.<DOMAIN>` 给 Clash 订阅） |
 | `SINGBOX_DIR` / `SINGBOX_BIN` | core.sh | sing-box 配置和二进制路径 |
-| `_AI_STACK_DIR` | core.sh | `${BASH_SOURCE[0]%/*}`，指向 `ai_stack/` 自身（用来定位 `../doc`） |
+| `_AI_STACK_DIR` | core.sh | `${BASH_SOURCE[0]%/*}`，指向 `ai_stack/` 自身（用来定位同级的 `doc/`） |
 | `INST_<SVC>` | select.sh / detect.sh | 用户选了 / 已安装的服务布尔变量 |
 | `LOC_<SVC>` | select.sh | 分布式模式下服务跑在 VPS 还是本地（`vps`/`local`） |
 | `DOMAIN` / `VPS_IP` / `FRP_TOKEN` 等 | select.sh / detect.sh / `.env` | 用户配置；持久化到 `/opt/ai-stack/.env`，下次启动 source 进来 |
@@ -57,7 +57,7 @@ core → detect → select → base → clash → compose → caddy → services
 - **改一个具体模块**：直接编辑对应 `.sh`，跑 `bash -n ai_stack/<file>.sh`，再跑入口 `bash ai_stack/ai-stack-setup.sh`（被 `modules/mod_ai_stack.sh` 间接调用）。
 - **加新功能**：尽量加到职责最相近的现有文件；新建文件需在 `ai-stack-setup.sh` 里按依赖顺序 `source`，并在本 README 表格里加一行。
 - **改路径常量**：只在 `core.sh` 改一次。
-- **doc 资源（vps.yaml / clash_subs.py / 品牌图标）路径**：模块内统一用 `${_AI_STACK_DIR%/}/../doc`（注意 `_AI_STACK_DIR` 现在指向 `ai_stack/` 而非旧的 `lib/`，但 `..` 仍能定位到仓库根的 `doc/`）。
+- **doc 资源（vps.yaml / clash_subs.py / 品牌图标）路径**：模块内统一用 `${_AI_STACK_DIR%/}/doc`，已从仓库根目录 `doc/` 迁入 `ai_stack/doc/`，与 ai_stack 模块同级，便于按职责定位。
 
 ## 调用入口
 

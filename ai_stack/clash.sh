@@ -64,7 +64,7 @@ _sync_clash_ufw() {
 setup_clash_subscription() {
   $INST_SINGBOX || return 0
   local _dir; _dir=$(_clash_dir)
-  local _repo_doc="${_AI_STACK_DIR%/}/../doc"
+  local _repo_doc="${_AI_STACK_DIR%/}/doc"
   mkdir -p "$_dir/output"
 
   if [[ ! -f "$_dir/template.yaml" ]]; then

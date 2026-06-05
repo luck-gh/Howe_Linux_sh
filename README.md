@@ -49,11 +49,11 @@ ai_stack/            # AI 服务栈 + 代理订阅（核心模块）
   compose.sh         # Docker Compose 生成
   lifecycle.sh       # 安装 / 卸载流程
   ...
-doc/                 # 分发资源
-  clash_subs.py      # 订阅管理 + 渲染脚本
-  clash_subs_serve.py# 订阅按需刷新 HTTP 服务
-  clash_subs_stats.py# 流量统计 + 限流执法
-  vps.yaml           # Clash 配置模板
+  doc/               # 分发资源
+    clash_subs.py    # 订阅管理 + 渲染脚本
+    clash_subs_serve.py# 订阅按需刷新 HTTP 服务
+    clash_subs_stats.py# 流量统计 + 限流执法
+    vps.yaml         # Clash 配置模板
 lib/                 # 基础工具库
 modules/             # 功能模块入口
 ```

@@ -162,7 +162,7 @@ show_config() {
     _menu_labels+=("查看密钥信息")
     _menu_actions+=("secrets")
     if [[ "${INST_NEWAPI:-false}" == "true" ]]; then
-      _menu_labels+=("刷新品牌资源（同步仓库 doc/ 下的 logo 等到 Caddy）")
+      _menu_labels+=("刷新品牌资源（同步 ai_stack/doc/ 下的 logo 等到 Caddy）")
       _menu_actions+=("brand")
     fi
     if [[ "${INST_SINGBOX:-false}" == "true" ]]; then
