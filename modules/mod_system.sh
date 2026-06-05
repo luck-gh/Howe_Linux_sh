@@ -250,13 +250,12 @@ mod_system_main() {
     echo "  1. 系统信息查看"
     echo "  2. 系统更新"
     echo "  3. 系统清理"
-    echo "  4. Swap 管理"
-    echo "  5. dpkg 修复（仅 Debian/Ubuntu）"
+    echo "  4. dpkg 修复（仅 Debian/Ubuntu）"
     echo "  ─────────────────"
-    echo "  6. 系统备份"
-    echo "  7. 系统恢复"
-    echo "  8. 查看备份列表"
-    echo "  9. 删除备份"
+    echo "  5. 系统备份"
+    echo "  6. 系统恢复"
+    echo "  7. 查看备份列表"
+    echo "  8. 删除备份"
     echo "  ─────────────────"
     echo "  0. 返回主菜单"
     echo ""
@@ -267,12 +266,11 @@ mod_system_main() {
       1) show_system_info; break_end ;;
       2) system_update; break_end ;;
       3) system_clean; break_end ;;
-      4) manage_swap; break_end ;;
-      5) fix_dpkg && log "dpkg 修复完成"; break_end ;;
-      6) create_backup; break_end ;;
-      7) restore_backup; break_end ;;
-      8) list_backups; break_end ;;
-      9) delete_backup; break_end ;;
+      4) fix_dpkg && log "dpkg 修复完成"; break_end ;;
+      5) create_backup; break_end ;;
+      6) restore_backup; break_end ;;
+      7) list_backups; break_end ;;
+      8) delete_backup; break_end ;;
       0|*) break ;;
     esac
   done

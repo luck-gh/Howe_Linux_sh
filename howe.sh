@@ -28,6 +28,7 @@ source "${HOWE_DIR}/lib/menu.sh"
 
 # 加载 modules
 source "${HOWE_DIR}/modules/mod_system.sh"
+source "${HOWE_DIR}/modules/mod_memmgr.sh"
 source "${HOWE_DIR}/modules/mod_security.sh"
 source "${HOWE_DIR}/modules/mod_network.sh"
 source "${HOWE_DIR}/modules/mod_docker.sh"
@@ -41,13 +42,14 @@ main() {
   if [[ $# -gt 0 ]]; then
     case "$1" in
       system)   mod_system_main ;;
+      memmgr)   mod_memmgr_main ;;
       docker)   mod_docker_main ;;
       security) mod_security_main ;;
       network)  mod_network_main ;;
       ai-stack) mod_ai_stack_main ;;
       test)     mod_test_main ;;
       info)     preflight; show_system_info ;;
-      *)        echo "用法: $0 [system|docker|security|network|ai-stack|test|info]" ;;
+      *)        echo "用法: $0 [system|memmgr|docker|security|network|ai-stack|test|info]" ;;
     esac
     return
   fi
@@ -73,12 +75,13 @@ main() {
     [[ -n "$_ip" ]] && echo -e "  ${DIM}IP：${N}$_ip"
     echo ""
 
-    echo "  1. 系统管理     （信息 / 更新 / 清理 / Swap / 备份）"
-    echo "  2. Docker 管理   （容器 / 镜像 / 网络 / IPv6）"
-    echo "  3. 安全加固     （SSH / fail2ban / 防火墙 / DDoS）"
-    echo "  4. 网络优化     （DNS / BBR / 内核调优）"
-    echo "  5. AI 服务栈    （New-API / OpenWebUI / sing-box）"
-    echo "  6. 网络测试     （IP 检测 / 回程路由 / 三网测速 / 性能）"
+    echo "  1. 系统管理     （信息 / 更新 / 清理 / 备份）"
+    echo "  2. 内存管理     （状态 / 救援 / Swap / zram / sysctl）"
+    echo "  3. Docker 管理   （容器 / 镜像 / 网络 / IPv6）"
+    echo "  4. 安全加固     （SSH / fail2ban / 防火墙 / DDoS）"
+    echo "  5. 网络优化     （DNS / BBR / 内核调优）"
+    echo "  6. AI 服务栈    （New-API / OpenWebUI / sing-box）"
+    echo "  7. 网络测试     （IP 检测 / 回程路由 / 三网测速 / 性能）"
     echo ""
     echo "  0. 退出"
     echo ""
@@ -87,11 +90,12 @@ main() {
 
     case "$choice" in
       1) mod_system_main ;;
-      2) mod_docker_main ;;
-      3) mod_security_main ;;
-      4) mod_network_main ;;
-      5) mod_ai_stack_main ;;
-      6) mod_test_main ;;
+      2) mod_memmgr_main ;;
+      3) mod_docker_main ;;
+      4) mod_security_main ;;
+      5) mod_network_main ;;
+      6) mod_ai_stack_main ;;
+      7) mod_test_main ;;
       0) echo -e "\n  ${DIM}已退出${N}"; exit 0 ;;
     esac
   done
