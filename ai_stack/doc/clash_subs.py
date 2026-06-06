@@ -53,6 +53,7 @@ import hashlib
 import os
 import secrets
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -90,7 +91,35 @@ BUILTIN_DEFAULTS = {
     "static_custom_keywords": [],
     # 静态 IP 子组节点显示前缀
     "static_name_prefix": "[静态] ",
+    # IP 质量检测：总开关 + 自建/静态 分项开关
+    # 外购始终不评分(协议私有,server 是入口 LB 而非真实落地,评分无意义)
+    "quality_check_enabled": "off",
+    "quality_check_for_self": "on",
+    "quality_check_for_static": "on",
+    # 出口 IP 显示(节点名末尾 (IP))总开关 + 自建/静态分项
+    # off = 显示 server 字段(可能是域名);on = 实测出口 IP 显示
+    "exit_ip_show_enabled": "on",
+    "exit_ip_show_for_self": "on",
+    "exit_ip_show_for_static": "on",
+    # 数据源：free = proxycheck 免费匿名(100/天，区分度低，所有 datacenter 一律 risk=66)
+    #         scamalytics = 用 scamalytics_url(免费 5K/月，区分度高)
+    "quality_source": "free",
+    # IP 质量打分数据源（按优先级回落）：
+    # - scamalytics_url 非空 → 用 scamalytics(区分度高,免费 5000/月)
+    #   填 dashboard 给的完整 URL,如 "https://api12.scamalytics.com/v3/?key=XXX&user=YYY"
+    #   代码会自动追加 &ip={ip}
+    # - 否则用 proxycheck(免费匿名 100/天,区分度低,所有 datacenter 都 risk=66)
+    #   填 API key 升级到 1000/天,空 = 走匿名额度
+    "scamalytics_url": "",
+    "proxycheck_api_key": "",
 }
+
+QUALITY_SOURCES = ("free", "scamalytics", "lookup_scrape")
+QUALITY_BOOL_KEYS = (
+    "quality_check_enabled", "quality_check_for_self",
+    "quality_check_for_static",
+    "exit_ip_show_enabled", "exit_ip_show_for_self", "exit_ip_show_for_static",
+)
 
 # 默认值字段类型（影响 cmd_defaults 转换）
 INT_DEFAULT_KEYS = {
@@ -285,7 +314,9 @@ def resolve_external_url(sub, defs):
 # ─── 静态 IP 出口（远端 socks5 outbound 资源池 + 路由策略）──────────
 def _coerce_static_proxy(p):
     """把单条静态 IP 资源标准化成 dict；非 dict / 缺关键字段时返回 None。
-    必填：server, port, password；type 默认 socks5；username 可选；name 缺省自动生成"""
+    必填：server, port, password；type 默认 socks5；username 可选；
+    annotation 可选(中英文/数字/空格/-_, 最多 12 字符,显示在节点名 risk 后 geo 前)；
+    name 缺省自动生成"""
     if not isinstance(p, dict):
         return None
     server = (p.get("server") or "").strip()
@@ -297,6 +328,11 @@ def _coerce_static_proxy(p):
     if not server or not (1 <= port <= 65535) or not password:
         return None
     username = (p.get("username") or "").strip() or None
+    annotation = (p.get("annotation") or "").strip() or None
+    if annotation:
+        # 校验:不允许 : , ; 和过长(12 字符上限)
+        if any(c in annotation for c in (":", ",", ";")) or len(annotation) > 12:
+            annotation = None
     out = {
         "name": (p.get("name") or "").strip(),
         "type": (p.get("type") or "socks5").strip().lower(),
@@ -306,13 +342,17 @@ def _coerce_static_proxy(p):
     }
     if username:
         out["username"] = username
+    if annotation:
+        out["annotation"] = annotation
     return out
 
 
 def parse_static_proxy_line(line):
     """解析单行字符串 → 静态 IP 资源 dict。支持：
-      host:port:user:password   （4 段，标准格式）
-      host:port:password        （3 段，无认证用户名）
+      [annotation:]host:port:user:password   (annotation 可选)
+      [annotation:]host:port:password        (无认证用户名)
+    冒号段数:3 = host:port:pwd / 4 = host:port:user:pwd 或 anno:host:port:pwd /
+            5 = anno:host:port:user:pwd
     其它格式返回 None。
     """
     if line is None:
@@ -321,8 +361,16 @@ def parse_static_proxy_line(line):
     if not s or s.startswith("#"):
         return None
     parts = s.split(":")
-    if len(parts) == 4:
-        host, port, user, pwd = parts
+    annotation = None
+    if len(parts) == 5:
+        annotation, host, port, user, pwd = parts
+    elif len(parts) == 4:
+        # 区分 anno:host:port:pwd vs host:port:user:pwd:看第 2 段是不是端口数字
+        if parts[1].isdigit() and 1 <= int(parts[1]) <= 65535:
+            host, port, user, pwd = parts
+        else:
+            annotation, host, port, pwd = parts
+            user = ""
     elif len(parts) == 3:
         host, port, pwd = parts
         user = ""
@@ -337,35 +385,55 @@ def parse_static_proxy_line(line):
         "port": port_n,
         "username": user.strip() or None,
         "password": pwd,
+        "annotation": (annotation or "").strip() or None,
     })
+
+
+def _static_proxy_key(p):
+    """静态 IP 资源去重键:(server, port, username, password)"""
+    return (p.get("server"), int(p.get("port", 0)),
+            p.get("username") or "", p.get("password") or "")
 
 
 def parse_static_proxies_blob(blob):
     """解析多行 / 逗号分隔的静态 IP 字符串列表 → list[dict]。
-    分隔符兼容换行、逗号、分号。空行/'#' 起始行忽略。"""
+    分隔符兼容换行、逗号、分号。空行/'#' 起始行忽略。
+    自动按 (server,port,user,password) 去重,保留首次出现。"""
     if blob is None:
         return []
     s = str(blob)
-    # 统一分隔符
     for sep in (",", ";"):
         s = s.replace(sep, "\n")
     out = []
+    seen = set()
     for line in s.splitlines():
         rec = parse_static_proxy_line(line)
-        if rec:
-            out.append(rec)
+        if not rec:
+            continue
+        k = _static_proxy_key(rec)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(rec)
     return out
 
 
 def _norm_static_list(raw):
-    """list/None → 标准化后的 list[dict]，过滤无效项。"""
+    """list/None → 标准化后的 list[dict]，过滤无效项,
+    按 (server,port,user,password) 去重(读取路径兜底)。"""
     if not isinstance(raw, list):
         return []
     out = []
+    seen = set()
     for p in raw:
         c = _coerce_static_proxy(p)
-        if c is not None:
-            out.append(c)
+        if c is None:
+            continue
+        k = _static_proxy_key(c)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
     return out
 
 
@@ -461,6 +529,8 @@ def load_external_proxies(base, sub, defs, ttl_seconds):
     prefix = defs.get("external_name_prefix") or ""
     out = []
     seen = set()
+    info_nodes = []
+    real_nodes = []
     for p in raw:
         if not isinstance(p, dict) or not p.get("name"):
             continue
@@ -473,7 +543,12 @@ def load_external_proxies(base, sub, defs, ttl_seconds):
             new_name = f"{base_name} #{i}"
         q["name"] = new_name
         seen.add(new_name)
-        out.append(q)
+        if _is_external_info_node(p["name"]):
+            info_nodes.append(q)
+        else:
+            real_nodes.append(q)
+    # 信息节点保持原序置顶，真节点保持机场原序
+    out = info_nodes + real_nodes
     return out
 
 
@@ -548,9 +623,11 @@ def lookup_ip_geo(ip, base):
         return result
 
 
-def format_geo_label(server, base):
+def format_geo_label(server, base, display=None):
     """根据 server 地址查 IP 地理位置，返回纯文本标签：
         "🇺🇸 United States · Los Angeles (1.2.3.4)"
+    server: 用于查 geo 的 IP/域名
+    display: 节点名末尾 (xxx) 中显示什么；None 则用 server；""(空) 则不附 (xxx)
     server 为空时返回空串；查询失败时退化为 server 本身。"""
     if not server:
         return ""
@@ -562,21 +639,357 @@ def format_geo_label(server, base):
         parts.append(country)
     if city and city != country:
         parts.append(f"· {city}")
-    if server:
-        parts.append(f"({server})")
+    show = server if display is None else display
+    if show:
+        parts.append(f"({show})")
     return " ".join(parts) if parts else server
 
 
-def auto_node_name(node, base):
+# ─── 实测节点真实出口 IP ───────────────────────────────────────────
+# 节点的 server 字段往往是 LB / CDN 入口,不是真实落地 IP。
+# 走真实的代理协议跑一次 ipify 才能拿到对外感知的出口 IP。
+EXIT_IP_PROBE_URL = "https://api.ipify.org"
+EXIT_IP_PROBE_TIMEOUT = 8
+_exit_ip_memo: dict = {}   # key: ("self",) / ("static", server, port, user) → ip 或 ""
+
+
+def _probe_self_exit_ip():
+    """VPS 本机直发 ipify,拿自建出口 IP。"""
+    key = ("self",)
+    if key in _exit_ip_memo:
+        return _exit_ip_memo[key]
+    try:
+        out = subprocess.check_output(
+            ["curl", "-s", "--max-time", str(EXIT_IP_PROBE_TIMEOUT), EXIT_IP_PROBE_URL],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        ip = out if out and all(c.isdigit() or c in ".:" for c in out) else ""
+    except Exception:
+        ip = ""
+    _exit_ip_memo[key] = ip
+    return ip
+
+
+def _probe_static_exit_ip(server, port, username, password):
+    """通过 socks5 节点跑 ipify,拿真实落地 IP。"""
+    key = ("static", server, int(port), username or "")
+    if key in _exit_ip_memo:
+        return _exit_ip_memo[key]
+    try:
+        cmd = ["curl", "-s", "--max-time", str(EXIT_IP_PROBE_TIMEOUT),
+               "--socks5-hostname", f"{server}:{port}"]
+        if username:
+            cmd += ["-U", f"{username}:{password or ''}"]
+        cmd.append(EXIT_IP_PROBE_URL)
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
+        ip = out if out and all(c.isdigit() or c in ".:" for c in out) else ""
+    except Exception as e:
+        sys.stderr.write(f"[exit-ip] {server}:{port} 探测失败:{e}\n")
+        ip = ""
+    _exit_ip_memo[key] = ip
+    return ip
+
+
+# ─── 外购信息节点识别(机场订阅常见的"剩余流量/到期"等无效占位)─────
+_EXTERNAL_INFO_KEYWORDS = (
+    "剩余", "流量", "重置", "到期", "倍率", "套餐",
+    "公告", "续费", "官网", "距离", "工单", "客服",
+    "群组", "网址", "域名", "节点信息",
+)
+
+
+def _is_external_info_node(name):
+    s = str(name or "")
+    return any(k in s for k in _EXTERNAL_INFO_KEYWORDS)
+
+
+# ─── IP 质量打分(proxycheck.io)→ 节点名后缀 ──────────────────
+IP_QUALITY_CACHE_FILE = ".ip_quality_cache.yaml"
+IP_QUALITY_FETCH_TIMEOUT = 8
+IP_QUALITY_CACHE_TTL = 24 * 3600       # 24 小时
+IP_QUALITY_NEG_TTL = 3600              # 失败负缓存 1 小时
+_ip_quality_memo: dict = {}
+
+
+# proxycheck 把 ISP 大网商常误归为 Business (例: Spectrum / Comcast / 中国移动)；
+# 这些关键词命中 provider/organisation 时强制视为家宽 → "宅"
+_RESIDENTIAL_ISP_KEYWORDS = (
+    # 美国
+    "spectrum", "charter", "comcast", "xfinity", "verizon", "at&t", "att inc",
+    "cox communications", "centurylink", "frontier", "windstream", "mediacom",
+    # 英 / 欧 / 加 / 澳
+    "british telecom", "bt group", "virgin media", "sky broadband", "talktalk",
+    "deutsche telekom", "telekom", "vodafone", "orange", "telefonica",
+    "kpn", "swisscom", "rogers", "telstra", "optus",
+    # 日 / 韩 / 港 / 台
+    "ntt", "kddi", "softbank", "nuro", "kt corp", "korea telecom", "skt",
+    "pccw", "hkt", "hutchison", "smartone",
+    "chunghwa", "hinet", "taiwan mobile", "fareastone",
+    # 中国大陆
+    "china telecom", "china unicom", "china mobile", "cnc",
+    "中国电信", "中国联通", "中国移动",
+    # 通用关键词（兜底）
+    "broadband", "cable", "fiber", "fibre", "dsl", "fttx", "ftth",
+    "communications", "telecom", "wireless", "mobile",
+)
+
+
+def _looks_like_residential(provider, organisation):
+    blob = f"{provider or ''} {organisation or ''}".lower()
+    return any(k in blob for k in _RESIDENTIAL_ISP_KEYWORDS)
+
+
+def _sort_by_risk(nodes, base, defs, kind_label):
+    """组内按风险升序排序：风险小(干净)排前，风险大排后，失败(score="")排末尾。
+    若该 kind 检测开关关，保持原顺序。返回新 list。
+    "self" 类用 VPS 本机出口 IP 作为排序依据(节点 server 可能是 LB 域名)。"""
+    if not nodes or not _is_quality_enabled(defs, kind_label):
+        return list(nodes)
+    self_exit_ip = _probe_self_exit_ip() if kind_label == "self" else ""
+    def _key(n):
+        target = self_exit_ip if kind_label == "self" else n.get("server", "")
+        if not target:
+            return (1, 0, 0)
+        _, score = lookup_ip_quality(target, base, defs)
+        if score == "" or score is None:
+            return (1, 0, 0)
+        return (0, int(score), 0)
+    return sorted(nodes, key=_key)
+    """返回 (kind, score, type_raw) 或抛异常。
+    scamalytics V3 返回 score 0-100(越小越干净),risk文字,connection.type。
+    score 直接用作风险分(0=干净=好,100=高危=差)。"""
+    import json as _json
+    sep = "&" if "?" in base_url else "?"
+    url = f"{base_url}{sep}ip={ip}"
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/7.88.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = _json.loads(resp.read().decode("utf-8"))
+    if (data.get("status") or "ok") not in ("ok", "OK", "success", "", None):
+        raise ValueError(f"scamalytics status={data.get('status')} err={data.get('error')}")
+    fraud = data.get("score")
+    if fraud is None and isinstance(data.get("scamalytics"), dict):
+        fraud = data["scamalytics"].get("scamalytics_score")
+    if fraud is None:
+        raise ValueError(f"scamalytics 响应无 score 字段: {list(data.keys())}")
+    score = max(0, min(100, int(fraud)))
+    type_raw = ""
+    conn = data.get("connection") or {}
+    if isinstance(conn, dict):
+        type_raw = conn.get("type") or conn.get("connection_type") or ""
+    if not type_raw:
+        type_raw = data.get("connection_type") or ""
+    t = (type_raw or "").lower()
+    kind = "宅" if any(x in t for x in ("residential", "isp", "broadband", "cable", "dsl", "mobile")) else "机"
+    return kind, score, type_raw or "Unknown"
+
+
+def _quality_via_lookup_scrape(ip, timeout):
+    """爬 https://proxycheck.io/lookup/IP 网页,解析综合风险分。
+    网页比 API 多一个综合评分(基于 type+history+ASN 干净度),
+    例如 hosting datacenter 网页给 33,API 给 0/66。
+    返回 (kind, score, type_raw) 或抛异常。"""
+    import re as _re
+    url = f"https://proxycheck.io/lookup/{ip}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Accept": "text/html",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+    m = _re.search(r'risk score of (\d+)%', html)
+    if not m:
+        m = _re.search(r'data-copy="(\d+)%"', html)
+    if not m:
+        raise ValueError("lookup 页未找到 risk score")
+    score = max(0, min(100, int(m.group(1))))
+    # type 字段:页面里有 data-copy="Hosting." / "Residential." / "Business." 等
+    # (一个简短词 + 句号),要避开第一个长描述句
+    type_raw = ""
+    tm = _re.search(
+        r'data-copy="(Hosting|Residential|Business|VPN|Mobile|Wireless|Compromised[^.]*?|Public[^.]*?|Datacenter|ISP)\.?"',
+        html)
+    if tm:
+        type_raw = tm.group(1).strip()
+    t = type_raw.lower()
+    # provider/org 用 "operated by XXX" 句式提取做 ISP 兜底
+    pm = _re.search(r'operated by ([^.<]{2,80})', html)
+    provider = pm.group(1).strip() if pm else ""
+    if t == "residential" or "mobile" in t or "wireless" in t \
+            or _looks_like_residential(provider, ""):
+        kind = "宅"
+    else:
+        kind = "机"
+    return kind, score, type_raw or "Unknown"
+
+
+def _quality_via_proxycheck(ip, api_key, timeout):
+    """返回 (kind, score, type_raw) 或抛异常。
+    使用 risk=1 但不启用 vpn=1 严格模式;vpn=1 会强制 datacenter range 一律打 66 分,
+    与 proxycheck 网页 /lookup 显示不一致。不带 vpn 时 type 字段更细
+    (Residential/Business/Hosting/...),risk 体现真实历史滥用。
+    """
+    import json as _json
+    qs = "risk=1&asn=1&node=0"
+    if api_key:
+        qs += f"&key={api_key}"
+    url = f"https://proxycheck.io/v2/{ip}?{qs}"
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/7.88.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = _json.loads(resp.read().decode("utf-8"))
+    if data.get("status") != "ok":
+        raise ValueError(f"proxycheck status={data.get('status')} msg={data.get('message')}")
+    info = data.get(ip) or {}
+    t = (info.get("type") or "").strip().lower()
+    provider = info.get("provider") or ""
+    organisation = info.get("organisation") or ""
+    if t == "residential" or _looks_like_residential(provider, organisation):
+        kind = "宅"
+    else:
+        kind = "机"
+    risk = int(info.get("risk", 0))
+    score = max(0, min(100, risk))  # 风险分:0=干净,100=高危
+    return kind, score, info.get("type", "")
+
+
+def lookup_ip_quality(host, base, defs=None):
+    """查询 host 的类型 + 风险分，返回 (kind, score)。
+    host 可以是 IP 或域名（域名会先 DNS 解析，缓存按 IP 键）。
+    数据源优先级: scamalytics_url 配了用 scamalytics → 否则 proxycheck。
+    kind: "宅"=Residential / "机"=Hosting/Business/其它 / "" = 失败
+    score: 0-100 的整数，风险分（0=干净最好，100=高危最差），"" = 失败
+    缓存 24h, 失败负缓存 1h, 进程内 memo。
+    """
+    import socket as _socket
+    if host in _ip_quality_memo:
+        return _ip_quality_memo[host]
+
+    try:
+        ip = _socket.gethostbyname(host)
+    except Exception as e:
+        sys.stderr.write(f"[quality] {host} DNS 解析失败：{e}\n")
+        result = ("", "")
+        _ip_quality_memo[host] = result
+        return result
+
+    cache_path = os.path.join(base, IP_QUALITY_CACHE_FILE)
+    cache = load_yaml(cache_path) if os.path.exists(cache_path) else {}
+    now = int(time.time())
+
+    entry = cache.get(ip)
+    if isinstance(entry, dict):
+        fetched_at = int(entry.get("fetched_at", 0))
+        ttl = IP_QUALITY_NEG_TTL if entry.get("error") else IP_QUALITY_CACHE_TTL
+        if now - fetched_at < ttl:
+            result = (entry.get("kind", ""), entry.get("score", ""))
+            _ip_quality_memo[host] = result
+            return result
+
+    scama = ((defs or {}).get("scamalytics_url") or "").strip()
+    proxy_key = ((defs or {}).get("proxycheck_api_key") or "").strip()
+    src_pref = str((defs or {}).get("quality_source", "free")).strip().lower()
+    use_scama = src_pref == "scamalytics" and bool(scama)
+    use_scrape = src_pref == "lookup_scrape"
+    source = "none"
+    try:
+        if use_scama:
+            kind, score, type_raw = _quality_via_scamalytics(ip, scama, IP_QUALITY_FETCH_TIMEOUT)
+            source = "scamalytics"
+        elif use_scrape:
+            kind, score, type_raw = _quality_via_lookup_scrape(ip, IP_QUALITY_FETCH_TIMEOUT)
+            source = "lookup_scrape"
+        else:
+            kind, score, type_raw = _quality_via_proxycheck(ip, proxy_key, IP_QUALITY_FETCH_TIMEOUT)
+            source = "proxycheck"
+        entry = {"kind": kind, "score": score, "type_raw": type_raw,
+                 "source": source, "fetched_at": now}
+        cache[ip] = entry
+        dump_yaml(cache_path, cache)
+        result = (kind, score)
+        _ip_quality_memo[host] = result
+        return result
+    except Exception as e:
+        sys.stderr.write(f"[quality] {host} ({ip}) {source or 'lookup'} 失败：{e}\n")
+        cache[ip] = {"kind": "", "score": "", "source": source,
+                     "fetched_at": now, "error": True}
+        try:
+            dump_yaml(cache_path, cache)
+        except Exception:
+            pass
+        result = ("", "")
+        _ip_quality_memo[host] = result
+        return result
+
+
+def _is_exit_ip_show_enabled(defs, kind_label):
+    """检查出口 IP 显示开关。kind_label: self / static。
+    总关 → False；总开 + 单类关 → False。"""
+    if not defs:
+        return False
+    if str(defs.get("exit_ip_show_enabled", "on")).strip().lower() != "on":
+        return False
+    per_key = {
+        "self":   "exit_ip_show_for_self",
+        "static": "exit_ip_show_for_static",
+    }.get(kind_label)
+    if per_key is None:
+        return True
+    return str(defs.get(per_key, "on")).strip().lower() == "on"
+
+
+def _is_quality_enabled(defs, kind_label):
+    """检查 IP 检测开关。kind_label: self / external / static。
+    总关 = 都跳过；总开 + 单类关 = 该类跳过。"""
+    if not defs:
+        return False
+    if str(defs.get("quality_check_enabled", "off")).strip().lower() != "on":
+        return False
+    per_key = {
+        "self":     "quality_check_for_self",
+        "external": "quality_check_for_external",
+        "static":   "quality_check_for_static",
+    }.get(kind_label)
+    if per_key is None:
+        return True
+    return str(defs.get(per_key, "on")).strip().lower() == "on"
+
+
+def format_quality_suffix(server, base, defs=None, kind_label=None):
+    """节点名后缀，格式：(宅-85) / (机-12) / (?-?)（查询失败）。
+    kind_label 指定该节点类别 self/external/static 用于检查分项开关；
+    传 None 则只看总开关；server 为空或开关关闭返回空串。"""
+    if not server:
+        return ""
+    if kind_label is not None and not _is_quality_enabled(defs, kind_label):
+        return ""
+    if kind_label is None and defs is not None and \
+            str(defs.get("quality_check_enabled", "off")).strip().lower() != "on":
+        return ""
+    kind, score = lookup_ip_quality(server, base, defs)
+    if kind == "" or score == "":
+        return "(?-?)"
+    return f"({kind}-{score})"
+
+
+def auto_node_name(node, base, defs=None):
     """节点 name 为空时，根据 server 地址自动生成显示名。
-    格式：[自建] 🇺🇸 United States · Los Angeles (1.2.3.4)
-    name 非空则原样返回。
+    格式：[自建](机-23) 🇺🇸 United States · Los Angeles (199.193.124.234)
+    server 字段可能是域名(LB)，所以 geo / quality 都基于 VPS 真实出口 IP。
+    出口 IP 显示开关关时，末尾 (IP) 隐藏。
     """
     name = (node.get("name") or "").strip()
     if name:
         return name
-    label = format_geo_label(node.get("server", ""), base)
-    return f"[自建] {label}" if label else "[自建]"
+    raw_server = node.get("server", "")
+    # 自建出口 = VPS 本机出口（无论 server 写的是 IP 还是域名）
+    exit_ip = _probe_self_exit_ip() if (_is_quality_enabled(defs, "self") or _is_exit_ip_show_enabled(defs, "self")) else ""
+    target = exit_ip or raw_server
+    show_ip = _is_exit_ip_show_enabled(defs, "self")
+    display = (exit_ip or raw_server) if show_ip else ""
+    label = format_geo_label(target, base, display=display)
+    quality = format_quality_suffix(target, base, defs, kind_label="self")
+    if not label:
+        return f"[自建]{quality}" if quality else "[自建]"
+    return f"[自建]{quality} {label}" if quality else f"[自建] {label}"
 
 
 def _normalize_sub(sub, defs, subs_for_port_alloc=None):
@@ -898,18 +1311,26 @@ def apply_fields(sub, args, defs, creating, all_subs):
         # 在现有基础上增删；若 sub 还没显式 static_proxies，则从默认值拷一份当起点
         cur = list(_norm_static_list(sub.get("static_proxies"))) if "static_proxies" in sub \
               else list(_norm_static_list(defs.get("static_proxies")))
-        # 删除：支持索引（1 起算）或 server:port 匹配
+        # 删除:支持索引(1 起算)或 server:port 匹配。
+        # 索引类先全部收集再降序删,避免每删一项后续索引漂移
+        idx_tokens = []
+        host_tokens = []
         for token in rems:
             t = str(token).strip()
             if not t:
                 continue
-            removed = False
             if t.isdigit():
-                idx = int(t) - 1
-                if 0 <= idx < len(cur):
-                    cur.pop(idx)
-                    removed = True
-            if not removed and ":" in t:
+                idx_tokens.append((t, int(t) - 1))
+            else:
+                host_tokens.append(t)
+        for raw, idx in sorted(idx_tokens, key=lambda x: -x[1]):
+            if 0 <= idx < len(cur):
+                cur.pop(idx)
+            else:
+                raise SystemExit(f"未找到要删除的静态 IP: {raw}（索引越界,共 {len(cur) + len([t for t in idx_tokens if 0 <= t[1] < len(cur)])} 条）")
+        for t in host_tokens:
+            removed = False
+            if ":" in t:
                 host, _, port = t.partition(":")
                 try:
                     port_n = int(port)
@@ -1007,6 +1428,15 @@ def cmd_defaults(args):
         ("external_name_prefix", "external_name_prefix"),
         ("static_strategy", "static_strategy"),
         ("static_name_prefix", "static_name_prefix"),
+        ("quality_check_enabled", "quality_check_enabled"),
+        ("quality_check_for_self", "quality_check_for_self"),
+        ("quality_check_for_static", "quality_check_for_static"),
+        ("quality_source", "quality_source"),
+        ("exit_ip_show_enabled", "exit_ip_show_enabled"),
+        ("exit_ip_show_for_self", "exit_ip_show_for_self"),
+        ("exit_ip_show_for_static", "exit_ip_show_for_static"),
+        ("scamalytics_url", "scamalytics_url"),
+        ("proxycheck_api_key", "proxycheck_api_key"),
     ):
         v = getattr(args, attr, None)
         if v is None:
@@ -1020,6 +1450,18 @@ def cmd_defaults(args):
     if "static_strategy" in defs:
         if str(defs["static_strategy"]).strip().lower() not in STATIC_STRATEGIES:
             raise SystemExit(f"static_strategy 必须是 {'/'.join(STATIC_STRATEGIES)}")
+    # IP 质量检测 on/off 字段标准化
+    for k in QUALITY_BOOL_KEYS:
+        if k in defs:
+            v = str(defs[k]).strip().lower()
+            if v not in ("on", "off"):
+                raise SystemExit(f"{k} 必须是 on/off")
+            defs[k] = v
+    if "quality_source" in defs:
+        v = str(defs["quality_source"]).strip().lower()
+        if v not in QUALITY_SOURCES:
+            raise SystemExit(f"quality_source 必须是 {'/'.join(QUALITY_SOURCES)}")
+        defs["quality_source"] = v
     # 列表型字段：逗号分隔 → list
     for key, attr in (
         ("static_service_packs", "static_service_packs"),
@@ -1044,16 +1486,25 @@ def cmd_defaults(args):
     rems = getattr(args, "static_proxy_remove", None) or []
     if adds or rems:
         cur = list(_norm_static_list(defs.get("static_proxies")))
+        # 索引类先全部收集再降序删,避免每删一项后续索引漂移
+        idx_tokens = []
+        host_tokens = []
         for token in rems:
             t = str(token).strip()
             if not t:
                 continue
-            removed = False
             if t.isdigit():
-                idx = int(t) - 1
-                if 0 <= idx < len(cur):
-                    cur.pop(idx); removed = True
-            if not removed and ":" in t:
+                idx_tokens.append((t, int(t) - 1))
+            else:
+                host_tokens.append(t)
+        for raw, idx in sorted(idx_tokens, key=lambda x: -x[1]):
+            if 0 <= idx < len(cur):
+                cur.pop(idx)
+            else:
+                raise SystemExit(f"未找到要删除的静态 IP: {raw}（索引越界）")
+        for t in host_tokens:
+            removed = False
+            if ":" in t:
                 host, _, port = t.partition(":")
                 try:
                     port_n = int(port)
@@ -1174,9 +1625,11 @@ def render_one(base, sub):
             info.append(make_proxy(f"[自建] 套餐到期:{sub['expire']}", head, pwd, sub_port))
 
     # 套餐到期时不显示自建节点；流量用完时仍显示（nft 负责限流）
-    real = [] if expired else [make_proxy(auto_node_name(n, base), n, pwd, sub_port) for n in nodes]
+    real = [] if expired else [make_proxy(auto_node_name(n, base, defs), n, pwd, sub_port) for n in nodes]
+    real = _sort_by_risk(real, base, defs, "self")
 
-    # 外购订阅节点（不计流量、不受 nft 限流约束）
+    # 外购订阅节点（不计流量、不受 nft 限流约束）;
+    # load_external_proxies 内部已按"信息置顶 + 真节点风险升序"排好
     ttl = int(defs.get("stats_refresh_minutes", 10)) * 60
     external = load_external_proxies(base, sub, defs, ttl)
 
@@ -1207,13 +1660,36 @@ def render_one(base, sub):
         for i, sp in enumerate(static_proxies):
             if i >= len(static_pwds):
                 break
-            # 节点显示名复用 VPS 节点的 geo 命名规则
-            label = format_geo_label(sp.get("server", ""), base) or sp.get("server") or ""
-            name = _uniq(f"[静态] {label}")
-            static_nodes.append(make_static_proxy(
+            entry_server = sp.get("server", "")
+            entry_port = sp.get("port", 0)
+            entry_user = sp.get("username") or ""
+            entry_pwd = sp.get("password") or ""
+            target = ""
+            # 实测出口 IP:质量检测 OR 出口IP显示 任一开就要探测
+            if _is_quality_enabled(defs, "static") or _is_exit_ip_show_enabled(defs, "static"):
+                target = _probe_static_exit_ip(entry_server, entry_port, entry_user, entry_pwd)
+            target = target or entry_server
+            show_ip = _is_exit_ip_show_enabled(defs, "static")
+            display = target if show_ip else ""
+            label = format_geo_label(target, base, display=display) or target or ""
+            quality = format_quality_suffix(target, base, defs, kind_label="static")
+            anno = sp.get("annotation") or ""
+            anno_seg = f"[{anno}]" if anno else ""
+            display_name = f"[静态]{quality}{anno_seg} {label}" if (quality or anno_seg) else f"[静态] {label}"
+            name = _uniq(display_name)
+            node = make_static_proxy(
                 name=name, sub_password=static_pwds[i],
                 sub_port=sub_port, vps_server=vps_server, sni=sni,
-            ))
+            )
+            if _is_quality_enabled(defs, "static") and target:
+                _, sc = lookup_ip_quality(target, base, defs)
+                node["__sort_risk"] = (1, 0) if sc == "" or sc is None else (0, int(sc))
+            else:
+                node["__sort_risk"] = (1, 0)
+            static_nodes.append(node)
+        static_nodes.sort(key=lambda n: n.get("__sort_risk", (1, 0)))
+        for n in static_nodes:
+            n.pop("__sort_risk", None)
 
     # 静态IP 组顶部的"信息说明节点"：用主 password（不是静态密码），所以 sing-box
     # 把它识别为主 user，流量沿 final=direct 出去 = VPS 出口。两条永远渲染：
@@ -1237,7 +1713,9 @@ def render_one(base, sub):
                 sni=head.get("sni"),
             ))
 
-    proxies = info + real + static_nodes + static_info_nodes + external
+    # 组顺序: 自建(info+real) → 静态(static_info+static_nodes) → 外购(external)
+    # 组内: info 节点在前, 真实节点按风险升序(已在各类生成时排好)
+    proxies = info + real + static_info_nodes + static_nodes + external
     tpl["proxies"] = proxies
 
     # proxy-groups：始终拆 "VPS 节点" 子组（含信息节点+自建），有外购时再加 "外购" 子组；
@@ -1746,10 +2224,37 @@ def cmd_field_values(args):
             "static_service_packs": ",".join(defs.get("static_service_packs") or []) or "(空)",
             "static_custom_keywords": ",".join(defs.get("static_custom_keywords") or []) or "(空)",
             "static_name_prefix": defs.get("static_name_prefix", ""),
+            "quality_check_enabled": defs.get("quality_check_enabled", "off"),
+            "quality_check_for_self": defs.get("quality_check_for_self", "on"),
+            "quality_check_for_static": defs.get("quality_check_for_static", "on"),
+            "quality_source": defs.get("quality_source", "free"),
+            "exit_ip_show_enabled": defs.get("exit_ip_show_enabled", "on"),
+            "exit_ip_show_for_self": defs.get("exit_ip_show_for_self", "on"),
+            "exit_ip_show_for_static": defs.get("exit_ip_show_for_static", "on"),
+            "scamalytics_url": defs.get("scamalytics_url", "") or "(未配置)",
+            "proxycheck_api_key": defs.get("proxycheck_api_key", "") or "(未配置，走免费匿名 100/天)",
         }
     for k, v in out.items():
         # 显示用，包括 "(继承: …)" 这种带空格/括号的字符串都安全
         print(f"{k}={v}")
+    return 0
+
+
+def cmd_parse_static_blob(args):
+    """解析 blob([annotation:]host:port:user:password) → 标准化条目列表。
+    用于 shell 端预览。每行输出: "<idx> <server>:<port> user=<u> anno=[<a>]"。
+    无效行用 stderr 提示但继续。"""
+    blob = args.blob if args.blob != "-" else sys.stdin.read()
+    parsed = parse_static_proxies_blob(blob)
+    if not parsed:
+        print("(解析后无有效条目)")
+        return 1
+    print(f"共 {len(parsed)} 条")
+    for i, p in enumerate(parsed, 1):
+        user = p.get("username") or "-"
+        anno = p.get("annotation") or ""
+        anno_show = f"  anno=[{anno}]" if anno else ""
+        print(f"  {i}  {p['server']}:{p['port']}  user={user}{anno_show}")
     return 0
 
 
@@ -1776,7 +2281,9 @@ def cmd_static_list(args):
     print(f"共 {len(proxies)} 条静态 IP  [{src}]")
     for i, p in enumerate(proxies, 1):
         user = p.get("username") or "-"
-        print(f"  {i}  {p['server']}:{p['port']}  user={user}  type={p.get('type','socks5')}")
+        anno = p.get("annotation") or ""
+        anno_show = f"  anno=[{anno}]" if anno else ""
+        print(f"  {i}  {p['server']}:{p['port']}  user={user}  type={p.get('type','socks5')}{anno_show}")
     return 0
 
 
@@ -1874,6 +2381,24 @@ def build_parser():
                    help="删除默认静态 IP（索引或 host:port）；可重复")
     d.add_argument("--static-name-prefix", dest="static_name_prefix",
                    help="静态 IP 节点显示前缀")
+    d.add_argument("--scamalytics-url", dest="scamalytics_url",
+                   help="scamalytics 完整 URL（含 key & user），优先于 proxycheck")
+    d.add_argument("--proxycheck-api-key", dest="proxycheck_api_key",
+                   help="proxycheck.io API key（空走免费 100/天，有 key 走 1000/天）")
+    d.add_argument("--quality-check-enabled", dest="quality_check_enabled",
+                   help="IP 检测总开关 on/off")
+    d.add_argument("--quality-check-for-self", dest="quality_check_for_self",
+                   help="自建节点 IP 检测开关 on/off")
+    d.add_argument("--quality-check-for-static", dest="quality_check_for_static",
+                   help="静态 IP 节点检测开关 on/off")
+    d.add_argument("--quality-source", dest="quality_source",
+                   help="数据源：free=proxycheck 免费匿名 / scamalytics=用 scamalytics_url")
+    d.add_argument("--exit-ip-show-enabled", dest="exit_ip_show_enabled",
+                   help="节点名末尾(IP)显示总开关 on/off")
+    d.add_argument("--exit-ip-show-for-self", dest="exit_ip_show_for_self",
+                   help="自建节点(IP)显示开关 on/off")
+    d.add_argument("--exit-ip-show-for-static", dest="exit_ip_show_for_static",
+                   help="静态节点(IP)显示开关 on/off")
 
     rd = sub.add_parser("render")
     g = rd.add_mutually_exclusive_group()
@@ -1921,6 +2446,9 @@ def build_parser():
     sl = sub.add_parser("static-list", help="列出静态 IP 资源（含索引）")
     sl.add_argument("--name", help="订阅名；省略则列默认值")
 
+    psb = sub.add_parser("parse-static-blob", help="解析 [annotation:]host:port:user:password 列表（用于 shell 预览）")
+    psb.add_argument("blob", help='blob 字符串；- = 从 stdin 读')
+
     return p
 
 
@@ -1948,6 +2476,7 @@ HANDLERS = {
     "clear-external-cache": cmd_clear_external_cache,
     "field-values": cmd_field_values,
     "static-list": cmd_static_list,
+    "parse-static-blob": cmd_parse_static_blob,
 }
 
 

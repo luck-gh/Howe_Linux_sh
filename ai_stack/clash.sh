@@ -656,6 +656,14 @@ _static_menu_add() {
     info "已取消"
     return
   fi
+  echo ""
+  echo -e "  ${W}── 即将新增 ──${N}"
+  python3 "$(_clash_py)" --base "$(_clash_dir)" parse-static-blob "$_blob" || {
+    warn "解析后无有效条目,已取消"; return; }
+  echo ""
+  local _yn
+  askyn _yn "确认追加?" "y"
+  $_yn || { info "已取消"; return; }
   local -a _args
   if [[ -z "$STATIC_TARGET" ]]; then
     _args=(defaults --static-proxy-add "$_blob")
@@ -678,7 +686,7 @@ _static_menu_remove() {
     python3 "$(_clash_py)" --base "$(_clash_dir)" static-list --name "$STATIC_TARGET"
   fi
   echo ""
-  echo -e "  ${DIM}多个编号用空格或逗号分隔，例如：1 3 或 1,3${N}"
+  echo -e "  ${DIM}多个编号用空格或逗号分隔，例如：1 3 / 1,3 / 1-5 (区间)${N}"
   echo -e "  ${DIM}[0 / 回车] 取消    [q] 退出菜单${N}"
   local _in
   ask _in "要删除的编号"
@@ -688,12 +696,18 @@ _static_menu_remove() {
   if [[ -z "$_in" || "$_in" == "0" || "$_in" =~ ^[yYnN]$ ]]; then
     info "已取消"; return
   fi
-  # 校验全是数字
-  local _tok
+  # 展开 token: 单数字保留,a-b 展开为 a a+1 ... b
+  local _tok _expanded=""
   for _tok in $(echo "$_in" | tr ',;' ' '); do
     [[ -z "$_tok" ]] && continue
-    if ! [[ "$_tok" =~ ^[1-9][0-9]*$ ]]; then
-      warn "无效编号: $_tok（必须是 1 起算的整数）"
+    if [[ "$_tok" =~ ^([1-9][0-9]*)-([1-9][0-9]*)$ ]]; then
+      local _a=${BASH_REMATCH[1]} _b=${BASH_REMATCH[2]} _i
+      if (( _a > _b )); then warn "无效区间: $_tok（起>终）"; return; fi
+      for (( _i=_a; _i<=_b; _i++ )); do _expanded+="$_i "; done
+    elif [[ "$_tok" =~ ^[1-9][0-9]*$ ]]; then
+      _expanded+="$_tok "
+    else
+      warn "无效编号: $_tok（必须是整数或 1-5 区间）"
       return
     fi
   done
@@ -703,12 +717,106 @@ _static_menu_remove() {
   else
     _args=(edit "$STATIC_TARGET")
   fi
-  for _tok in $(echo "$_in" | tr ',;' ' '); do
-    [[ -z "$_tok" ]] && continue
+  for _tok in $_expanded; do
     _args+=(--static-proxy-remove "$_tok")
   done
+  # 预览:列出将被删除的条目(根据展开后的编号筛 static-list 行)
+  echo ""
+  echo -e "  ${W}── 即将删除 ──${N}"
+  local _list
+  if [[ -z "$STATIC_TARGET" ]]; then
+    _list=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list 2>&1)
+  else
+    _list=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list --name "$STATIC_TARGET" 2>&1)
+  fi
+  echo "$_list" | awk -v IDS="$_expanded" 'BEGIN{n=split(IDS,a," "); for(i=1;i<=n;i++) keep[a[i]]=1}
+    /^  [0-9]+ / { if(keep[$1]) print "  -> "$0 }'
+  echo ""
+  local _yn
+  askyn _yn "确认删除以上 $(echo $_expanded | wc -w) 条?" "y"
+  $_yn || { info "已取消"; return; }
   if python3 "$(_clash_py)" --base "$(_clash_dir)" "${_args[@]}"; then
     log "已删除静态 IP"
+    _static_apply_changes "$STATIC_TARGET"
+  fi
+}
+
+# 修改：批量累积 → 最后统一预览 → 确认后一次 CLI 下发
+_static_menu_modify() {
+  _static_pick_target || return
+  echo ""
+  local _list
+  if [[ -z "$STATIC_TARGET" ]]; then
+    _list=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list)
+  else
+    _list=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list --name "$STATIC_TARGET")
+  fi
+  echo "$_list"
+  echo ""
+  declare -A _changes=()
+  while true; do
+    local _idx
+    echo -e "  ${DIM}已暂存 ${#_changes[@]} 项变更    [0 / 回车] 完成    [c] 清空暂存    [q] 退出菜单${N}"
+    ask _idx "要修改的编号"
+    if [[ "$_idx" =~ ^[qQ]$ ]]; then
+      _STATIC_QUIT=1; return
+    fi
+    if [[ "$_idx" =~ ^[cC]$ ]]; then
+      _changes=(); info "已清空暂存"; continue
+    fi
+    if [[ -z "$_idx" || "$_idx" == "0" || "$_idx" =~ ^[yYnN]$ ]]; then
+      break
+    fi
+    if ! [[ "$_idx" =~ ^[1-9][0-9]*$ ]]; then
+      warn "无效编号"; continue
+    fi
+    echo -e "  ${DIM}格式 [annotation:]host:port:user:password    [0] 取消该项${N}"
+    local _line
+    ask _line "新内容"
+    if [[ -z "$_line" || "$_line" == "0" ]]; then
+      info "已取消该项"; continue
+    fi
+    # 验证可解析
+    local _parsed
+    _parsed=$(python3 "$(_clash_py)" --base "$(_clash_dir)" parse-static-blob "$_line" 2>&1)
+    if [[ "$_parsed" != 共\ 1\ 条* ]]; then
+      warn "解析失败,跳过该项"; echo "$_parsed"; continue
+    fi
+    _changes[$_idx]="$_line"
+    info "已暂存 [${_idx}] → ${_line}"
+  done
+
+  if [[ ${#_changes[@]} -eq 0 ]]; then
+    info "无变更,已取消"; return
+  fi
+
+  # 统一 diff 预览
+  echo ""
+  echo -e "  ${W}── 改动预览 (${#_changes[@]} 项) ──${N}"
+  local _idx _line
+  for _idx in $(echo "${!_changes[@]}" | tr ' ' '\n' | sort -n); do
+    _line="${_changes[$_idx]}"
+    echo -e "  ${W}[${_idx}]${N}"
+    echo -e "    ${DIM}原:${N} $(echo "$_list" | awk -v ID="$_idx" '$1==ID')"
+    echo -e "    ${G}新:${N}    $(python3 "$(_clash_py)" --base "$(_clash_dir)" parse-static-blob "$_line" | tail -1)"
+  done
+  echo ""
+  local _yn
+  askyn _yn "确认提交以上 ${#_changes[@]} 项变更?" "y"
+  $_yn || { info "已取消"; return; }
+
+  # 一次 CLI: 所有 remove + 所有 add (Python 端 cmd_edit 先处理 rems 再 adds,且降序删避免漂移)
+  local -a _args
+  if [[ -z "$STATIC_TARGET" ]]; then
+    _args=(defaults)
+  else
+    _args=(edit "$STATIC_TARGET")
+  fi
+  for _idx in "${!_changes[@]}"; do
+    _args+=(--static-proxy-remove "$_idx" --static-proxy-add "${_changes[$_idx]}")
+  done
+  if python3 "$(_clash_py)" --base "$(_clash_dir)" "${_args[@]}"; then
+    log "已修改 ${#_changes[@]} 条静态 IP"
     _static_apply_changes "$STATIC_TARGET"
   fi
 }
@@ -732,6 +840,14 @@ _static_menu_replace() {
     info "已取消"
     return
   fi
+  echo ""
+  echo -e "  ${W}── 整体替换为以下资源池 ──${N}"
+  python3 "$(_clash_py)" --base "$(_clash_dir)" parse-static-blob "$_blob" || {
+    warn "解析后无有效条目,已取消"; return; }
+  echo ""
+  local _yn
+  askyn _yn "确认整体替换? (现有资源池将被覆盖)" "n"
+  $_yn || { info "已取消"; return; }
   local -a _args
   if [[ -z "$STATIC_TARGET" ]]; then
     _args=(defaults --static-proxies "$_blob")
@@ -1016,10 +1132,11 @@ _clash_menu_static() {
     echo ""
     echo -e "    ${W}[1]${N} 编辑策略 / 服务包 / 关键词（默认 或 某订阅）"
     echo -e "    ${W}[2]${N} 列出资源（生效池）"
-    echo -e "    ${W}[3]${N} 添加资源（单条 / 多条粘贴 host:port:user:password）"
-    echo -e "    ${W}[4]${N} 删除资源（按编号选）"
-    echo -e "    ${W}[5]${N} 整体替换"
-    echo -e "    ${W}[6]${N} 清空（订阅级 = 回继承）"
+    echo -e "    ${W}[3]${N} 添加资源（[annotation:]host:port:user:password；预览后确认）"
+    echo -e "    ${W}[4]${N} 修改资源（按编号选；输入完整新行；预览后确认）"
+    echo -e "    ${W}[5]${N} 删除资源（按编号选；预览后确认）"
+    echo -e "    ${W}[6]${N} 整体替换（覆盖；预览后确认）"
+    echo -e "    ${W}[7]${N} 清空（订阅级 = 回继承）"
     echo ""
     echo -e "    ${DIM}[0 / 回车] 返回    [q] 退出菜单${N}"
     echo ""
@@ -1029,9 +1146,10 @@ _clash_menu_static() {
       1) _static_menu_strategy ;;
       2) _static_menu_list ;;
       3) _static_menu_add ;;
-      4) _static_menu_remove ;;
-      5) _static_menu_replace ;;
-      6) _static_menu_clear ;;
+      4) _static_menu_modify ;;
+      5) _static_menu_remove ;;
+      6) _static_menu_replace ;;
+      7) _static_menu_clear ;;
       0|y|Y|n|N|"") break ;;
       q|Q) _STATIC_QUIT=1 ;;
       *) warn "无效选项" ;;
@@ -1039,6 +1157,236 @@ _clash_menu_static() {
     (( _STATIC_QUIT == 1 )) && { _STATIC_QUIT=0; break; }
     echo ""
     read -erp "  按回车继续..." _
+  done
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# IP 检测（节点名后缀 (宅/机-质量分)）
+# ═══════════════════════════════════════════════════════════════════
+
+_quality_get() {
+  python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting "$1" 2>/dev/null
+}
+
+_quality_set() {
+  python3 "$(_clash_py)" --base "$(_clash_dir)" defaults "$@" >/dev/null
+}
+
+_quality_toggle() {
+  local _key=$1 _label=$2
+  local _cur; _cur=$(_quality_get "$_key")
+  local _new; [[ "$_cur" == "on" ]] && _new="off" || _new="on"
+  _quality_set "--${_key//_/-}" "$_new"
+  info "${_label} 已切换为 ${_new}"
+}
+
+_quality_set_source() {
+  echo ""
+  echo -e "  ${W}选择 IP 质量检测数据源${N}"
+  echo -e "  ${DIM}──────────────────────────────────${N}"
+  echo -e "    [1] free          ${DIM}— proxycheck API,匿名 100/天 或带 key 1000/天${N}"
+  echo -e "    [2] scamalytics   ${DIM}— 免费 5000/月,需自助申请 key,区分度高${N}"
+  echo -e "    [3] lookup_scrape ${DIM}— 爬 proxycheck 网页,无 API 限额,与网页显示一致(33/53/96 之类)${N}"
+  echo -e "    ${DIM}[0] 取消${N}"
+  echo ""
+  local _in
+  read -erp "  选择：" _in
+  case "$_in" in
+    1) _quality_set --quality-source free; info "已切换为 free（proxycheck API）" ;;
+    2)
+      _quality_set --quality-source scamalytics
+      info "已切换为 scamalytics"
+      echo -e "  ${DIM}如未注册，请前往 https://scamalytics.com/pricing 注册免费 plan${N}"
+      echo -e "  ${DIM}拿到完整 URL 后录入 scamalytics URL${N}"
+      ;;
+    3) _quality_set --quality-source lookup_scrape; info "已切换为 lookup_scrape（爬网页,与 https://proxycheck.io/lookup/IP 显示一致）" ;;
+    0|"") info "未变更" ;;
+    *) warn "无效选项" ;;
+  esac
+}
+
+_quality_set_scamalytics_url() {
+  local _cur; _cur=$(_quality_get scamalytics_url)
+  echo ""
+  echo -e "  ${W}录入 scamalytics 完整查询 URL${N}"
+  echo -e "  ${DIM}格式示例：https://api12.scamalytics.com/v3/?key=XXX&user=YYY${N}"
+  echo -e "  ${DIM}注册地址：https://scamalytics.com/pricing （免费 plan 5K/月）${N}"
+  if [[ -n "$_cur" ]]; then
+    echo -e "  ${DIM}当前：${_cur}${N}"
+    echo -e "  ${DIM}（直接回车保持不变；输入 - 清空）${N}"
+  fi
+  local _in
+  read -erp "  URL：" _in
+  if [[ -z "$_in" ]]; then info "未变更"; return; fi
+  if [[ "$_in" == "-" ]]; then
+    _quality_set --scamalytics-url ""
+    info "已清空"
+    return
+  fi
+  _quality_set --scamalytics-url "$_in"
+  info "已保存"
+}
+
+_quality_set_proxycheck_key() {
+  local _cur; _cur=$(_quality_get proxycheck_api_key)
+  echo ""
+  echo -e "  ${W}录入 proxycheck.io API key（可选，免费注册升级到 1000/天）${N}"
+  echo -e "  ${DIM}注册地址：https://proxycheck.io/dashboard${N}"
+  if [[ -n "$_cur" ]]; then
+    echo -e "  ${DIM}当前：${_cur}${N}"
+    echo -e "  ${DIM}（直接回车保持不变；输入 - 清空）${N}"
+  fi
+  local _in
+  read -erp "  key：" _in
+  if [[ -z "$_in" ]]; then info "未变更"; return; fi
+  if [[ "$_in" == "-" ]]; then
+    _quality_set --proxycheck-api-key ""
+    info "已清空（回到免费匿名 100/天）"
+    return
+  fi
+  _quality_set --proxycheck-api-key "$_in"
+  info "已保存"
+}
+
+_quality_clear_cache() {
+  local _f="$(_clash_dir)/.ip_quality_cache.yaml"
+  if [[ -f "$_f" ]]; then
+    rm -f "$_f"
+    info "已清空 IP 质量缓存：${_f}"
+    echo -e "  ${DIM}下次渲染会重新查询所有 IP（注意配额）${N}"
+  else
+    info "无缓存文件"
+  fi
+}
+
+# IP 检测主菜单(风格 D 立即生效字段表):
+# 9 个字段(布尔/枚举/文本)选号即生效,无暂存
+_QUALITY_QUIT=0
+
+# 二级菜单:风险评分开关
+_clash_menu_quality_check() {
+  while true; do
+    print_header "Clash 订阅管理 / IP 检测 / 风险评分开关"
+    local _en _self _sta
+    _en=$(_quality_get quality_check_enabled)
+    _self=$(_quality_get quality_check_for_self)
+    _sta=$(_quality_get quality_check_for_static)
+    local _onoff
+    _onoff() { [[ "$1" == "on" ]] && echo "${G}on${N}" || echo "${DIM}off${N}"; }
+    echo ""
+    printf "    ${W}[1]${N} 评分总开关        : %b\n" "$(_onoff "$_en")"
+    printf "    ${W}[2]${N} 自建评分          : %b\n" "$(_onoff "$_self")"
+    printf "    ${W}[3]${N} 静态评分          : %b\n" "$(_onoff "$_sta")"
+    echo ""
+    echo -e "    ${DIM}[外购] 不评分(协议私有,server 是入口 LB,评分无意义)${N}"
+    echo -e "    ${DIM}[0 / 回车] 返回    [q] 退出菜单${N}"
+    echo ""
+    local _in
+    read -erp "  选择：" _in
+    case "$_in" in
+      1) _quality_toggle quality_check_enabled "评分总开关" ;;
+      2) _quality_toggle quality_check_for_self "自建评分" ;;
+      3) _quality_toggle quality_check_for_static "静态评分" ;;
+      0|"") return 0 ;;
+      q|Q) _QUALITY_QUIT=1; return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+# 二级菜单:出口 IP 显示开关
+_clash_menu_exit_ip_show() {
+  while true; do
+    print_header "Clash 订阅管理 / IP 检测 / 出口 IP 显示开关"
+    local _en _self _sta
+    _en=$(_quality_get exit_ip_show_enabled)
+    _self=$(_quality_get exit_ip_show_for_self)
+    _sta=$(_quality_get exit_ip_show_for_static)
+    local _onoff
+    _onoff() { [[ "$1" == "on" ]] && echo "${G}on${N}" || echo "${DIM}off${N}"; }
+    echo ""
+    printf "    ${W}[1]${N} 出口 IP 总开关     : %b\n" "$(_onoff "$_en")"
+    printf "    ${W}[2]${N} 自建出口 IP 显示    : %b\n" "$(_onoff "$_self")"
+    printf "    ${W}[3]${N} 静态出口 IP 显示    : %b\n" "$(_onoff "$_sta")"
+    echo ""
+    echo -e "    ${DIM}节点名末尾 (IP) 段;关闭则只显示 geo 标签${N}"
+    echo -e "    ${DIM}[0 / 回车] 返回    [q] 退出菜单${N}"
+    echo ""
+    local _in
+    read -erp "  选择：" _in
+    case "$_in" in
+      1) _quality_toggle exit_ip_show_enabled "出口 IP 总开关" ;;
+      2) _quality_toggle exit_ip_show_for_self "自建出口 IP 显示" ;;
+      3) _quality_toggle exit_ip_show_for_static "静态出口 IP 显示" ;;
+      0|"") return 0 ;;
+      q|Q) _QUALITY_QUIT=1; return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+# 二级菜单:数据源配置(源选 / scamalytics URL / proxycheck key)
+_clash_menu_quality_source() {
+  while true; do
+    print_header "Clash 订阅管理 / IP 检测 / 数据源配置"
+    local _src _scama _proxy
+    _src=$(_quality_get quality_source)
+    _scama=$(_quality_get scamalytics_url)
+    _proxy=$(_quality_get proxycheck_api_key)
+    local _src_show
+    case "$_src" in
+      scamalytics)   _src_show="${G}scamalytics${N}（5K/月）" ;;
+      lookup_scrape) _src_show="${G}lookup_scrape${N}（爬网页，与 https://proxycheck.io/lookup 一致）" ;;
+      *)             _src_show="${W}free${N}（proxycheck API）" ;;
+    esac
+    local _scama_show _proxy_show
+    [[ -n "$_scama" ]] && _scama_show="${G}(已配置)${N}" || _scama_show="${DIM}(未配置)${N}"
+    [[ -n "$_proxy" ]] && _proxy_show="${G}(已配置)${N}" || _proxy_show="${DIM}(未配置，匿名 100/天)${N}"
+    echo ""
+    printf "    ${W}[1]${N} 数据源              : %b\n" "$_src_show"
+    printf "    ${W}[2]${N} scamalytics URL    : %b\n" "$_scama_show"
+    printf "    ${W}[3]${N} proxycheck API key : %b\n" "$_proxy_show"
+    echo ""
+    echo -e "    ${DIM}[0 / 回车] 返回    [q] 退出菜单${N}"
+    echo ""
+    local _in
+    read -erp "  选择：" _in
+    case "$_in" in
+      1) _quality_set_source ;;
+      2) _quality_set_scamalytics_url ;;
+      3) _quality_set_proxycheck_key ;;
+      0|"") return 0 ;;
+      q|Q) _QUALITY_QUIT=1; return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
+}
+
+# 顶层 IP 检测菜单(风格 A 动作型;三个分类入口 + 缓存清理)
+_clash_menu_quality() {
+  _QUALITY_QUIT=0
+  while true; do
+    print_header "Clash 订阅管理 / IP 检测"
+    echo ""
+    echo -e "    ${W}[1]${N} 风险评分开关 (总 / 自建 / 静态)"
+    echo -e "    ${W}[2]${N} 出口 IP 显示开关 (总 / 自建 / 静态)"
+    echo -e "    ${W}[3]${N} 数据源配置 (源选 / scamalytics URL / proxycheck key)"
+    echo -e "    ${W}[c]${N} 清空 IP 质量缓存"
+    echo ""
+    echo -e "    ${DIM}[0 / 回车] 返回    [q] 退出菜单${N}"
+    echo ""
+    local _in
+    read -erp "  选择：" _in
+    case "$_in" in
+      1) _clash_menu_quality_check ;;
+      2) _clash_menu_exit_ip_show ;;
+      3) _clash_menu_quality_source ;;
+      c|C) _quality_clear_cache ;;
+      0|"") break ;;
+      q|Q) _QUALITY_QUIT=1 ;;
+      *) warn "无效选项" ;;
+    esac
+    (( _QUALITY_QUIT == 1 )) && { _QUALITY_QUIT=0; break; }
   done
 }
 
@@ -1061,6 +1409,7 @@ refresh_clash_subscription() {
     echo -e "    ${W}[5]${N} 修改默认值"
     echo -e "    ${W}[6]${N} 同步配置（重渲染 yaml + 同步 Caddyfile / sing-box / nft，仅在变化时重启）"
     echo -e "    ${W}[7]${N} 静态 IP 资源管理（默认池 / 订阅池，host:port:user:password）"
+    echo -e "    ${W}[8]${N} IP 检测（[自建]/[外购]/[静态] 节点名后缀质量分）"
     echo ""
     echo -e "    ${DIM}[0] 返回${N}"
     echo ""
@@ -1074,6 +1423,7 @@ refresh_clash_subscription() {
       5) _clash_menu_defaults ;;
       6) _clash_menu_refresh ;;
       7) _clash_menu_static ;;
+      8) _clash_menu_quality ;;
       0|"") break ;;
       *) warn "无效选项" ;;
     esac
