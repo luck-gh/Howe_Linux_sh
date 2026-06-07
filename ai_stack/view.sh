@@ -9,10 +9,34 @@ show_secrets() {
   print_header "密钥信息"
 
   echo -e "  ${W}服务密钥${N}"
-  [[ "${INST_NEWAPI:-false}"  == "true" ]] && echo "    New-API Token  : ${NEWAPI_TOKEN:-未设置}"
-  [[ "${INST_LITELLM:-false}" == "true" ]] && echo "    LiteLLM Key    : ${LITELLM_KEY:-未设置}"
-  [[ "${INST_DIFY:-false}"    == "true" ]] && echo "    Dify Secret    : ${DIFY_SECRET:-未设置}"
-  echo ""
+  if [[ "${INST_NEWAPI:-false}" == "true" ]]; then
+    echo "    New-API Token  : ${NEWAPI_TOKEN:-未设置}"
+    echo -e "    ${DIM}修改：编辑 ${BASE_DIR}/.env → NEWAPI_TOKEN=新值，然后 docker restart new-api${N}"
+    echo ""
+  fi
+  if [[ "${INST_LITELLM:-false}" == "true" ]]; then
+    echo "    LiteLLM Key    : ${LITELLM_KEY:-未设置}"
+    echo -e "    ${DIM}修改：编辑 ${BASE_DIR}/.env → LITELLM_KEY=新值，然后 docker restart litellm${N}"
+    echo ""
+  fi
+  if [[ "${INST_DIFY:-false}" == "true" ]]; then
+    echo "    Dify Secret    : ${DIFY_SECRET:-未设置}"
+    echo -e "    ${DIM}修改：编辑 ${BASE_DIR}/.env → DIFY_SECRET=新值，然后 docker compose up -d dify${N}"
+    echo ""
+  fi
+  if [[ "${INST_KIRO:-false}" == "true" ]]; then
+    local _kiro_cfg="${BASE_DIR}/kiro-rs/config/config.json"
+    local _kiro_key _kiro_admin
+    _kiro_key=$(python3 -c "import json; d=json.load(open('$_kiro_cfg')); print(d.get('apiKey','未设置'))" 2>/dev/null || echo "读取失败")
+    _kiro_admin=$(python3 -c "import json; d=json.load(open('$_kiro_cfg')); print(d.get('adminApiKey','未设置'))" 2>/dev/null || echo "读取失败")
+    echo -e "  ${W}kiro-rs${N}"
+    echo "    API Key        : ${_kiro_key}"
+    echo "    Admin Key      : ${_kiro_admin}"
+    echo "    内网地址       : http://kiro-rs:8990  （渠道类型：Anthropic）"
+    echo -e "    ${DIM}修改 API/Admin Key：编辑 ${_kiro_cfg}，然后 docker restart kiro-rs${N}"
+    echo -e "    ${DIM}修改 Token（Kiro账号）：编辑 ${BASE_DIR}/kiro-rs/config/credentials.json → refreshToken，然后 docker restart kiro-rs${N}"
+    echo ""
+  fi
 
   if [[ "${INST_SINGBOX:-false}" == "true" ]]; then
     echo -e "  ${W}sing-box AnyTLS${N}"
@@ -131,11 +155,27 @@ show_config() {
     local _ip="${VPS_IP:-未知}"
     if [[ -n "$_domain" ]]; then
       echo -e "  ${W}访问地址${N}"
-      [[ "${INST_NEWAPI:-false}"  == "true" ]] && printf "    %-10s → ${C}https://${PREFIX_NEWAPI}.${_domain}${N}  ${DIM}(${_ip}:13000)${N}\n" "New-API"
-      [[ "${INST_WEBUI:-false}"   == "true" ]] && printf "    %-10s → ${C}https://${PREFIX_WEBUI}.${_domain}${N}   ${DIM}(${_ip}:13010)${N}\n" "OpenWebUI"
-      [[ "${INST_LITELLM:-false}" == "true" ]] && printf "    %-10s → ${C}https://${PREFIX_LITELLM}.${_domain}${N}     ${DIM}(${_ip}:14000)${N}\n" "LiteLLM"
-      [[ "${INST_SUB2API:-false}" == "true" ]] && printf "    %-10s → ${C}https://${PREFIX_SUB2API}.${_domain}${N}    ${DIM}(${_ip}:13001)${N}\n" "Sub2API"
-      [[ "${INST_DIFY:-false}"    == "true" ]] && printf "    %-10s → ${C}https://${PREFIX_DIFY}.${_domain}${N}   ${DIM}(${_ip}:13080)${N}\n" "Dify"
+      _show_url_entry() {
+        local _name="$1" _prefix="$2" _port="$3" _inst="$4" _exposed="$5"
+        if [[ "$_inst" == "true" ]]; then
+          if [[ "$_exposed" == "true" ]]; then
+            printf "    %-10s → ${C}https://${_prefix}.${_domain}${N}  ${DIM}(${_ip}:${_port})${N}\n" "$_name"
+          else
+            printf "    %-10s → ${DIM}https://${_prefix}.${_domain}  [已关闭]${N}\n" "$_name"
+          fi
+        fi
+      }
+      # 判断 kiro-rs 是否在 Caddyfile 中暴露
+      local _kiro_cf="${BASE_DIR}/caddy/Caddyfile"
+      local _kiro_exposed=false
+      grep -q "^${PREFIX_KIRO:-kiro}\.${_domain}" "$_kiro_cf" 2>/dev/null && _kiro_exposed=true
+      _show_url_entry "New-API"   "${PREFIX_NEWAPI}"   "13000" "${INST_NEWAPI:-false}"  "true"
+      _show_url_entry "OpenWebUI" "${PREFIX_WEBUI}"    "13010" "${INST_WEBUI:-false}"   "true"
+      _show_url_entry "LiteLLM"   "${PREFIX_LITELLM}"  "14000" "${INST_LITELLM:-false}" "true"
+      _show_url_entry "Sub2API"   "${PREFIX_SUB2API}"  "13001" "${INST_SUB2API:-false}" "true"
+      _show_url_entry "Dify"      "${PREFIX_DIFY}"     "13080" "${INST_DIFY:-false}"    "true"
+      _show_url_entry "kiro-rs"   "${PREFIX_KIRO:-kiro}" "13002" "${INST_KIRO:-false}"  "$_kiro_exposed"
+      unset -f _show_url_entry
     elif [[ -n "${VPS_IP:-}" ]]; then
       echo -e "  ${W}访问地址（HTTP 直连）${N}"
       [[ "${INST_NEWAPI:-false}"  == "true" ]] && echo "    New-API   → http://${_ip}:13000"
@@ -143,7 +183,20 @@ show_config() {
       [[ "${INST_LITELLM:-false}" == "true" ]] && echo "    LiteLLM   → http://${_ip}:14000"
       [[ "${INST_SUB2API:-false}" == "true" ]] && echo "    Sub2API   → http://${_ip}:13001"
       [[ "${INST_DIFY:-false}"    == "true" ]] && echo "    Dify      → http://${_ip}:13080"
+      [[ "${INST_KIRO:-false}"    == "true" ]] && echo "    kiro-rs   → http://${_ip}:13002"
     fi
+    echo ""
+
+    # 内网地址（Docker ai-stack 网络）
+    echo -e "  ${W}内网地址${N}  ${DIM}（Docker ai-stack 网络内直连）${N}"
+    [[ "${INST_NEWAPI:-false}"  == "true" ]] && echo "    new-api   → http://new-api:3000"
+    [[ "${INST_WEBUI:-false}"   == "true" ]] && echo "    openwebui → http://openwebui:3000"
+    [[ "${INST_LITELLM:-false}" == "true" ]] && echo "    litellm   → http://litellm:4000"
+    [[ "${INST_SUB2API:-false}" == "true" ]] && echo "    sub2api   → http://sub2api:8080"
+    [[ "${INST_DIFY:-false}"    == "true" ]] && echo "    dify      → http://dify-nginx:80"
+    [[ "${INST_KIRO:-false}"    == "true" ]] && echo "    kiro-rs   → http://kiro-rs:8990"
+    [[ "${INST_PGSQL:-false}"   == "true" ]] && echo "    ai-db     → ai-db:5432"
+    [[ "${INST_REDIS:-false}"   == "true" ]] && echo "    ai-redis  → ai-redis:6379"
     echo ""
 
     # 部署信息
@@ -157,8 +210,8 @@ show_config() {
     # 菜单项（动态构建）
     local -a _menu_labels=()
     local -a _menu_actions=()
-    _menu_labels+=("重新配置域名")
-    _menu_actions+=("reconfig")
+    _menu_labels+=("域名配置")
+    _menu_actions+=("domain_cfg")
     _menu_labels+=("查看密钥信息")
     _menu_actions+=("secrets")
     if [[ "${INST_NEWAPI:-false}" == "true" ]]; then
@@ -188,8 +241,8 @@ show_config() {
 
     if [[ "$_input" =~ ^[0-9]+$ ]] && [[ $_input -ge 1 ]] && [[ $_input -le $_m_cnt ]]; then
       case "${_menu_actions[$((_input-1))]}" in
-        reconfig)
-          reconfigure_domain ;;
+        domain_cfg)
+          domain_config_menu ;;
         secrets)
           show_secrets
           echo ""
@@ -1473,5 +1526,148 @@ _rollback_caddy() {
     warn "服务未起来"
     systemctl status caddy --no-pager 2>&1 | tail -20 | sed 's/^/    /'
   fi
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# 域名配置：重新配置域名 / 开启-关闭服务的域名暴露
+# ═══════════════════════════════════════════════════════════════════
+
+# _svc_is_exposed <subdomain>  →  0=是 1=否
+_svc_is_exposed() {
+  grep -q "^${1}\.${DOMAIN}" "${BASE_DIR}/caddy/Caddyfile" 2>/dev/null
+}
+
+# _svc_set_expose <subdomain> <port> <true|false>
+_svc_set_expose() {
+  local _host="$1" _port="$2" _expose="$3"
+  local _cf="${BASE_DIR}/caddy/Caddyfile"
+  local _tls="tls ${EMAIL:-}"
+  [[ -z "${EMAIL:-}" ]] && _tls="# tls（未填邮箱）"
+
+  if [[ "$_expose" == "true" ]]; then
+    _svc_is_exposed "$_host" && { info "${_host}.${DOMAIN} 已处于开启状态"; return 0; }
+    cat >> "$_cf" <<EOF
+
+${_host}.${DOMAIN} {
+  ${_tls}
+  reverse_proxy 127.0.0.1:${_port}
+}
+EOF
+  else
+    _svc_is_exposed "$_host" || { info "${_host}.${DOMAIN} 已处于关闭状态"; return 0; }
+    python3 - "$_cf" "${_host}.${DOMAIN}" <<'PYEOF'
+import sys, re
+path, host = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    content = f.read()
+content = re.sub(r'\n?' + re.escape(host) + r' \{[^}]*\}', '', content)
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+  fi
+
+  caddy fmt --overwrite "$_cf" 2>/dev/null || true
+  caddy reload --config "$_cf" 2>&1 && log "Caddy 已重载" || warn "Caddy reload 失败"
+}
+
+# 切换指定服务域名暴露：显示所有已安装服务列表，用户输入编号切换
+_toggle_expose_menu() {
+  # 定义：显示名|变量前缀|端口|INST变量
+  local -a _SVC_DEFS=(
+    "New-API|${PREFIX_NEWAPI:-aapi}|13000|${INST_NEWAPI:-false}"
+    "Sub2API|${PREFIX_SUB2API:-s2a}|13001|${INST_SUB2API:-false}"
+    "OpenWebUI|${PREFIX_WEBUI:-chat}|13010|${INST_WEBUI:-false}"
+    "LiteLLM|${PREFIX_LITELLM:-lb}|14000|${INST_LITELLM:-false}"
+    "Dify|${PREFIX_DIFY:-dify}|13080|${INST_DIFY:-false}"
+    "kiro-rs|${PREFIX_KIRO:-kiro}|13002|${INST_KIRO:-false}"
+  )
+
+  # 过滤出已安装的
+  local -a _installed=()
+  for _def in "${_SVC_DEFS[@]}"; do
+    IFS='|' read -r _n _h _p _inst <<< "$_def"
+    [[ "$_inst" == "true" ]] && _installed+=("$_def")
+  done
+
+  if [[ ${#_installed[@]} -eq 0 ]]; then
+    warn "无已安装服务"; return 0
+  fi
+
+  local _cf="${BASE_DIR}/caddy/Caddyfile"
+  echo ""
+  echo -e "  选择要切换的服务（当前状态）："
+  echo ""
+  for (( i=0; i<${#_installed[@]}; i++ )); do
+    IFS='|' read -r _n _h _p _inst <<< "${_installed[$i]}"
+    if _svc_is_exposed "$_h"; then
+      printf "    ${W}[%d]${N} %-10s  ${G}开启${N} → 点击关闭\n" "$((i+1))" "$_n"
+    else
+      printf "    ${W}[%d]${N} %-10s  ${DIM}关闭${N} → 点击开启\n" "$((i+1))" "$_n"
+    fi
+  done
+  echo ""
+  echo -e "    ${DIM}[0] 返回${N}"
+  echo ""
+
+  local _input
+  read -erp "  选择：" _input
+  [[ -z "$_input" || "$_input" == "0" ]] && return 0
+  if [[ "$_input" =~ ^[0-9]+$ ]] && (( _input >= 1 && _input <= ${#_installed[@]} )); then
+    IFS='|' read -r _n _h _p _inst <<< "${_installed[$((_input-1))]}"
+    if _svc_is_exposed "$_h"; then
+      _svc_set_expose "$_h" "$_p" false
+    else
+      _svc_set_expose "$_h" "$_p" true
+    fi
+  fi
+}
+
+domain_config_menu() {
+  while true; do
+    [[ -f "$BASE_DIR/.env" ]] && source "$BASE_DIR/.env" 2>/dev/null
+    detect_installed_services
+
+    print_header "域名配置"
+
+    echo -e "  ${W}域名暴露状态${N}  （域名：${C}${DOMAIN:-未配置}${N}）"
+    echo ""
+    if [[ -n "${DOMAIN:-}" ]]; then
+      local _cf="${BASE_DIR}/caddy/Caddyfile"
+      for _def in \
+        "New-API|${PREFIX_NEWAPI:-aapi}|${INST_NEWAPI:-false}" \
+        "Sub2API|${PREFIX_SUB2API:-s2a}|${INST_SUB2API:-false}" \
+        "OpenWebUI|${PREFIX_WEBUI:-chat}|${INST_WEBUI:-false}" \
+        "LiteLLM|${PREFIX_LITELLM:-lb}|${INST_LITELLM:-false}" \
+        "Dify|${PREFIX_DIFY:-dify}|${INST_DIFY:-false}" \
+        "kiro-rs|${PREFIX_KIRO:-kiro}|${INST_KIRO:-false}"
+      do
+        IFS='|' read -r _n _h _inst <<< "$_def"
+        [[ "$_inst" != "true" ]] && continue
+        if _svc_is_exposed "$_h"; then
+          printf "    %-10s  ${G}开启${N}  https://${_h}.${DOMAIN}\n" "$_n"
+        else
+          printf "    %-10s  ${DIM}关闭${N}  https://${_h}.${DOMAIN}\n" "$_n"
+        fi
+      done
+    else
+      echo -e "    ${DIM}未配置域名${N}"
+    fi
+    echo ""
+
+    echo -e "    ${W}[1]${N} 重新配置域名（更换域名 / 重新生成 Caddyfile）"
+    [[ -n "${DOMAIN:-}" ]] && echo -e "    ${W}[2]${N} 切换指定服务的域名暴露"
+    echo ""
+    echo -e "    ${DIM}[0] 返回${N}"
+    echo ""
+
+    local _input
+    read -erp "  选择：" _input
+    [[ -z "$_input" ]] && continue
+    case "$_input" in
+      0) break ;;
+      1) reconfigure_domain ;;
+      2) [[ -n "${DOMAIN:-}" ]] && { _toggle_expose_menu; echo ""; read -erp "  按回车继续..." _; } ;;
+    esac
+  done
 }
 

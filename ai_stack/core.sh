@@ -161,6 +161,7 @@ PREFIX_LITELLM="lb"          # LiteLLM       → lb.域名
 PREFIX_SUB2API="s2a"         # Sub2API       → s2a.域名
 PREFIX_DIFY="dify"           # Dify          → dify.域名
 PREFIX_VPS="vps"             # Clash 订阅    → vps.域名（仅当装了 sing-box）
+PREFIX_KIRO="kiro"           # kiro-rs       → kiro.域名
 
 # ═══════════════════════════════════════════════════════════════════
 # 全局变量默认值（set -u 安全）
@@ -178,6 +179,7 @@ INST_SINGBOX=true
 INST_CADDY=false
 INST_PGSQL=false
 INST_REDIS=false
+INST_KIRO=false
 
 LOC_WEBUI="vps"
 LOC_LITELLM="vps"

@@ -111,6 +111,14 @@ ${PREFIX_DIFY}.${DOMAIN} {
 }
 EOF
     fi
+    if [[ "${INST_KIRO:-false}" == "true" ]]; then cat >> "$_cf" <<EOF
+
+${PREFIX_KIRO:-kiro}.${DOMAIN} {
+  ${_tls}
+  reverse_proxy 127.0.0.1:13002
+}
+EOF
+    fi
     if $INST_SINGBOX; then
       local _blocks=""
       if [[ -x "$(_clash_py)" ]]; then

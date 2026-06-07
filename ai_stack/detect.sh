@@ -215,6 +215,7 @@ SVC_REGISTRY_STACK=(
   "DIFY|Dify|docker|dify-nginx"
   "SINGBOX|sing-box|systemd|sing-box"
   "CADDY|Caddy|systemd|caddy"
+  "KIRO|kiro-rs|docker|kiro-rs"
 )
 
 # 服务描述（升级菜单 / 选服务页面共用）
@@ -278,6 +279,7 @@ detect_installed_services() {
   $SVC_CADDY_INSTALLED   && INST_CADDY=true
   $SVC_PGSQL_INSTALLED   && INST_PGSQL=true
   $SVC_REDIS_INSTALLED   && INST_REDIS=true
+  $SVC_KIRO_INSTALLED    && INST_KIRO=true
   return 0
 }
 
