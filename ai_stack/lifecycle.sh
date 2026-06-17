@@ -47,8 +47,11 @@ print_summary() {
     $INST_LITELLM && echo -e "    LiteLLM   → ${C}https://${PREFIX_LITELLM}.${DOMAIN}${N}    ${DIM}[${LOC_LITELLM}]${N}"
     $INST_SUB2API && echo -e "    Sub2API   → ${C}https://${PREFIX_SUB2API}.${DOMAIN}${N}   ${DIM}[${LOC_SUB2API}]${N}"
     $INST_DIFY    && echo -e "    Dify      → ${C}https://${PREFIX_DIFY}.${DOMAIN}${N}  ${DIM}[${LOC_DIFY}]${N}"
+    [[ "${INST_KIRO:-false}"    == "true" ]] && echo -e "    kiro-rs   → ${C}https://${PREFIX_KIRO:-kiro}.${DOMAIN}${N}"
+    [[ "${INST_9ROUTER:-false}" == "true" ]] && echo -e "    9router   → ${C}https://${PREFIX_9ROUTER:-9r}.${DOMAIN}${N}"
     echo ""
     warn "HTTPS 证书由 Caddy 自动申请，首次访问如见证书错误，等 1-2 分钟后刷新"
+    warn "使用 Cloudflare 橙色云朵时：CF Edge 证书传播需 5-15 分钟，域名建议用 *.域名 一级子域而非二级"
   elif has_web_service; then
     if $INST_CADDY; then
       # HTTP 模式：Caddy 在 :8080 做反代
@@ -177,6 +180,8 @@ confirm_installation() {
     printf "    ${G}✓${N}  %-12s  %s%s\n" "Dify" "工作流平台 → :13080" "$_loc"
   }
   $INST_CADDY && printf "    ${G}✓${N}  %-12s  %s\n" "Caddy" "HTTPS 反代 → :443"
+  [[ "${INST_KIRO:-false}" == "true" ]] && printf "    ${G}✓${N}  %-12s  %s\n" "kiro-rs" "Kiro 代理 → :13002"
+  [[ "${INST_9ROUTER:-false}" == "true" ]] && printf "    ${G}✓${N}  %-12s  %s\n" "9router" "AI 网关 → :13003"
   [[ "$DEPLOY_MODE" == "distributed" ]] && printf "    ${G}✓${N}  %-12s  %s\n" "frps" "穿透服务端 → :${FRP_PORT}"
   echo ""
 
@@ -265,6 +270,8 @@ uninstall_stack() {
   (docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^ai-redis$") && _U+=("ai-redis|Redis")
   $SVC_DIFY_INSTALLED    && _U+=("dify-nginx|Dify")
   $SVC_SINGBOX_INSTALLED && _U+=("sing-box|sing-box")
+  $SVC_KIRO_INSTALLED    && _U+=("kiro-rs|kiro-rs")
+  $SVC_NROUTER_INSTALLED && _U+=("9router|9router")
   command -v caddy &>/dev/null && _U+=("caddy|Caddy")
 
   if [[ ${#_U[@]} -eq 0 ]]; then
@@ -335,7 +342,7 @@ uninstall_stack() {
     IFS='|' read -r _key _name <<< "${_U[$i]}"
 
     case "$_key" in
-      new-api|openwebui|litellm|sub2api|ai-db|ai-redis)
+      new-api|openwebui|litellm|sub2api|ai-db|ai-redis|kiro-rs|9router)
         dc_cmd rm "$_key" >/dev/null 2>&1 || true
         rm -rf "$BASE_DIR/$_key" 2>/dev/null
         log "$_name 容器已卸载"

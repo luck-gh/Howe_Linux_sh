@@ -16,6 +16,8 @@ select_services() {
     "INST_WEBUI|OpenWebUI|512|2|中等，约 1-2GB|自托管 AI 对话界面（类 ChatGPT），依赖 New-API|"
     "INST_DIFY|Dify|4096|10|很大，镜像约 5GB+|LLM 工作流 / Agent / RAG 平台|"
     "INST_CADDY|Caddy|32|0.1|极小|HTTPS 反向代理 + 自动 Let's Encrypt 证书|"
+    "INST_KIRO|kiro-rs|30|0.1|极小，Rust 二进制|Kiro IDE 订阅 → Anthropic API 兼容代理（单账号）|"
+    "INST_9ROUTER|9router|150|1|轻量，约 150MB|多 AI provider 聚合网关 + failover（含 Kiro 支持）|"
     "INST_PGSQL|PostgreSQL|128|2|极小，约 200MB|数据库（Sub2API / New-API 自动依赖）|dep"
     "INST_REDIS|Redis|32|0.5|极小，约 50MB|缓存（Sub2API 自动依赖）|dep"
   )
@@ -30,7 +32,8 @@ select_services() {
     [INST_LITELLM]=${INST_LITELLM:-false} [INST_SUB2API]=${INST_SUB2API:-false}
     [INST_DIFY]=${INST_DIFY:-false}       [INST_SINGBOX]=${INST_SINGBOX:-false}
     [INST_CADDY]=${INST_CADDY:-false}     [INST_PGSQL]=${INST_PGSQL:-false}
-    [INST_REDIS]=${INST_REDIS:-false}
+    [INST_REDIS]=${INST_REDIS:-false}     [INST_KIRO]=${INST_KIRO:-false}
+    [INST_9ROUTER]=${INST_9ROUTER:-false}
   )
 
   local _msg=""
@@ -170,7 +173,7 @@ select_services() {
       # 切换服务时自动联动
       if [[ "${SEL[$_var]}" == "true" ]]; then
         case "$_var" in
-          INST_NEWAPI|INST_WEBUI|INST_LITELLM|INST_SUB2API|INST_DIFY)
+          INST_NEWAPI|INST_WEBUI|INST_LITELLM|INST_SUB2API|INST_DIFY|INST_KIRO|INST_9ROUTER)
             SEL[INST_CADDY]=true ;;
         esac
       fi
@@ -207,7 +210,8 @@ select_services() {
   INST_NEWAPI=${SEL[INST_NEWAPI]}  INST_WEBUI=${SEL[INST_WEBUI]}
   INST_LITELLM=${SEL[INST_LITELLM]}  INST_SUB2API=${SEL[INST_SUB2API]}
   INST_DIFY=${SEL[INST_DIFY]}  INST_SINGBOX=${SEL[INST_SINGBOX]}
-  INST_CADDY=${SEL[INST_CADDY]}
+  INST_CADDY=${SEL[INST_CADDY]}  INST_KIRO=${SEL[INST_KIRO]}
+  INST_9ROUTER=${SEL[INST_9ROUTER]}
   INST_PGSQL=${SEL[INST_PGSQL]}  INST_REDIS=${SEL[INST_REDIS]}
   log "服务选择完成"
   sleep 1
@@ -373,6 +377,8 @@ collect_config() {
     $INST_LITELLM && echo -e "    ${PREFIX_LITELLM}.你的域名    → LiteLLM"
     $INST_SUB2API && echo -e "    ${PREFIX_SUB2API}.你的域名   → Sub2API"
     $INST_DIFY    && echo -e "    ${PREFIX_DIFY}.你的域名  → Dify"
+    [[ "${INST_KIRO:-false}"    == "true" ]] && echo -e "    ${PREFIX_KIRO:-kiro}.你的域名  → kiro-rs"
+    [[ "${INST_9ROUTER:-false}" == "true" ]] && echo -e "    ${PREFIX_9ROUTER:-9r}.你的域名     → 9router"
     echo ""
     ask DOMAIN "主域名（如 example.com），留空则 IP+HTTP 测试模式" ""
     if [[ -n "$DOMAIN" ]]; then
@@ -439,6 +445,8 @@ check_dns() {
   $INST_LITELLM && _subs+=("${PREFIX_LITELLM}")
   $INST_SUB2API && _subs+=("${PREFIX_SUB2API}")
   $INST_DIFY    && _subs+=("${PREFIX_DIFY}")
+  [[ "${INST_KIRO:-false}"    == "true" ]] && _subs+=("${PREFIX_KIRO:-kiro}")
+  [[ "${INST_9ROUTER:-false}" == "true" ]] && _subs+=("${PREFIX_9ROUTER:-9r}")
   [[ ${#_subs[@]} -eq 0 ]] && return 0
 
   for _sub_ in "${_subs[@]}"; do

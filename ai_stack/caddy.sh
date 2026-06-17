@@ -119,6 +119,14 @@ ${PREFIX_KIRO:-kiro}.${DOMAIN} {
 }
 EOF
     fi
+    if [[ "${INST_9ROUTER:-false}" == "true" ]]; then cat >> "$_cf" <<EOF
+
+${PREFIX_9ROUTER:-9r}.${DOMAIN} {
+  ${_tls}
+  reverse_proxy 127.0.0.1:13003
+}
+EOF
+    fi
     if $INST_SINGBOX; then
       local _blocks=""
       if [[ -x "$(_clash_py)" ]]; then
@@ -186,7 +194,8 @@ reconfigure_domain() {
   if [[ -f "$BASE_DIR/.env" ]]; then
     local _flag _val
     for _flag in INST_NEWAPI INST_WEBUI INST_LITELLM INST_SUB2API \
-                 INST_DIFY INST_SINGBOX INST_CADDY INST_PGSQL INST_REDIS; do
+                 INST_DIFY INST_SINGBOX INST_CADDY INST_PGSQL INST_REDIS \
+                 INST_KIRO INST_9ROUTER; do
       _val="${!_flag:-false}"
       if grep -q "^${_flag}=" "$BASE_DIR/.env"; then
         sed -i "s|^${_flag}=.*|${_flag}=${_val}|" "$BASE_DIR/.env"
@@ -231,6 +240,12 @@ reconfigure_domain() {
 
   # DNS 预检
   check_dns
+
+  echo ""
+  warn "如果使用 Cloudflare 橙色云朵（CF 代理）："
+  info "  CF Edge 证书传播需要 5-15 分钟，期间访问可能出现 SSL 错误，属正常现象"
+  info "  CF Universal SSL 仅覆盖 *.guohowe.com，不覆盖二级通配符（如 *.ai.guohowe.com）"
+  info "  建议域名直接用 guohowe.com 下的子域，避免二级子域证书问题"
 }
 
 # ═══════════════════════════════════════════════════════════════════

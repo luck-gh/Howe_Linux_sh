@@ -47,6 +47,10 @@ INST_CADDY=${INST_CADDY}
 INST_PGSQL=${INST_PGSQL}
 # Redis：缓存（Sub2API 自动依赖）
 INST_REDIS=${INST_REDIS}
+# kiro-rs：Kiro IDE 订阅 → Anthropic API 兼容代理
+INST_KIRO=${INST_KIRO:-false}
+# 9router：多 AI provider 聚合网关 + failover
+INST_9ROUTER=${INST_9ROUTER:-false}
 
 # ── 服务密钥 / Token ────────────────────────────────────────────
 # New-API 会话密钥（SESSION_SECRET），保护 Web 登录会话
@@ -355,6 +359,70 @@ SVC
     echo "S2A_PORT=${_s2a_port}" >> "$BASE_DIR/.env"
     echo "S2A_JWT_SECRET=${_s2a_jwt}" >> "$BASE_DIR/.env"
     echo "S2A_TOTP_KEY=${_s2a_totp}" >> "$BASE_DIR/.env"
+  fi
+
+  if [[ "${INST_KIRO:-false}" == "true" ]]; then
+    mkdir -p "$BASE_DIR/kiro-rs/config"
+    local _kiro_api_key="sk-kiro-$(openssl rand -hex 32)"
+    local _kiro_admin_key="sk-admin-$(openssl rand -hex 32)"
+    if [[ ! -f "$BASE_DIR/kiro-rs/config/config.json" ]]; then
+      cat > "$BASE_DIR/kiro-rs/config/config.json" <<KIROCFG
+{
+  "host": "0.0.0.0",
+  "port": 8990,
+  "region": "us-east-1",
+  "kiroVersion": "0.11.107",
+  "machineId": null,
+  "apiKey": "${_kiro_api_key}",
+  "systemVersion": "win32#10.0.22631",
+  "nodeVersion": "22.22.0",
+  "tlsBackend": "rustls",
+  "loadBalancingMode": "priority"
+}
+KIROCFG
+      echo "KIRO_API_KEY=${_kiro_api_key}" >> "$BASE_DIR/.env"
+      echo "KIRO_ADMIN_KEY=${_kiro_admin_key}" >> "$BASE_DIR/.env"
+    fi
+    cat >> "$BASE_DIR/docker-compose.yml" <<SVC
+
+  kiro-rs:
+    image: ghcr.io/hank9999/kiro-rs:v2026.3.1
+    container_name: kiro-rs
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:13002:8990"
+    volumes:
+      - ./kiro-rs/config:/app/config
+    networks: [ai-stack]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8990/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+SVC
+  fi
+
+  if [[ "${INST_9ROUTER:-false}" == "true" ]]; then
+    mkdir -p "$BASE_DIR/9router/data"
+    cat >> "$BASE_DIR/docker-compose.yml" <<'SVC'
+
+  9router:
+    image: decolua/9router:latest
+    container_name: 9router
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:13003:20128"
+    volumes:
+      - ./9router/data:/app/data
+    networks: [ai-stack]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:20128/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+SVC
   fi
 
   cat >> "$BASE_DIR/docker-compose.yml" <<'FOOTER'

@@ -234,10 +234,11 @@ def _read_cached_external(yaml_path):
         return None
 
 
-def fetch_external_yaml(url, base, ttl_seconds, force=False):
+def fetch_external_yaml(url, base, ttl_seconds, force=False, prefer_cache=False):
     """拉取外购 Clash yaml，失败兜底用旧缓存。返回 dict 或 None。
 
     缓存命中（force=False 且未过期）→ 直接读缓存
+    prefer_cache=True 且本地有缓存 → 直接读缓存（不论 TTL，无网络请求）
     否则发请求（带 ETag / If-Modified-Since）：
       200  → 写新缓存 + meta
       304  → 只更新 fetched_at
@@ -252,6 +253,12 @@ def fetch_external_yaml(url, base, ttl_seconds, force=False):
     meta = load_yaml(meta_path) if os.path.exists(meta_path) else {}
     now = int(time.time())
     fetched_at = int(meta.get("fetched_at") or 0)
+
+    # prefer_cache: 自动刷新关闭 → 有本地缓存就直接用,不发 HTTP 请求
+    if prefer_cache and not force and os.path.exists(yaml_path):
+        data = _read_cached_external(yaml_path)
+        _external_fetch_memo[url] = data
+        return data
 
     if (not force) and fetched_at and (now - fetched_at < max(60, int(ttl_seconds))):
         data = _read_cached_external(yaml_path)
@@ -514,12 +521,12 @@ def _ensure_static_passwords(sub, defs=None):
     return changed
 
 
-def load_external_proxies(base, sub, defs, ttl_seconds):
+def load_external_proxies(base, sub, defs, ttl_seconds, prefer_cache=False):
     """拉外购 yaml，提取 proxies 列表，加前缀 + 命名去重。"""
     url = resolve_external_url(sub, defs)
     if not url:
         return []
-    data = fetch_external_yaml(url, base, ttl_seconds)
+    data = fetch_external_yaml(url, base, ttl_seconds, prefer_cache=prefer_cache)
     if not isinstance(data, dict):
         return []
     raw = data.get("proxies")
@@ -653,11 +660,54 @@ EXIT_IP_PROBE_TIMEOUT = 8
 _exit_ip_memo: dict = {}   # key: ("self",) / ("static", server, port, user) → ip 或 ""
 
 
-def _probe_self_exit_ip():
-    """VPS 本机直发 ipify,拿自建出口 IP。"""
+def _evict_quality_cache(base, old_ip):
+    """从质量缓存中删除旧出口 IP 的记录，避免废弃 IP 占用配额。"""
+    if not old_ip:
+        return
+    cache = _load_quality_cache(base)
+    if old_ip in cache:
+        del cache[old_ip]
+        _save_quality_cache(base, cache)
+        sys.stderr.write(f"[exit-ip] 出口 IP 变更，已删除旧质量缓存: {old_ip}\n")
+
+
+def _check_exit_ip_change(track_key, new_ip, base):
+    """对比持久化的上次出口 IP；若变更则清除旧 IP 质量缓存并更新记录。"""
+    if not new_ip or not base:
+        return
+    track_path = os.path.join(base, EXIT_IP_TRACK_FILE)
+    track = load_yaml(track_path) if os.path.exists(track_path) else {}
+    old_ip = track.get(track_key, "")
+    if old_ip and old_ip != new_ip:
+        _evict_quality_cache(base, old_ip)
+    if old_ip != new_ip:
+        track[track_key] = new_ip
+        dump_yaml(track_path, track)
+
+
+def _read_cached_exit_ip(base, node_key):
+    """从 .ip_quality_cache.yaml 读取 node_key 已缓存的 exit_ip;无则返回 ''."""
+    if not base or not node_key:
+        return ""
+    cache = _load_quality_cache(base)
+    entry = cache.get(node_key)
+    if isinstance(entry, dict):
+        return entry.get("exit_ip", "") or ""
+    return ""
+
+
+def _probe_self_exit_ip(base=None, prefer_cache=False):
+    """VPS 本机直发 ipify,拿自建出口 IP，返回 (ip, node_key)。
+    prefer_cache=True 时先读缓存里上次探测结果,未命中再 curl(避免每次 render 都跑一次)。"""
+    node_key = "self"
     key = ("self",)
     if key in _exit_ip_memo:
-        return _exit_ip_memo[key]
+        return _exit_ip_memo[key], node_key
+    if prefer_cache:
+        cached = _read_cached_exit_ip(base, node_key)
+        if cached:
+            _exit_ip_memo[key] = cached
+            return cached, node_key
     try:
         out = subprocess.check_output(
             ["curl", "-s", "--max-time", str(EXIT_IP_PROBE_TIMEOUT), EXIT_IP_PROBE_URL],
@@ -667,14 +717,21 @@ def _probe_self_exit_ip():
     except Exception:
         ip = ""
     _exit_ip_memo[key] = ip
-    return ip
+    return ip, node_key
 
 
-def _probe_static_exit_ip(server, port, username, password):
-    """通过 socks5 节点跑 ipify,拿真实落地 IP。"""
+def _probe_static_exit_ip(server, port, username, password, base=None, prefer_cache=False):
+    """通过 socks5 节点跑 ipify,拿真实落地 IP，返回 (ip, node_key)。
+    prefer_cache=True 时先读缓存里上次探测结果,未命中再 curl(避免每次 render 都跑一次)。"""
+    node_key = f"static:{server}:{port}:{username or ''}"
     key = ("static", server, int(port), username or "")
     if key in _exit_ip_memo:
-        return _exit_ip_memo[key]
+        return _exit_ip_memo[key], node_key
+    if prefer_cache:
+        cached = _read_cached_exit_ip(base, node_key)
+        if cached:
+            _exit_ip_memo[key] = cached
+            return cached, node_key
     try:
         cmd = ["curl", "-s", "--max-time", str(EXIT_IP_PROBE_TIMEOUT),
                "--socks5-hostname", f"{server}:{port}"]
@@ -687,7 +744,7 @@ def _probe_static_exit_ip(server, port, username, password):
         sys.stderr.write(f"[exit-ip] {server}:{port} 探测失败:{e}\n")
         ip = ""
     _exit_ip_memo[key] = ip
-    return ip
+    return ip, node_key
 
 
 # ─── 外购信息节点识别(机场订阅常见的"剩余流量/到期"等无效占位)─────
@@ -705,10 +762,51 @@ def _is_external_info_node(name):
 
 # ─── IP 质量打分(proxycheck.io)→ 节点名后缀 ──────────────────
 IP_QUALITY_CACHE_FILE = ".ip_quality_cache.yaml"
+EXIT_IP_TRACK_FILE   = ".exit_ip_track.yaml"   # 持久化上次出口 IP，用于变更检测
 IP_QUALITY_FETCH_TIMEOUT = 8
 IP_QUALITY_CACHE_TTL = 24 * 3600       # 24 小时
-IP_QUALITY_NEG_TTL = 3600              # 失败负缓存 1 小时
+IP_QUALITY_NEG_TTL = 6 * 3600          # 失败负缓存 6 小时（避免限流时频繁重试耗配额）
 _ip_quality_memo: dict = {}
+_scrape_quota_exhausted = False  # 配额耗尽后本进程内跳过网页爬取
+# render 路径"是否强制重新探测/评分"开关:
+# - False(默认): 由 render_one 按 stats_refresh_minutes 判断 prefer_cache
+# - True (cmd_render 收到 --refresh-quality 时设置): 全部走实时探测/拉取
+_REFRESH_QUALITY_FLAG = False
+# .ip_quality_cache.yaml 解析后的进程级内存副本(69KB YAML 反复 load 是热点)
+# 第一次访问读盘,后续直接命中;同进程内写入后通过 _save_quality_cache 同步落盘
+_quality_cache_memo: dict | None = None
+_quality_cache_path_memo: str = ""
+
+
+def _quality_cache_path(base):
+    return os.path.join(base, IP_QUALITY_CACHE_FILE)
+
+
+def _load_quality_cache(base):
+    """读取并缓存 .ip_quality_cache.yaml 解析结果(进程级)。"""
+    global _quality_cache_memo, _quality_cache_path_memo
+    cp = _quality_cache_path(base)
+    if _quality_cache_memo is not None and _quality_cache_path_memo == cp:
+        return _quality_cache_memo
+    if not os.path.exists(cp):
+        _quality_cache_memo = {}
+        _quality_cache_path_memo = cp
+        return _quality_cache_memo
+    try:
+        _quality_cache_memo = load_yaml(cp) or {}
+    except Exception:
+        _quality_cache_memo = {}
+    _quality_cache_path_memo = cp
+    return _quality_cache_memo
+
+
+def _save_quality_cache(base, cache):
+    """落盘并更新内存副本。"""
+    global _quality_cache_memo, _quality_cache_path_memo
+    cp = _quality_cache_path(base)
+    dump_yaml(cp, cache)
+    _quality_cache_memo = cache
+    _quality_cache_path_memo = cp
 
 
 # proxycheck 把 ISP 大网商常误归为 Business (例: Spectrum / Comcast / 中国移动)；
@@ -728,9 +826,9 @@ _RESIDENTIAL_ISP_KEYWORDS = (
     # 中国大陆
     "china telecom", "china unicom", "china mobile", "cnc",
     "中国电信", "中国联通", "中国移动",
-    # 通用关键词（兜底）
+    # 通用关键词（兜底）—— 不放 "communications"/"telecom" 避免机房 ISP 误判
     "broadband", "cable", "fiber", "fibre", "dsl", "fttx", "ftth",
-    "communications", "telecom", "wireless", "mobile",
+    "wireless", "mobile",
 )
 
 
@@ -739,18 +837,21 @@ def _looks_like_residential(provider, organisation):
     return any(k in blob for k in _RESIDENTIAL_ISP_KEYWORDS)
 
 
-def _sort_by_risk(nodes, base, defs, kind_label):
+def _sort_by_risk(nodes, base, defs, kind_label, prefer_cache=False):
     """组内按风险升序排序：风险小(干净)排前，风险大排后，失败(score="")排末尾。
     若该 kind 检测开关关，保持原顺序。返回新 list。
     "self" 类用 VPS 本机出口 IP 作为排序依据(节点 server 可能是 LB 域名)。"""
     if not nodes or not _is_quality_enabled(defs, kind_label):
         return list(nodes)
-    self_exit_ip = _probe_self_exit_ip() if kind_label == "self" else ""
+    self_exit_ip, _self_nk = _probe_self_exit_ip(base=base, prefer_cache=prefer_cache) if kind_label == "self" else ("", "self")
     def _key(n):
-        target = self_exit_ip if kind_label == "self" else n.get("server", "")
+        if kind_label == "self":
+            target, nk = self_exit_ip, _self_nk
+        else:
+            target, nk = n.get("server", ""), None
         if not target:
             return (1, 0, 0)
-        _, score = lookup_ip_quality(target, base, defs)
+        _, score = lookup_ip_quality(target, base, defs, node_key=nk, prefer_cache=prefer_cache)
         if score == "" or score is None:
             return (1, 0, 0)
         return (0, int(score), 0)
@@ -791,15 +892,20 @@ def _quality_via_lookup_scrape(ip, timeout):
     import re as _re
     url = f"https://proxycheck.io/lookup/{ip}"
     req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-        "Accept": "text/html",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         html = resp.read().decode("utf-8", errors="replace")
+    # 优先匹配长描述句里的 "risk score of N%"
     m = _re.search(r'risk score of (\d+)%', html)
     if not m:
+        # 备选：data-copy="N%" （独立百分比字段）
         m = _re.search(r'data-copy="(\d+)%"', html)
     if not m:
+        if "queries exhausted" in html:
+            raise RuntimeError("proxycheck_quota_exhausted")
         raise ValueError("lookup 页未找到 risk score")
     score = max(0, min(100, int(m.group(1))))
     # type 字段:页面里有 data-copy="Hosting." / "Residential." / "Business." 等
@@ -851,38 +957,50 @@ def _quality_via_proxycheck(ip, api_key, timeout):
     return kind, score, info.get("type", "")
 
 
-def lookup_ip_quality(host, base, defs=None):
+def lookup_ip_quality(host, base, defs=None, node_key=None, prefer_cache=False):
     """查询 host 的类型 + 风险分，返回 (kind, score)。
-    host 可以是 IP 或域名（域名会先 DNS 解析，缓存按 IP 键）。
-    数据源优先级: scamalytics_url 配了用 scamalytics → 否则 proxycheck。
-    kind: "宅"=Residential / "机"=Hosting/Business/其它 / "" = 失败
-    score: 0-100 的整数，风险分（0=干净最好，100=高危最差），"" = 失败
-    缓存 24h, 失败负缓存 1h, 进程内 memo。
+    node_key: 节点唯一标识（"self" / "static:server:port:user"），用于出口 IP 变更检测。
+    缓存以 node_key 为主键（无 node_key 时退化为 IP 键，向后兼容）。
+    出口 IP 变更 → 复位评分；评分未过期 → 跳过查询。
+    prefer_cache=True 时只要缓存里有非空评分就直接复用,忽略 24h TTL;
+    缓存未命中(新静态 IP) 仍 fetch 一次写入缓存。
     """
     import socket as _socket
-    if host in _ip_quality_memo:
-        return _ip_quality_memo[host]
+    memo_key = node_key or host
+    if memo_key in _ip_quality_memo:
+        return _ip_quality_memo[memo_key]
 
     try:
         ip = _socket.gethostbyname(host)
     except Exception as e:
         sys.stderr.write(f"[quality] {host} DNS 解析失败：{e}\n")
         result = ("", "")
-        _ip_quality_memo[host] = result
+        _ip_quality_memo[memo_key] = result
         return result
 
-    cache_path = os.path.join(base, IP_QUALITY_CACHE_FILE)
-    cache = load_yaml(cache_path) if os.path.exists(cache_path) else {}
+    cache_path = _quality_cache_path(base)
+    cache = _load_quality_cache(base)
     now = int(time.time())
+    cache_key = node_key or ip
 
-    entry = cache.get(ip)
+    entry = cache.get(cache_key)
     if isinstance(entry, dict):
-        fetched_at = int(entry.get("fetched_at", 0))
-        ttl = IP_QUALITY_NEG_TTL if entry.get("error") else IP_QUALITY_CACHE_TTL
-        if now - fetched_at < ttl:
-            result = (entry.get("kind", ""), entry.get("score", ""))
-            _ip_quality_memo[host] = result
-            return result
+        # 出口 IP 变更时复位评分
+        if node_key and entry.get("exit_ip") and entry["exit_ip"] != ip:
+            sys.stderr.write(f"[quality] {node_key} 出口 IP 变更 {entry['exit_ip']} → {ip}，复位评分\n")
+            entry = None
+        else:
+            fetched_at = int(entry.get("fetched_at", 0))
+            ttl = IP_QUALITY_NEG_TTL if entry.get("error") else IP_QUALITY_CACHE_TTL
+            # prefer_cache: 自动刷新关闭 → 有非空评分就用,不看 TTL
+            if prefer_cache and not entry.get("error") and entry.get("kind") != "":
+                result = (entry.get("kind", ""), entry.get("score", ""))
+                _ip_quality_memo[memo_key] = result
+                return result
+            if now - fetched_at < ttl:
+                result = (entry.get("kind", ""), entry.get("score", ""))
+                _ip_quality_memo[memo_key] = result
+                return result
 
     scama = ((defs or {}).get("scamalytics_url") or "").strip()
     proxy_key = ((defs or {}).get("proxycheck_api_key") or "").strip()
@@ -895,28 +1013,46 @@ def lookup_ip_quality(host, base, defs=None):
             kind, score, type_raw = _quality_via_scamalytics(ip, scama, IP_QUALITY_FETCH_TIMEOUT)
             source = "scamalytics"
         elif use_scrape:
-            kind, score, type_raw = _quality_via_lookup_scrape(ip, IP_QUALITY_FETCH_TIMEOUT)
-            source = "lookup_scrape"
+            global _scrape_quota_exhausted
+            if _scrape_quota_exhausted:
+                kind, score, type_raw = _quality_via_proxycheck(ip, proxy_key, IP_QUALITY_FETCH_TIMEOUT)
+                source = "proxycheck_fallback"
+            else:
+                try:
+                    kind, score, type_raw = _quality_via_lookup_scrape(ip, IP_QUALITY_FETCH_TIMEOUT)
+                    source = "lookup_scrape"
+                except RuntimeError as _quota_err:
+                    if "quota_exhausted" in str(_quota_err):
+                        _scrape_quota_exhausted = True
+                        sys.stderr.write("[quality] proxycheck 网页配额已耗尽，本次渲染回退 API\n")
+                        kind, score, type_raw = _quality_via_proxycheck(ip, proxy_key, IP_QUALITY_FETCH_TIMEOUT)
+                        source = "proxycheck_fallback"
+                    else:
+                        raise
+                except Exception as _scrape_err:
+                    sys.stderr.write(f"[quality] {ip} lookup_scrape 失败({_scrape_err})，回退 proxycheck\n")
+                    kind, score, type_raw = _quality_via_proxycheck(ip, proxy_key, IP_QUALITY_FETCH_TIMEOUT)
+                    source = "proxycheck_fallback"
         else:
             kind, score, type_raw = _quality_via_proxycheck(ip, proxy_key, IP_QUALITY_FETCH_TIMEOUT)
             source = "proxycheck"
-        entry = {"kind": kind, "score": score, "type_raw": type_raw,
-                 "source": source, "fetched_at": now}
-        cache[ip] = entry
-        dump_yaml(cache_path, cache)
+        new_entry = {"exit_ip": ip, "kind": kind, "score": score,
+                     "type_raw": type_raw, "source": source, "fetched_at": now}
+        cache[cache_key] = new_entry
+        _save_quality_cache(base, cache)
         result = (kind, score)
-        _ip_quality_memo[host] = result
+        _ip_quality_memo[memo_key] = result
         return result
     except Exception as e:
         sys.stderr.write(f"[quality] {host} ({ip}) {source or 'lookup'} 失败：{e}\n")
-        cache[ip] = {"kind": "", "score": "", "source": source,
-                     "fetched_at": now, "error": True}
+        cache[cache_key] = {"exit_ip": ip, "kind": "", "score": "", "source": source,
+                            "fetched_at": now, "error": True}
         try:
-            dump_yaml(cache_path, cache)
+            _save_quality_cache(base, cache)
         except Exception:
             pass
         result = ("", "")
-        _ip_quality_memo[host] = result
+        _ip_quality_memo[memo_key] = result
         return result
 
 
@@ -953,7 +1089,7 @@ def _is_quality_enabled(defs, kind_label):
     return str(defs.get(per_key, "on")).strip().lower() == "on"
 
 
-def format_quality_suffix(server, base, defs=None, kind_label=None):
+def format_quality_suffix(server, base, defs=None, kind_label=None, node_key=None, prefer_cache=False):
     """节点名后缀，格式：(宅-85) / (机-12) / (?-?)（查询失败）。
     kind_label 指定该节点类别 self/external/static 用于检查分项开关；
     传 None 则只看总开关；server 为空或开关关闭返回空串。"""
@@ -964,13 +1100,13 @@ def format_quality_suffix(server, base, defs=None, kind_label=None):
     if kind_label is None and defs is not None and \
             str(defs.get("quality_check_enabled", "off")).strip().lower() != "on":
         return ""
-    kind, score = lookup_ip_quality(server, base, defs)
+    kind, score = lookup_ip_quality(server, base, defs, node_key=node_key, prefer_cache=prefer_cache)
     if kind == "" or score == "":
         return "(?-?)"
     return f"({kind}-{score})"
 
 
-def auto_node_name(node, base, defs=None):
+def auto_node_name(node, base, defs=None, prefer_cache=False):
     """节点 name 为空时，根据 server 地址自动生成显示名。
     格式：[自建](机-23) 🇺🇸 United States · Los Angeles (199.193.124.234)
     server 字段可能是域名(LB)，所以 geo / quality 都基于 VPS 真实出口 IP。
@@ -981,12 +1117,12 @@ def auto_node_name(node, base, defs=None):
         return name
     raw_server = node.get("server", "")
     # 自建出口 = VPS 本机出口（无论 server 写的是 IP 还是域名）
-    exit_ip = _probe_self_exit_ip() if (_is_quality_enabled(defs, "self") or _is_exit_ip_show_enabled(defs, "self")) else ""
+    exit_ip, _self_nk = _probe_self_exit_ip(base=base, prefer_cache=prefer_cache) if (_is_quality_enabled(defs, "self") or _is_exit_ip_show_enabled(defs, "self")) else ("", "self")
     target = exit_ip or raw_server
     show_ip = _is_exit_ip_show_enabled(defs, "self")
     display = (exit_ip or raw_server) if show_ip else ""
     label = format_geo_label(target, base, display=display)
-    quality = format_quality_suffix(target, base, defs, kind_label="self")
+    quality = format_quality_suffix(target, base, defs, kind_label="self", node_key=_self_nk, prefer_cache=prefer_cache)
     if not label:
         return f"[自建]{quality}" if quality else "[自建]"
     return f"[自建]{quality} {label}" if quality else f"[自建] {label}"
@@ -1594,6 +1730,13 @@ def render_one(base, sub):
         raise SystemExit("template.yaml 缺失或为空")
 
     defs = read_defaults(base)
+    # 自动刷新关 (stats_refresh_minutes==0) 且未传 --refresh-quality:
+    # 出口 IP 探测 / 评分都优先走缓存,新静态 IP(缓存未命中) 仍会即时探测一次
+    try:
+        _auto_off = int(defs.get("stats_refresh_minutes", 10)) == 0
+    except (TypeError, ValueError):
+        _auto_off = False
+    prefer_cache = _auto_off and not _REFRESH_QUALITY_FLAG
     pwd = sub.get("password")
     sub_port = sub.get("port")
     u = sub.get("usage") or _empty_usage()
@@ -1625,13 +1768,13 @@ def render_one(base, sub):
             info.append(make_proxy(f"[自建] 套餐到期:{sub['expire']}", head, pwd, sub_port))
 
     # 套餐到期时不显示自建节点；流量用完时仍显示（nft 负责限流）
-    real = [] if expired else [make_proxy(auto_node_name(n, base, defs), n, pwd, sub_port) for n in nodes]
-    real = _sort_by_risk(real, base, defs, "self")
+    real = [] if expired else [make_proxy(auto_node_name(n, base, defs, prefer_cache=prefer_cache), n, pwd, sub_port) for n in nodes]
+    real = _sort_by_risk(real, base, defs, "self", prefer_cache=prefer_cache)
 
     # 外购订阅节点（不计流量、不受 nft 限流约束）;
     # load_external_proxies 内部已按"信息置顶 + 真节点风险升序"排好
     ttl = int(defs.get("stats_refresh_minutes", 10)) * 60
-    external = load_external_proxies(base, sub, defs, ttl)
+    external = load_external_proxies(base, sub, defs, ttl, prefer_cache=prefer_cache)
 
     # ── 静态 IP 出口节点 ─────────────────────────────────────────────
     # 客户端看到的还是连本机的 anytls 节点（server=VPS_IP, port=订阅端口）；
@@ -1667,12 +1810,14 @@ def render_one(base, sub):
             target = ""
             # 实测出口 IP:质量检测 OR 出口IP显示 任一开就要探测
             if _is_quality_enabled(defs, "static") or _is_exit_ip_show_enabled(defs, "static"):
-                target = _probe_static_exit_ip(entry_server, entry_port, entry_user, entry_pwd)
+                target, _static_nk = _probe_static_exit_ip(entry_server, entry_port, entry_user, entry_pwd, base=base, prefer_cache=prefer_cache)
+            else:
+                target, _static_nk = "", f"static:{entry_server}:{entry_port}:{entry_user}"
             target = target or entry_server
             show_ip = _is_exit_ip_show_enabled(defs, "static")
             display = target if show_ip else ""
             label = format_geo_label(target, base, display=display) or target or ""
-            quality = format_quality_suffix(target, base, defs, kind_label="static")
+            quality = format_quality_suffix(target, base, defs, kind_label="static", node_key=_static_nk, prefer_cache=prefer_cache)
             anno = sp.get("annotation") or ""
             anno_seg = f"[{anno}]" if anno else ""
             display_name = f"[静态]{quality}{anno_seg} {label}" if (quality or anno_seg) else f"[静态] {label}"
@@ -1682,7 +1827,7 @@ def render_one(base, sub):
                 sub_port=sub_port, vps_server=vps_server, sni=sni,
             )
             if _is_quality_enabled(defs, "static") and target:
-                _, sc = lookup_ip_quality(target, base, defs)
+                _, sc = lookup_ip_quality(target, base, defs, node_key=_static_nk, prefer_cache=prefer_cache)
                 node["__sort_risk"] = (1, 0) if sc == "" or sc is None else (0, int(sc))
             else:
                 node["__sort_risk"] = (1, 0)
@@ -1798,6 +1943,8 @@ def render_one(base, sub):
 
 
 def cmd_render(args):
+    global _REFRESH_QUALITY_FLAG
+    _REFRESH_QUALITY_FLAG = bool(getattr(args, "refresh_quality", False))
     subs = read_subs_normalized(args.base)
     if not subs:
         print("(无订阅可渲染)")
@@ -2404,6 +2551,9 @@ def build_parser():
     g = rd.add_mutually_exclusive_group()
     g.add_argument("--name")
     g.add_argument("--all", action="store_true")
+    rd.add_argument("--refresh-quality", dest="refresh_quality", action="store_true",
+                    help="强制重新探测出口 IP 和重新拉取风险评分(忽略缓存);"
+                         "默认: stats_refresh_minutes==0 时优先用缓存")
 
     cb = sub.add_parser("caddy-blocks")
     cb.add_argument("--host", default="")

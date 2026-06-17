@@ -15,10 +15,13 @@ service_stack_menu() {
       echo -e "  ${G}已安装${N}"
       [[ -n "${DOMAIN:-}" ]] && echo -e "  域名：${C}${DOMAIN}${N}"
       local _running=0 _total=0
-      for _cn in new-api openwebui litellm sub2api; do
-        docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${_cn}$" && ((_running++)); ((_total++))
+      for _entry in "${SVC_REGISTRY_STACK[@]}"; do
+        IFS='|' read -r _key _name _type _target <<< "$_entry"
+        local _var="SVC_${_key}_INSTALLED"
+        [[ "${!_var}" != "true" ]] && continue
+        ((_total++))
+        svc_running "$_type" "$_target" && ((_running++))
       done
-      [[ "${INST_SINGBOX:-false}" == "true" ]] && { systemctl is-active sing-box &>/dev/null && ((_running++)); ((_total++)); }
       echo -e "  运行中：${_running}/${_total} 个服务"
     else
       echo -e "  ${DIM}未安装${N}"
@@ -501,10 +504,13 @@ main() {
       echo -e "  ${W}服务栈${N}  ${G}已安装${N}"
       [[ -n "${DOMAIN:-}" ]] && echo -e "  域名：${C}${DOMAIN}${N}"
       local _running=0 _total=0
-      for _cn in new-api openwebui litellm sub2api; do
-        docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${_cn}$" && ((_running++)); ((_total++))
+      for _entry in "${SVC_REGISTRY_STACK[@]}"; do
+        IFS='|' read -r _key _name _type _target <<< "$_entry"
+        local _var="SVC_${_key}_INSTALLED"
+        [[ "${!_var}" != "true" ]] && continue
+        ((_total++))
+        svc_running "$_type" "$_target" && ((_running++))
       done
-      [[ "${INST_SINGBOX:-false}" == "true" ]] && { systemctl is-active sing-box &>/dev/null && ((_running++)); ((_total++)); }
       echo -e "  运行中：${_running}/${_total} 个服务"
     else
       echo -e "  ${W}服务栈${N}  ${DIM}未安装${N}"

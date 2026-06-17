@@ -125,12 +125,24 @@ NODESCFG
 }
 
 # 部署流量统计 systemd unit + timer（每 stats_refresh_minutes 分钟运行）
+# stats_refresh_minutes = 0 → 关闭 timer（仅保留 serve.py 按需刷新）
 setup_clash_stats_timer() {
   $INST_SINGBOX || return 0
   local _interval
   _interval=$(python3 "$(_clash_py)" --base "$(_clash_dir)" \
-                get-setting stats_refresh_minutes 2>/dev/null || echo 1)
-  [[ "$_interval" =~ ^[0-9]+$ ]] || _interval=1
+                get-setting stats_refresh_minutes 2>/dev/null || echo 10)
+  [[ "$_interval" =~ ^[0-9]+$ ]] || _interval=10
+
+  if [[ "$_interval" == "0" ]]; then
+    systemctl disable --now clash-subs-stats.timer 2>/dev/null || true
+    systemctl stop clash-subs-stats.service 2>/dev/null || true
+    rm -f /etc/systemd/system/clash-subs-stats.timer \
+          /etc/systemd/system/clash-subs-stats.service
+    systemctl daemon-reload
+    log "流量统计 timer 已关闭（仅 serve 按需刷新）"
+    return 0
+  fi
+
   cat > /etc/systemd/system/clash-subs-stats.service <<UNIT
 [Unit]
 Description=Clash 订阅流量统计 + 限流执法
@@ -526,7 +538,7 @@ _clash_menu_defaults() {
     "默认流量重置日 1-31"
     "默认到期天数（自今天起）"
     "默认客户端拉取间隔 小时"
-    "默认流量统计刷新分钟数（serve 主管，timer 兜底）"
+    "默认流量统计刷新分钟数（0 = 关闭 timer，仅 serve 按需刷新）"
     "端口段下限（决定订阅可分配的最小端口）"
     "端口段上限（max - min + 1 = 最大订阅数）"
     "默认外购 Clash URL（留空 = 不启用）"
@@ -563,11 +575,80 @@ _clash_menu_defaults() {
   fi
 }
 
-# 子菜单：刷新所有
+# 子菜单：刷新配置（自动刷新开关 + 间隔分钟数）
+# 与 [5] 默认值菜单中的 stats_refresh_minutes 同源；0 = 关闭 timer
+_clash_menu_auto_refresh() {
+  while true; do
+    local _cur _show _timer_st
+    _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" \
+            get-setting stats_refresh_minutes 2>/dev/null || echo 10)
+    [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=10
+    if [[ "$_cur" == "0" ]]; then
+      _show="${DIM}关闭${N}（仅 serve.py 按需刷新）"
+    else
+      _show="${G}启用${N}（每 ${_cur} 分钟）"
+    fi
+    if systemctl is-active clash-subs-stats.timer &>/dev/null; then
+      _timer_st="${G}active${N}"
+    else
+      _timer_st="${DIM}inactive${N}"
+    fi
+
+    print_header "Clash 订阅管理 / 刷新配置"
+    echo ""
+    printf "    自动刷新状态  : %b\n" "$_show"
+    printf "    timer 服务    : %b\n" "$_timer_st"
+    echo ""
+    echo -e "    ${DIM}与 [5] 默认值菜单中『默认流量统计刷新分钟数』同源；${N}"
+    echo -e "    ${DIM}0 = 关闭 timer，仅保留 serve.py 按需刷新（客户端拉订阅时触发）${N}"
+    echo ""
+    echo -e "    ${W}[1]${N} 切换开启 / 关闭"
+    echo -e "    ${W}[2]${N} 设置刷新间隔（分钟）"
+    echo ""
+    echo -e "    ${DIM}[0 / 回车] 返回${N}"
+    echo ""
+    local _in
+    read -erp "  选择：" _in
+    case "$_in" in
+      1)
+        local _new
+        if [[ "$_cur" == "0" ]]; then
+          _new=10
+          info "已开启自动刷新（默认每 10 分钟，可在 [2] 修改）"
+        else
+          _new=0
+          info "已关闭自动刷新（timer 将停用）"
+        fi
+        python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --stats-refresh-minutes "$_new" >/dev/null
+        setup_clash_stats_timer
+        ;;
+      2)
+        local _v
+        ask _v "刷新间隔分钟数（0 = 关闭，当前 ${_cur}）"
+        if [[ -z "$_v" ]]; then
+          info "未变更"
+        elif ! [[ "$_v" =~ ^[0-9]+$ ]]; then
+          warn "需输入非负整数"
+        elif [[ "$_v" == "$_cur" ]]; then
+          info "未变更"
+        else
+          python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --stats-refresh-minutes "$_v" >/dev/null
+          setup_clash_stats_timer
+        fi
+        ;;
+      0|"") return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+    echo ""
+    read -erp "  按回车继续..." _
+  done
+}
+
+# 子菜单：刷新所有（用户主动同步 → 强制重新探测出口 IP / 评分，绕过缓存）
 _clash_menu_refresh() {
   setup_clash_subscription || return 1
   python3 "$(_clash_py)" --base "$(_clash_dir)" clear-external-cache >/dev/null 2>&1 || true
-  render_clash_subscription || return 1
+  python3 "$(_clash_py)" --base "$(_clash_dir)" render --all --refresh-quality || return 1
   write_caddyfile
   reload_clash_subscription
   echo ""
@@ -645,9 +726,11 @@ _static_menu_add() {
   echo -e "  ${DIM}单条：直接粘贴一行；多条：粘贴多行后按 Ctrl-D 结束${N}"
   echo -e "  ${DIM}[0 / 直接 Ctrl-D] 取消    [q 后 Ctrl-D] 退出菜单${N}"
   echo ""
-  echo -e "  ${W}请输入静态 IP（按 Ctrl-D 结束，留空取消）：${N}"
-  local _blob
-  _blob=$(cat) || true
+  echo -e "  ${W}请输入静态 IP（每行一条，Ctrl-D 结束，留空取消）：${N}"
+  local _blob="" _line
+  while IFS= read -er _line || [[ -n "$_line" ]]; do
+    _blob+="${_line}"$'\n'
+  done
   local _trim="${_blob//[[:space:]]/}"
   if [[ "$_trim" =~ ^[qQ]$ ]]; then
     _STATIC_QUIT=1; return
@@ -1407,9 +1490,10 @@ refresh_clash_subscription() {
     echo -e "    ${W}[3]${N} 编辑订阅（流量 / 重置日 / 到期 / 拉取间隔 / 密码 / 端口 / 外购）"
     echo -e "    ${W}[4]${N} 删除订阅"
     echo -e "    ${W}[5]${N} 修改默认值"
-    echo -e "    ${W}[6]${N} 同步配置（重渲染 yaml + 同步 Caddyfile / sing-box / nft，仅在变化时重启）"
-    echo -e "    ${W}[7]${N} 静态 IP 资源管理（默认池 / 订阅池，host:port:user:password）"
-    echo -e "    ${W}[8]${N} IP 检测（[自建]/[外购]/[静态] 节点名后缀质量分）"
+    echo -e "    ${W}[6]${N} 刷新配置（自动刷新开关 / 间隔分钟数；0 = 关闭 timer，仅 serve 按需刷新）"
+    echo -e "    ${W}[7]${N} 同步配置（重渲染 yaml + 同步 Caddyfile / sing-box / nft，仅在变化时重启）"
+    echo -e "    ${W}[8]${N} 静态 IP 资源管理（默认池 / 订阅池，host:port:user:password）"
+    echo -e "    ${W}[9]${N} IP 检测（[自建]/[外购]/[静态] 节点名后缀质量分）"
     echo ""
     echo -e "    ${DIM}[0] 返回${N}"
     echo ""
@@ -1421,9 +1505,10 @@ refresh_clash_subscription() {
       3) _clash_menu_edit ;;
       4) _clash_menu_remove ;;
       5) _clash_menu_defaults ;;
-      6) _clash_menu_refresh ;;
-      7) _clash_menu_static ;;
-      8) _clash_menu_quality ;;
+      6) _clash_menu_auto_refresh ;;
+      7) _clash_menu_refresh ;;
+      8) _clash_menu_static ;;
+      9) _clash_menu_quality ;;
       0|"") break ;;
       *) warn "无效选项" ;;
     esac

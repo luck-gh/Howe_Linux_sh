@@ -37,6 +37,13 @@ show_secrets() {
     echo -e "    ${DIM}修改 Token（Kiro账号）：编辑 ${BASE_DIR}/kiro-rs/config/credentials.json → refreshToken，然后 docker restart kiro-rs${N}"
     echo ""
   fi
+  if [[ "${INST_9ROUTER:-false}" == "true" ]]; then
+    echo -e "  ${W}9router${N}"
+    echo "    内网地址       : http://9router:20128"
+    echo "    外部端口       : 127.0.0.1:13003"
+    echo -e "    ${DIM}Web 管理界面：https://${PREFIX_9ROUTER:-9r}.${DOMAIN:-<域名>}  （添加 provider 在此操作）${N}"
+    echo ""
+  fi
 
   if [[ "${INST_SINGBOX:-false}" == "true" ]]; then
     echo -e "  ${W}sing-box AnyTLS${N}"
@@ -175,6 +182,14 @@ show_config() {
       _show_url_entry "Sub2API"   "${PREFIX_SUB2API}"  "13001" "${INST_SUB2API:-false}" "true"
       _show_url_entry "Dify"      "${PREFIX_DIFY}"     "13080" "${INST_DIFY:-false}"    "true"
       _show_url_entry "kiro-rs"   "${PREFIX_KIRO:-kiro}" "13002" "${INST_KIRO:-false}"  "$_kiro_exposed"
+      local _9r_exposed=false
+      grep -q "^${PREFIX_9ROUTER:-9r}\.${_domain}" "$_kiro_cf" 2>/dev/null && _9r_exposed=true
+      _show_url_entry "9router"   "${PREFIX_9ROUTER:-9r}" "13003" "${INST_9ROUTER:-false}" "$_9r_exposed"
+      if [[ "${INST_SINGBOX:-false}" == "true" ]]; then
+        local _vps_exposed=false
+        grep -q "^${PREFIX_VPS:-vps}\.${_domain}" "$_kiro_cf" 2>/dev/null && _vps_exposed=true
+        _show_url_entry "Clash订阅" "${PREFIX_VPS:-vps}" "13888" "true" "$_vps_exposed"
+      fi
       unset -f _show_url_entry
     elif [[ -n "${VPS_IP:-}" ]]; then
       echo -e "  ${W}访问地址（HTTP 直连）${N}"
@@ -184,6 +199,7 @@ show_config() {
       [[ "${INST_SUB2API:-false}" == "true" ]] && echo "    Sub2API   → http://${_ip}:13001"
       [[ "${INST_DIFY:-false}"    == "true" ]] && echo "    Dify      → http://${_ip}:13080"
       [[ "${INST_KIRO:-false}"    == "true" ]] && echo "    kiro-rs   → http://${_ip}:13002"
+      [[ "${INST_9ROUTER:-false}" == "true" ]] && echo "    9router   → http://${_ip}:13003"
     fi
     echo ""
 
@@ -195,6 +211,7 @@ show_config() {
     [[ "${INST_SUB2API:-false}" == "true" ]] && echo "    sub2api   → http://sub2api:8080"
     [[ "${INST_DIFY:-false}"    == "true" ]] && echo "    dify      → http://dify-nginx:80"
     [[ "${INST_KIRO:-false}"    == "true" ]] && echo "    kiro-rs   → http://kiro-rs:8990"
+    [[ "${INST_9ROUTER:-false}" == "true" ]] && echo "    9router   → http://9router:20128"
     [[ "${INST_PGSQL:-false}"   == "true" ]] && echo "    ai-db     → ai-db:5432"
     [[ "${INST_REDIS:-false}"   == "true" ]] && echo "    ai-redis  → ai-redis:6379"
     echo ""
@@ -1580,6 +1597,7 @@ _toggle_expose_menu() {
     "LiteLLM|${PREFIX_LITELLM:-lb}|14000|${INST_LITELLM:-false}"
     "Dify|${PREFIX_DIFY:-dify}|13080|${INST_DIFY:-false}"
     "kiro-rs|${PREFIX_KIRO:-kiro}|13002|${INST_KIRO:-false}"
+    "9router|${PREFIX_9ROUTER:-9r}|13003|${INST_9ROUTER:-false}"
   )
 
   # 过滤出已安装的
@@ -1622,6 +1640,46 @@ _toggle_expose_menu() {
   fi
 }
 
+_check_domain_status() {
+  echo ""
+  echo -e "  ${W}域名 DNS / HTTPS 检测${N}  ${DIM}（需要几秒，请稍候）${N}"
+  echo ""
+  local _cf="${BASE_DIR}/caddy/Caddyfile"
+  local -a _prefixes=()
+  _svc_is_exposed "${PREFIX_NEWAPI:-aapi}"   && _prefixes+=("${PREFIX_NEWAPI:-aapi}")
+  _svc_is_exposed "${PREFIX_SUB2API:-s2a}"   && _prefixes+=("${PREFIX_SUB2API:-s2a}")
+  _svc_is_exposed "${PREFIX_WEBUI:-chat}"    && _prefixes+=("${PREFIX_WEBUI:-chat}")
+  _svc_is_exposed "${PREFIX_LITELLM:-lb}"    && _prefixes+=("${PREFIX_LITELLM:-lb}")
+  _svc_is_exposed "${PREFIX_DIFY:-dify}"     && _prefixes+=("${PREFIX_DIFY:-dify}")
+  _svc_is_exposed "${PREFIX_KIRO:-kiro}"     && _prefixes+=("${PREFIX_KIRO:-kiro}")
+  _svc_is_exposed "${PREFIX_9ROUTER:-9r}"    && _prefixes+=("${PREFIX_9ROUTER:-9r}")
+  _svc_is_exposed "${PREFIX_VPS:-vps}"       && _prefixes+=("${PREFIX_VPS:-vps}")
+
+  local _cf_ip
+  _cf_ip=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$(dig +short "${_prefixes[0]:-aapi}.${DOMAIN}" A @1.1.1.1 2>/dev/null)" | head -1)
+
+  for _p in "${_prefixes[@]}"; do
+    local _fqdn="${_p}.${DOMAIN}"
+    local _dns _http _dns_st _http_st
+    _dns=$(dig +short "$_fqdn" A @1.1.1.1 2>/dev/null | head -1)
+    if [[ -z "$_dns" ]]; then
+      _dns_st="${R}DNS未解析${N}"
+    else
+      _dns_st="${G}${_dns}${N}"
+    fi
+    _http=$(curl -sI --max-time 6 "https://${_fqdn}/" 2>/dev/null | grep "^HTTP" | awk '{print $2}')
+    if [[ "$_http" =~ ^[23] ]]; then
+      _http_st="${G}HTTPS ${_http}${N}"
+    elif [[ -n "$_http" ]]; then
+      _http_st="${Y}HTTPS ${_http}${N}"
+    else
+      _http_st="${R}HTTPS 超时/失败${N}"
+    fi
+    printf "    %-8s  %-35s  DNS: %b  %b\n" "$_p" "$_fqdn" "$_dns_st" "$_http_st"
+  done
+  echo ""
+}
+
 domain_config_menu() {
   while true; do
     [[ -f "$BASE_DIR/.env" ]] && source "$BASE_DIR/.env" 2>/dev/null
@@ -1639,7 +1697,9 @@ domain_config_menu() {
         "OpenWebUI|${PREFIX_WEBUI:-chat}|${INST_WEBUI:-false}" \
         "LiteLLM|${PREFIX_LITELLM:-lb}|${INST_LITELLM:-false}" \
         "Dify|${PREFIX_DIFY:-dify}|${INST_DIFY:-false}" \
-        "kiro-rs|${PREFIX_KIRO:-kiro}|${INST_KIRO:-false}"
+        "kiro-rs|${PREFIX_KIRO:-kiro}|${INST_KIRO:-false}" \
+        "9router|${PREFIX_9ROUTER:-9r}|${INST_9ROUTER:-false}" \
+        "Clash订阅|${PREFIX_VPS:-vps}|${INST_SINGBOX:-false}"
       do
         IFS='|' read -r _n _h _inst <<< "$_def"
         [[ "$_inst" != "true" ]] && continue
@@ -1656,6 +1716,7 @@ domain_config_menu() {
 
     echo -e "    ${W}[1]${N} 重新配置域名（更换域名 / 重新生成 Caddyfile）"
     [[ -n "${DOMAIN:-}" ]] && echo -e "    ${W}[2]${N} 切换指定服务的域名暴露"
+    [[ -n "${DOMAIN:-}" ]] && echo -e "    ${W}[3]${N} 检测所有域名 DNS 和 HTTPS 状态"
     echo ""
     echo -e "    ${DIM}[0] 返回${N}"
     echo ""
@@ -1667,6 +1728,7 @@ domain_config_menu() {
       0) break ;;
       1) reconfigure_domain ;;
       2) [[ -n "${DOMAIN:-}" ]] && { _toggle_expose_menu; echo ""; read -erp "  按回车继续..." _; } ;;
+      3) [[ -n "${DOMAIN:-}" ]] && { _check_domain_status; read -erp "  按回车继续..." _; } ;;
     esac
   done
 }

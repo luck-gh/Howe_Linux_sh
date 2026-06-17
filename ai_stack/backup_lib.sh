@@ -11,6 +11,7 @@
 #   singbox   /etc/sing-box
 #   caddy     /etc/caddy
 #   ai-cli    ~/.claude ~/.codex ~/.opencode ~/.openclaw
+#   kiro      /opt/ai-stack/kiro-rs/config（config.json + credentials.json）
 #
 # 备份点目录结构：/var/backups/howe/<timestamp>/
 #   <scope>.tar.gz
@@ -20,7 +21,7 @@
 
 BACKUP_ROOT_DEFAULT=/var/backups/howe
 BACKUP_KEEP_DEFAULT=7
-BACKUP_DEFAULT_SCOPES_DEFAULT="ai-pg,ai-data,ai-config,clash,singbox,caddy"
+BACKUP_DEFAULT_SCOPES_DEFAULT="ai-pg,ai-data,ai-config,clash,singbox,caddy,kiro"
 BACKUP_AUTO_BEFORE_UPGRADE_DEFAULT=true
 BACKUP_TIMER_ENABLED_DEFAULT=false
 BACKUP_TIMER_SCHEDULE_DEFAULT=daily
@@ -65,6 +66,8 @@ BACKUP_SCOPES=(
   "singbox|sing-box 配置（/etc/sing-box）|_bk_has_singbox"
   "caddy|Caddy 配置（/etc/caddy）|_bk_has_caddy"
   "ai-cli|AI CLI 配置（claude / codex / opencode / openclaw）|_bk_has_ai_cli"
+  "kiro|kiro-rs 配置（config.json / credentials.json）|_bk_has_kiro"
+  "nrouter|9router 数据目录（/opt/ai-stack/9router/data）|_bk_has_nrouter"
 )
 
 # ── 检测函数（决定 scope 是否对当前主机可用）────────────────────────
@@ -75,6 +78,8 @@ _bk_has_clash()     { [[ -f "$BACKUP_AI_BASE/clash/subs.yaml" ]]; }
 _bk_has_singbox()   { [[ -d /etc/sing-box ]]; }
 _bk_has_caddy()     { [[ -f /etc/caddy/Caddyfile ]] || [[ -d /etc/caddy ]]; }
 _bk_has_ai_cli()    { local d; for d in ~/.claude ~/.codex ~/.opencode ~/.openclaw; do [[ -d "$d" ]] && return 0; done; return 1; }
+_bk_has_kiro()      { [[ -d "$BACKUP_AI_BASE/kiro-rs/config" ]]; }
+_bk_has_nrouter()   { [[ -d "$BACKUP_AI_BASE/9router/data" ]]; }
 
 # ── 工具函数 ─────────────────────────────────────────────────────
 _bk_ts() { date +%Y%m%d-%H%M%S; }
@@ -269,6 +274,30 @@ _bk_rs_clash() {
 _bk_rs_singbox() { tar xzf "$1" -C /etc; }
 _bk_rs_caddy()   { tar xzf "$1" -C /etc; }
 _bk_rs_ai_cli()  { tar xzf "$1" -C "$HOME"; }
+
+_bk_do_kiro() {
+  local out=$1/kiro.tar.gz
+  [[ -d "$BACKUP_AI_BASE/kiro-rs/config" ]] || return 1
+  ( cd "$BACKUP_AI_BASE" && tar czf "$out" kiro-rs/config ) || return 1
+  _bk_seal "$out"
+}
+
+_bk_rs_kiro() {
+  [[ -d "$BACKUP_AI_BASE/kiro-rs" ]] || mkdir -p "$BACKUP_AI_BASE/kiro-rs"
+  tar xzf "$1" -C "$BACKUP_AI_BASE"
+}
+
+_bk_do_nrouter() {
+  local out=$1/nrouter.tar.gz
+  [[ -d "$BACKUP_AI_BASE/9router/data" ]] || return 1
+  ( cd "$BACKUP_AI_BASE" && tar czf "$out" 9router/data ) || return 1
+  _bk_seal "$out"
+}
+
+_bk_rs_nrouter() {
+  [[ -d "$BACKUP_AI_BASE/9router" ]] || mkdir -p "$BACKUP_AI_BASE/9router"
+  tar xzf "$1" -C "$BACKUP_AI_BASE"
+}
 
 # ── 顶层调度 ─────────────────────────────────────────────────────
 
@@ -608,6 +637,8 @@ backup_estimate_size() {
         for d in ~/.claude ~/.codex ~/.opencode ~/.openclaw; do
           [[ -d "$d" ]] && total=$((total + $(du -sb "$d" 2>/dev/null | awk '{print $1}')))
         done ;;
+      kiro)      [[ -d "$BACKUP_AI_BASE/kiro-rs/config" ]] && total=$((total + $(du -sb "$BACKUP_AI_BASE/kiro-rs/config" 2>/dev/null | awk '{print $1}'))) ;;
+      nrouter)   [[ -d "$BACKUP_AI_BASE/9router/data" ]]  && total=$((total + $(du -sb "$BACKUP_AI_BASE/9router/data" 2>/dev/null | awk '{print $1}'))) ;;
     esac
   done
   echo "$total"

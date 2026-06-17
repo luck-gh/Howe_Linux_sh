@@ -216,6 +216,7 @@ SVC_REGISTRY_STACK=(
   "SINGBOX|sing-box|systemd|sing-box"
   "CADDY|Caddy|systemd|caddy"
   "KIRO|kiro-rs|docker|kiro-rs"
+  "NROUTER|9router|docker|9router"
 )
 
 # 服务描述（升级菜单 / 选服务页面共用）
@@ -230,6 +231,8 @@ declare -A SVC_DESC=(
   [INST_CADDY]="HTTPS 反向代理 + 自动 Let's Encrypt 证书"
   [INST_PGSQL]="数据库（Sub2API / New-API 自动依赖）"
   [INST_REDIS]="缓存（Sub2API 自动依赖）"
+  [INST_KIRO]="kiro-rs：Kiro IDE 订阅 → Anthropic API 兼容代理"
+  [INST_9ROUTER]="9router：多 AI provider 聚合网关 + failover（类 sub2api）"
 )
 
 # 通过 SVC_REGISTRY_STACK 的 KEY 取描述（如 NEWAPI → INST_NEWAPI）
@@ -280,6 +283,7 @@ detect_installed_services() {
   $SVC_PGSQL_INSTALLED   && INST_PGSQL=true
   $SVC_REDIS_INSTALLED   && INST_REDIS=true
   $SVC_KIRO_INSTALLED    && INST_KIRO=true
+  $SVC_NROUTER_INSTALLED && INST_9ROUTER=true
   return 0
 }
 
@@ -296,6 +300,8 @@ detect_ai_agents() {
 # 用法：svc_installed_var INST_NEWAPI → echo true/false
 svc_installed_var() {
   local _key="${1#INST_}"
+  # bash 变量名不能以数字开头，9ROUTER → NROUTER
+  [[ "$_key" == "9ROUTER" ]] && _key="NROUTER"
   local _var="SVC_${_key}_INSTALLED"
   echo "${!_var:-false}"
 }
