@@ -71,6 +71,19 @@ BUILTIN_DEFAULTS = {
     "update_interval_hours": 24,
     # serve.py 按需刷新已是主路径；timer 仅做兜底，默认 10 分钟
     "stats_refresh_minutes": 10,
+    # 自动刷新策略: interval(间隔) / daily(日刷新) / off(关闭)
+    # - interval: 每 stats_refresh_minutes 分钟刷新一次（传统模式）
+    # - daily:    每天 daily_refresh_time 刷新一次（systemd OnCalendar）
+    # - off:      关闭定时器，纯手动刷新
+    "refresh_mode": "interval",
+    # 日刷新模式：每天 HH:MM 执行（仅 refresh_mode=daily 时生效）
+    "daily_refresh_time": "03:00",
+    # 定时刷新时是否强制重新检测 IP 质量（带 --refresh-quality）
+    # - true:  定时刷新时忽略缓存，全量探测出口 IP + 重新拉取评分
+    # - false: 定时刷新走 prefer_cache 路径（复用现有缓存）
+    "refresh_force_recheck": "false",
+    # IP 质量缓存有效期（小时）；超过此时长的缓存条目视为过期需重新拉取
+    "ip_quality_cache_hours": 24,
     # 每订阅独立端口段（≤ 16 个用户）
     "port_min": 13443,
     "port_max": 13458,
@@ -120,11 +133,12 @@ QUALITY_BOOL_KEYS = (
     "quality_check_for_static",
     "exit_ip_show_enabled", "exit_ip_show_for_self", "exit_ip_show_for_static",
 )
+REFRESH_MODES = ("interval", "daily", "off")
 
 # 默认值字段类型（影响 cmd_defaults 转换）
 INT_DEFAULT_KEYS = {
     "traffic_gb", "reset_day", "expire_days", "update_interval_hours",
-    "stats_refresh_minutes", "port_min", "port_max",
+    "stats_refresh_minutes", "port_min", "port_max", "ip_quality_cache_hours",
 }
 
 # 静态 IP 字段（list[str|dict] 型，CLI 用逗号或 YAML 文本传入）
@@ -764,7 +778,7 @@ def _is_external_info_node(name):
 IP_QUALITY_CACHE_FILE = ".ip_quality_cache.yaml"
 EXIT_IP_TRACK_FILE   = ".exit_ip_track.yaml"   # 持久化上次出口 IP，用于变更检测
 IP_QUALITY_FETCH_TIMEOUT = 8
-IP_QUALITY_CACHE_TTL = 24 * 3600       # 24 小时
+# IP_QUALITY_CACHE_TTL 改由 ip_quality_cache_hours 配置项动态计算
 IP_QUALITY_NEG_TTL = 6 * 3600          # 失败负缓存 6 小时（避免限流时频繁重试耗配额）
 _ip_quality_memo: dict = {}
 _scrape_quota_exhausted = False  # 配额耗尽后本进程内跳过网页爬取
@@ -991,7 +1005,8 @@ def lookup_ip_quality(host, base, defs=None, node_key=None, prefer_cache=False):
             entry = None
         else:
             fetched_at = int(entry.get("fetched_at", 0))
-            ttl = IP_QUALITY_NEG_TTL if entry.get("error") else IP_QUALITY_CACHE_TTL
+            cache_hours = int((defs or {}).get("ip_quality_cache_hours", 24))
+            ttl = IP_QUALITY_NEG_TTL if entry.get("error") else (cache_hours * 3600)
             # prefer_cache: 自动刷新关闭 → 有非空评分就用,不看 TTL
             if prefer_cache and not entry.get("error") and entry.get("kind") != "":
                 result = (entry.get("kind", ""), entry.get("score", ""))
@@ -1189,6 +1204,12 @@ def read_defaults(base):
         if isinstance(v, (list, dict)):
             out[k] = list(v) if isinstance(v, list) else dict(v)
     out.update({k: d[k] for k in BUILTIN_DEFAULTS if k in d})
+
+    # 向后兼容：旧配置无 refresh_mode 时根据 stats_refresh_minutes 推断
+    if "refresh_mode" not in d:
+        mins = int(out.get("stats_refresh_minutes", 10))
+        out["refresh_mode"] = "off" if mins == 0 else "interval"
+
     return out
 
 
@@ -1573,6 +1594,10 @@ def cmd_defaults(args):
         ("exit_ip_show_for_static", "exit_ip_show_for_static"),
         ("scamalytics_url", "scamalytics_url"),
         ("proxycheck_api_key", "proxycheck_api_key"),
+        ("refresh_mode", "refresh_mode"),
+        ("daily_refresh_time", "daily_refresh_time"),
+        ("refresh_force_recheck", "refresh_force_recheck"),
+        ("ip_quality_cache_hours", "ip_quality_cache_hours"),
     ):
         v = getattr(args, attr, None)
         if v is None:
@@ -1598,6 +1623,12 @@ def cmd_defaults(args):
         if v not in QUALITY_SOURCES:
             raise SystemExit(f"quality_source 必须是 {'/'.join(QUALITY_SOURCES)}")
         defs["quality_source"] = v
+    # refresh_mode 校验
+    if "refresh_mode" in defs:
+        v = str(defs["refresh_mode"]).strip().lower()
+        if v not in REFRESH_MODES:
+            raise SystemExit(f"refresh_mode 必须是 {'/'.join(REFRESH_MODES)}")
+        defs["refresh_mode"] = v
     # 列表型字段：逗号分隔 → list
     for key, attr in (
         ("static_service_packs", "static_service_packs"),
@@ -2546,6 +2577,14 @@ def build_parser():
                    help="自建节点(IP)显示开关 on/off")
     d.add_argument("--exit-ip-show-for-static", dest="exit_ip_show_for_static",
                    help="静态节点(IP)显示开关 on/off")
+    d.add_argument("--refresh-mode", dest="refresh_mode",
+                   help="自动刷新模式：interval(间隔) / daily(日刷新) / off(关闭)")
+    d.add_argument("--daily-refresh-time", dest="daily_refresh_time",
+                   help="日刷新模式：每天刷新时间 HH:MM（如 03:00）")
+    d.add_argument("--refresh-force-recheck", dest="refresh_force_recheck",
+                   help="定时刷新时是否强制重新检测 IP：true / false")
+    d.add_argument("--ip-quality-cache-hours", dest="ip_quality_cache_hours", type=int,
+                   help="IP 质量缓存有效期（小时）")
 
     rd = sub.add_parser("render")
     g = rd.add_mutually_exclusive_group()

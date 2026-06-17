@@ -128,19 +128,31 @@ NODESCFG
 # stats_refresh_minutes = 0 → 关闭 timer（仅保留 serve.py 按需刷新）
 setup_clash_stats_timer() {
   $INST_SINGBOX || return 0
-  local _interval
-  _interval=$(python3 "$(_clash_py)" --base "$(_clash_dir)" \
-                get-setting stats_refresh_minutes 2>/dev/null || echo 10)
-  [[ "$_interval" =~ ^[0-9]+$ ]] || _interval=10
 
-  if [[ "$_interval" == "0" ]]; then
+  # 读取刷新策略配置
+  local _mode _interval _daily_time _force
+  _mode=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_mode 2>/dev/null || echo "interval")
+  _interval=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting stats_refresh_minutes 2>/dev/null || echo 10)
+  _daily_time=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting daily_refresh_time 2>/dev/null || echo "03:00")
+  _force=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_force_recheck 2>/dev/null || echo "false")
+  [[ "$_interval" =~ ^[0-9]+$ ]] || _interval=10
+  [[ "$_mode" =~ ^(interval|daily|off)$ ]] || _mode="interval"
+
+  # refresh_mode=off: 关闭定时器
+  if [[ "$_mode" == "off" ]]; then
     systemctl disable --now clash-subs-stats.timer 2>/dev/null || true
     systemctl stop clash-subs-stats.service 2>/dev/null || true
     rm -f /etc/systemd/system/clash-subs-stats.timer \
           /etc/systemd/system/clash-subs-stats.service
     systemctl daemon-reload
-    log "流量统计 timer 已关闭（仅 serve 按需刷新）"
+    log "自动刷新已关闭（仅 serve 按需刷新 + 手动同步）"
     return 0
+  fi
+
+  # 构建 ExecStart 命令（根据 refresh_force_recheck 决定是否带 --refresh-quality）
+  local _exec_cmd="/usr/bin/python3 $(_clash_stats_py) --base $(_clash_dir) --clash-subs $(_clash_py)"
+  if [[ "$_force" == "true" ]]; then
+    _exec_cmd="$_exec_cmd --refresh-quality"
   fi
 
   cat > /etc/systemd/system/clash-subs-stats.service <<UNIT
@@ -149,9 +161,25 @@ Description=Clash 订阅流量统计 + 限流执法
 After=sing-box.service nftables.service
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 $(_clash_stats_py) --base $(_clash_dir) --clash-subs $(_clash_py)
+ExecStart=${_exec_cmd}
 UNIT
-  cat > /etc/systemd/system/clash-subs-stats.timer <<UNIT
+
+  # 根据 refresh_mode 生成不同的 timer 配置
+  if [[ "$_mode" == "daily" ]]; then
+    cat > /etc/systemd/system/clash-subs-stats.timer <<UNIT
+[Unit]
+Description=Clash 订阅流量统计定时器（每天 ${_daily_time}）
+[Timer]
+OnCalendar=*-*-* ${_daily_time}:00
+Persistent=true
+AccuracySec=1min
+[Install]
+WantedBy=timers.target
+UNIT
+    log "自动刷新已启用（日刷新模式：每天 ${_daily_time}，强制重检测=${_force}）"
+  else
+    # interval 模式
+    cat > /etc/systemd/system/clash-subs-stats.timer <<UNIT
 [Unit]
 Description=Clash 订阅流量统计定时器（每 ${_interval} 分钟）
 [Timer]
@@ -161,9 +189,11 @@ AccuracySec=15s
 [Install]
 WantedBy=timers.target
 UNIT
+    log "自动刷新已启用（间隔模式：每 ${_interval} 分钟，强制重检测=${_force}）"
+  fi
+
   systemctl daemon-reload
   systemctl enable --now clash-subs-stats.timer 2>/dev/null
-  log "流量统计 timer 已启用（每 ${_interval} 分钟，按需刷新由 serve 主管）"
 }
 
 # 部署按需刷新 HTTP 服务（监听 127.0.0.1:13888，由 caddy /sub/* 反代过来）
@@ -579,69 +609,162 @@ _clash_menu_defaults() {
 # 与 [5] 默认值菜单中的 stats_refresh_minutes 同源；0 = 关闭 timer
 _clash_menu_auto_refresh() {
   while true; do
-    local _cur _show _timer_st
-    _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" \
-            get-setting stats_refresh_minutes 2>/dev/null || echo 10)
-    [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=10
-    if [[ "$_cur" == "0" ]]; then
-      _show="${DIM}关闭${N}（仅 serve.py 按需刷新）"
-    else
-      _show="${G}启用${N}（每 ${_cur} 分钟）"
-    fi
+    local _mode _interval _daily_time _force _cache_hours _timer_st
+    _mode=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_mode 2>/dev/null || echo "interval")
+    _interval=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting stats_refresh_minutes 2>/dev/null || echo 10)
+    _daily_time=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting daily_refresh_time 2>/dev/null || echo "03:00")
+    _force=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_force_recheck 2>/dev/null || echo "false")
+    _cache_hours=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting ip_quality_cache_hours 2>/dev/null || echo 24)
+    [[ "$_interval" =~ ^[0-9]+$ ]] || _interval=10
+    [[ "$_cache_hours" =~ ^[0-9]+$ ]] || _cache_hours=24
+
+    # 刷新模式显示
+    local _mode_show
+    case "$_mode" in
+      interval) _mode_show="${G}间隔${N} (每 ${_interval} 分钟)" ;;
+      daily)    _mode_show="${G}日刷新${N} (每天 ${_daily_time})" ;;
+      off)      _mode_show="${DIM}关闭${N} (仅手动 + serve 按需)" ;;
+      *)        _mode_show="${DIM}未知${N}" ;;
+    esac
+
+    # timer 状态
     if systemctl is-active clash-subs-stats.timer &>/dev/null; then
       _timer_st="${G}active${N}"
     else
       _timer_st="${DIM}inactive${N}"
     fi
 
-    print_header "Clash 订阅管理 / 刷新配置"
+    # 强制重检测显示
+    local _force_show
+    [[ "$_force" == "true" ]] && _force_show="${G}是${N}" || _force_show="${DIM}否${N}"
+
+    print_header "Clash 订阅管理 / 自动刷新策略"
     echo ""
-    printf "    自动刷新状态  : %b\n" "$_show"
-    printf "    timer 服务    : %b\n" "$_timer_st"
+    echo -e "    ${W}当前配置${N}"
+    echo -e "    ├─ 刷新模式         : $_mode_show"
+    echo -e "    ├─ 定时刷新重检测IP : $_force_show"
+    echo -e "    ├─ IP质量缓存有效期 : ${_cache_hours} 小时"
+    echo -e "    └─ timer 服务状态   : $_timer_st"
     echo ""
-    echo -e "    ${DIM}与 [5] 默认值菜单中『默认流量统计刷新分钟数』同源；${N}"
-    echo -e "    ${DIM}0 = 关闭 timer，仅保留 serve.py 按需刷新（客户端拉订阅时触发）${N}"
+    echo -e "    ${W}[1]${N} 切换刷新模式 (间隔 / 日刷新 / 关闭)"
+    echo -e "    ${W}[2]${N} 间隔模式: 设置刷新间隔 (分钟)"
+    echo -e "    ${W}[3]${N} 日刷新模式: 设置刷新时间 (HH:MM)"
+    echo -e "    ${W}[4]${N} 定时刷新时是否强制重新检测 IP 质量"
+    echo -e "    ${W}[5]${N} 设置 IP 质量缓存有效期 (小时)"
     echo ""
-    echo -e "    ${W}[1]${N} 切换开启 / 关闭"
-    echo -e "    ${W}[2]${N} 设置刷新间隔（分钟）"
+    echo -e "    ${DIM}说明: 间隔模式适合高频更新，日刷新适合凌晨低负载时段；${N}"
+    echo -e "    ${DIM}      强制重检测=否 时定时刷新走缓存(快)，手动同步仍全量刷新${N}"
     echo ""
     echo -e "    ${DIM}[0 / 回车] 返回${N}"
     echo ""
     local _in
     read -erp "  选择：" _in
     case "$_in" in
-      1)
-        local _new
-        if [[ "$_cur" == "0" ]]; then
-          _new=10
-          info "已开启自动刷新（默认每 10 分钟，可在 [2] 修改）"
-        else
-          _new=0
-          info "已关闭自动刷新（timer 将停用）"
-        fi
-        python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --stats-refresh-minutes "$_new" >/dev/null
-        setup_clash_stats_timer
-        ;;
-      2)
-        local _v
-        ask _v "刷新间隔分钟数（0 = 关闭，当前 ${_cur}）"
-        if [[ -z "$_v" ]]; then
-          info "未变更"
-        elif ! [[ "$_v" =~ ^[0-9]+$ ]]; then
-          warn "需输入非负整数"
-        elif [[ "$_v" == "$_cur" ]]; then
-          info "未变更"
-        else
-          python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --stats-refresh-minutes "$_v" >/dev/null
-          setup_clash_stats_timer
-        fi
-        ;;
-      0|"") return 0 ;;
+      1) _refresh_switch_mode ;;
+      2) _refresh_set_interval ;;
+      3) _refresh_set_daily_time ;;
+      4) _refresh_toggle_force_recheck ;;
+      5) _refresh_set_cache_hours ;;
+      0|"") break ;;
       *) warn "无效选项" ;;
     esac
-    echo ""
-    read -erp "  按回车继续..." _
   done
+}
+
+# 自动刷新策略子菜单辅助函数
+_refresh_switch_mode() {
+  local _cur
+  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_mode 2>/dev/null || echo "interval")
+  echo ""
+  echo -e "  当前模式: ${W}${_cur}${N}"
+  echo -e "  ${W}[1]${N} interval (间隔) - 每 N 分钟刷新一次"
+  echo -e "  ${W}[2]${N} daily (日刷新) - 每天指定时刻刷新"
+  echo -e "  ${W}[3]${N} off (关闭) - 仅手动同步 + serve 按需"
+  echo ""
+  local _in
+  read -erp "  选择模式: " _in
+  local _new
+  case "$_in" in
+    1) _new="interval" ;;
+    2) _new="daily" ;;
+    3) _new="off" ;;
+    *) warn "取消"; return ;;
+  esac
+  if [[ "$_new" == "$_cur" ]]; then
+    info "未变更"
+  else
+    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --refresh-mode "$_new" >/dev/null
+    setup_clash_stats_timer
+    info "刷新模式已切换为: $_new"
+  fi
+}
+
+_refresh_set_interval() {
+  local _cur
+  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting stats_refresh_minutes 2>/dev/null || echo 10)
+  local _v
+  ask _v "间隔分钟数（当前 ${_cur}）"
+  if [[ -z "$_v" ]]; then
+    info "未变更"
+  elif ! [[ "$_v" =~ ^[0-9]+$ ]] || [[ "$_v" -lt 1 ]]; then
+    warn "需输入正整数"
+  elif [[ "$_v" == "$_cur" ]]; then
+    info "未变更"
+  else
+    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --stats-refresh-minutes "$_v" >/dev/null
+    setup_clash_stats_timer
+    info "刷新间隔已设置为: $_v 分钟"
+  fi
+}
+
+_refresh_set_daily_time() {
+  local _cur
+  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting daily_refresh_time 2>/dev/null || echo "03:00")
+  local _v
+  ask _v "每天刷新时间 HH:MM（当前 ${_cur}）"
+  if [[ -z "$_v" ]]; then
+    info "未变更"
+  elif ! [[ "$_v" =~ ^[0-2][0-9]:[0-5][0-9]$ ]]; then
+    warn "格式错误，需 HH:MM (如 03:00)"
+  elif [[ "$_v" == "$_cur" ]]; then
+    info "未变更"
+  else
+    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --daily-refresh-time "$_v" >/dev/null
+    setup_clash_stats_timer
+    info "日刷新时间已设置为: 每天 $_v"
+  fi
+}
+
+_refresh_toggle_force_recheck() {
+  local _cur
+  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_force_recheck 2>/dev/null || echo "false")
+  local _new
+  if [[ "$_cur" == "true" ]]; then
+    _new="false"
+    info "定时刷新将走缓存路径（快速）"
+  else
+    _new="true"
+    info "定时刷新将强制重新检测所有 IP 质量（慢，更准确）"
+  fi
+  python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --refresh-force-recheck "$_new" >/dev/null
+  setup_clash_stats_timer
+}
+
+_refresh_set_cache_hours() {
+  local _cur
+  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting ip_quality_cache_hours 2>/dev/null || echo 24)
+  local _v
+  ask _v "IP 质量缓存有效期（小时，当前 ${_cur}）"
+  if [[ -z "$_v" ]]; then
+    info "未变更"
+  elif ! [[ "$_v" =~ ^[0-9]+$ ]] || [[ "$_v" -lt 1 ]]; then
+    warn "需输入正整数"
+  elif [[ "$_v" == "$_cur" ]]; then
+    info "未变更"
+  else
+    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --ip-quality-cache-hours "$_v" >/dev/null
+    info "IP 质量缓存有效期已设置为: $_v 小时"
+  fi
 }
 
 # 子菜单：刷新所有（用户主动同步 → 强制重新探测出口 IP / 评分，绕过缓存）
