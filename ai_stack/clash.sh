@@ -788,9 +788,11 @@ _clash_menu_refresh() {
 #   2) 订阅独立池（subs.yaml.<sub>.static_proxies）—— 显式覆盖
 # ═══════════════════════════════════════════════════════════════════
 _static_input_hint() {
-  echo -e "  ${DIM}格式：host:port:user:password（用户名留空时可写 host:port:password）${N}"
+  echo -e "  ${DIM}格式：host:port:user:password{annotation}（注解可选）${N}"
+  echo -e "  ${DIM}      用户名留空时可写 host:port:password 或 host:port::password${N}"
   echo -e "  ${DIM}多条：每行一条；或用逗号 / 分号在同一行隔开${N}"
-  echo -e "  ${DIM}示例：1.2.3.4:1080:alice:s3cret${N}"
+  echo -e "  ${DIM}示例：1.2.3.4:1080:alice:s3cret{美国节点}${N}"
+  echo -e "  ${DIM}      2.3.4.5:1080::pass123{洛杉矶}${N}"
 }
 
 # 通用：选择目标（全局默认 / 某订阅）

@@ -336,7 +336,7 @@ def resolve_external_url(sub, defs):
 def _coerce_static_proxy(p):
     """把单条静态 IP 资源标准化成 dict；非 dict / 缺关键字段时返回 None。
     必填：server, port, password；type 默认 socks5；username 可选；
-    annotation 可选(中英文/数字/空格/-_, 最多 12 字符,显示在节点名 risk 后 geo 前)；
+    annotation 可选(中英文/数字/空格/-_:等，最多 20 字符，显示在节点名 risk 后 geo 前)；
     name 缺省自动生成"""
     if not isinstance(p, dict):
         return None
@@ -351,9 +351,9 @@ def _coerce_static_proxy(p):
     username = (p.get("username") or "").strip() or None
     annotation = (p.get("annotation") or "").strip() or None
     if annotation:
-        # 校验:不允许 : , ; 和过长(12 字符上限)
-        if any(c in annotation for c in (":", ",", ";")) or len(annotation) > 12:
-            annotation = None
+        # 校验：长度上限 20 字符（花括号包裹，不再限制冒号等字符）
+        if len(annotation) > 20:
+            annotation = annotation[:20]
     out = {
         "name": (p.get("name") or "").strip(),
         "type": (p.get("type") or "socks5").strip().lower(),
@@ -370,10 +370,10 @@ def _coerce_static_proxy(p):
 
 def parse_static_proxy_line(line):
     """解析单行字符串 → 静态 IP 资源 dict。支持：
-      [annotation:]host:port:user:password   (annotation 可选)
-      [annotation:]host:port:password        (无认证用户名)
-    冒号段数:3 = host:port:pwd / 4 = host:port:user:pwd 或 anno:host:port:pwd /
-            5 = anno:host:port:user:pwd
+      host:port:user:password{annotation}   (annotation 可选，花括号包裹)
+      host:port:password{annotation}        (无认证用户名，或 host:port::password)
+    冒号段数: 3 = host:port:pwd / 4 = host:port:user:pwd
+    注解: 行末 {...} 部分，可选，内部可包含冒号
     其它格式返回 None。
     """
     if line is None:
@@ -381,32 +381,35 @@ def parse_static_proxy_line(line):
     s = str(line).strip()
     if not s or s.startswith("#"):
         return None
-    parts = s.split(":")
+
+    # 先提取行末 {...} 注解（避免注解内冒号干扰 split）
     annotation = None
-    if len(parts) == 5:
-        annotation, host, port, user, pwd = parts
-    elif len(parts) == 4:
-        # 区分 anno:host:port:pwd vs host:port:user:pwd:看第 2 段是不是端口数字
-        if parts[1].isdigit() and 1 <= int(parts[1]) <= 65535:
-            host, port, user, pwd = parts
-        else:
-            annotation, host, port, pwd = parts
-            user = ""
+    if s.endswith("}"):
+        idx = s.rfind("{")
+        if idx > 0:
+            annotation = s[idx+1:-1].strip()
+            s = s[:idx].strip()
+
+    parts = s.split(":")
+    if len(parts) == 4:
+        host, port, user, pwd = parts
     elif len(parts) == 3:
         host, port, pwd = parts
         user = ""
     else:
         return None
+
     try:
         port_n = int(port)
     except ValueError:
         return None
+
     return _coerce_static_proxy({
         "server": host.strip(),
         "port": port_n,
         "username": user.strip() or None,
-        "password": pwd,
-        "annotation": (annotation or "").strip() or None,
+        "password": pwd.strip(),
+        "annotation": annotation or None,
     })
 
 
