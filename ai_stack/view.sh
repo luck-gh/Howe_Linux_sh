@@ -409,7 +409,7 @@ manage_services() {
 _UPGRADE_DIR()    { echo "${BASE_DIR}/upgrade"; }
 _HISTORY_FILE()   { echo "$(_UPGRADE_DIR)/history/$1.log"; }
 _DB_BACKUP_DIR()  { echo "$(_UPGRADE_DIR)/db_backups"; }
-_KEEP_GENERATIONS=5
+_KEEP_GENERATIONS=2
 
 # 服务是否依赖 PostgreSQL（决定是否自动 pg_dump）
 # new-api → newapi 库；sub2api → sub2api 库
@@ -421,12 +421,84 @@ _svc_pg_db() {
   esac
 }
 
+_upgrade_scope_matches_service() {
+  local _scope="$1" _svc="$2"
+  case "$_scope" in
+    ai-pg) [[ -n "$(_svc_pg_db "$_svc")" || "$_svc" == "ai-db" ]] ;;
+    ai-data)
+      case "$_svc" in new-api|sub2api|litellm|openwebui) return 0 ;; *) return 1 ;; esac ;;
+    ai-config)
+      case "$_svc" in new-api|sub2api|litellm|openwebui|ai-db|ai-redis|dify-nginx) return 0 ;; *) return 1 ;; esac ;;
+    singbox) [[ "$_svc" == "sing-box" ]] ;;
+    caddy) [[ "$_svc" == "caddy" ]] ;;
+    kiro) [[ "$_svc" == "kiro-rs" ]] ;;
+    nrouter) [[ "$_svc" == "9router" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+_upgrade_backup_scopes_for_services() {
+  declare -F backup_conf_get >/dev/null 2>&1 || return 0
+  local _csv; _csv=$(backup_conf_get DEFAULT_SCOPES "$BACKUP_DEFAULT_SCOPES_DEFAULT")
+  [[ -z "$_csv" ]] && return 0
+
+  local -a _defaults=()
+  local _s
+  for _s in ${_csv//,/ }; do
+    _s="${_s//[[:space:]]/}"
+    [[ -n "$_s" ]] && _defaults+=("$_s")
+  done
+
+  local -A _seen=()
+  local -a _out=()
+  local _svc
+  for _svc in "$@"; do
+    for _s in "${_defaults[@]}"; do
+      _upgrade_scope_matches_service "$_s" "$_svc" || continue
+      [[ -n "${_seen[$_s]:-}" ]] && continue
+      _seen["$_s"]=1
+      _out+=("$_s")
+    done
+  done
+
+  printf '%s\n' "${_out[@]}"
+}
+
 # 取容器当前镜像引用（如 calciumion/new-api:latest）和镜像 ID
 _svc_image_ref() {
   docker inspect --format '{{.Config.Image}}' "$1" 2>/dev/null
 }
 _svc_image_id() {
   docker inspect --format '{{.Image}}' "$1" 2>/dev/null
+}
+
+_docker_history_references_image() {
+  local _want="$1" _f _ts _ref _id
+  for _f in "$(_UPGRADE_DIR)"/history/*.log; do
+    [[ -f "$_f" ]] || continue
+    while read -r _ts _ref _id; do
+      [[ "$_id" == "$_want" ]] && return 0
+    done < "$_f"
+  done
+  return 1
+}
+
+_prune_docker_image_if_unreferenced() {
+  local _id="$1"
+  [[ -z "$_id" || "$_id" == "unknown" ]] && return 0
+  _docker_history_references_image "$_id" && return 0
+  docker image inspect "$_id" >/dev/null 2>&1 || return 0
+  docker image rm "$_id" >/dev/null 2>&1 && info "已清理未被回滚历史引用的旧镜像：${_id:0:19}"
+  return 0
+}
+
+_prune_unreferenced_dangling_images() {
+  local _id _full_id
+  while read -r _id; do
+    [[ -z "$_id" ]] && continue
+    _full_id=$(docker image inspect "$_id" --format '{{.Id}}' 2>/dev/null || true)
+    _prune_docker_image_if_unreferenced "${_full_id:-$_id}"
+  done < <(docker images -f dangling=true --format '{{.ID}}' 2>/dev/null || true)
 }
 
 # 记录一代 image 历史；超过保留代数则截断（保留最近 N 行）
@@ -437,7 +509,13 @@ _record_image_history() {
   printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_ref" "$_id" >> "$_f"
   local _keep_lines=$_KEEP_GENERATIONS
   if [[ -s "$_f" ]] && (( $(wc -l < "$_f") > _keep_lines )); then
+    local -a _old_ids=()
+    mapfile -t _old_ids < <(head -n -"$_keep_lines" "$_f" | awk '{print $3}' | sed '/^$/d')
     tail -n "$_keep_lines" "$_f" > "${_f}.tmp" && mv "${_f}.tmp" "$_f"
+    local _old_id
+    for _old_id in "${_old_ids[@]}"; do
+      _prune_docker_image_if_unreferenced "$_old_id"
+    done
   fi
 }
 
@@ -491,9 +569,6 @@ upgrade_single_service() {
     return 1
   fi
 
-  # 升级前自动备份（受 /etc/howe-backup.conf::AUTO_BEFORE_UPGRADE 控制）
-  _upgrade_pre_backup_hook "$_svc" docker
-
   local _cur_ref _cur_id
   _cur_ref=$(_svc_image_ref "$_svc")
   _cur_id=$(_svc_image_id "$_svc")
@@ -506,16 +581,12 @@ upgrade_single_service() {
   [[ -n "$_db" ]] && echo -e "    数据库    : ${C}${_db}${N}（升级前自动 pg_dump）"
   echo ""
   local _go
-  askyn _go "确认拉取新镜像并重建容器？" "y"
-  $_go || { info "已取消"; return 0; }
-
-  # 1) 备份 DB
-  if [[ -n "$_db" ]]; then
-    _dump_db_if_needed "$_svc" || warn "数据库备份失败，仍可继续，但回滚将无法恢复 DB"
+  if [[ "${_BATCH_UPGRADE_YES:-}" == "1" ]]; then
+    _go=true; echo -e "  ${DIM}（全部升级：自动确认）${N}"
+  else
+    askyn _go "确认拉取新镜像并重建容器？" "y"
   fi
-
-  # 2) 记录旧 image（升级成功与否都是有效的回滚锚点）
-  _record_image_history "$_svc" "$_cur_ref" "$_cur_id"
+  $_go || { info "已取消"; return 0; }
 
   # 3) 拉新镜像
   step "docker compose pull ${_svc}"
@@ -531,10 +602,15 @@ upgrade_single_service() {
   _post_pull_id=$(docker image inspect "$_cur_ref" --format '{{.Id}}' 2>/dev/null)
   if [[ -n "$_post_pull_id" && "$_post_pull_id" == "$_cur_id" ]]; then
     info "镜像已是最新（${_cur_id:0:19}），跳过容器重建"
-    [[ -n "$LAST_DB_BACKUP" ]] && \
-      echo -e "  ${DIM}DB 备份保留在：${LAST_DB_BACKUP}${N}"
     return 0
   fi
+
+  # 远端确有新镜像后再备份，避免无升级也产生回滚文件和数据备份。
+  _upgrade_pre_backup_hook "$_svc" docker
+  if [[ -n "$_db" ]]; then
+    _dump_db_if_needed "$_svc" || warn "数据库备份失败，仍可继续，但回滚将无法恢复 DB"
+  fi
+  _record_image_history "$_svc" "$_cur_ref" "$_cur_id"
 
   # 4) up -d 重建（--no-deps 防止重建依赖容器，例如 ai-db）
   step "docker compose up -d --no-deps ${_svc}"
@@ -571,6 +647,7 @@ upgrade_single_service() {
   echo -e "  ${W}最近日志${N}"
   docker logs --tail 30 "$_svc" 2>&1 | sed 's/^/    /'
   echo ""
+  _prune_unreferenced_dangling_images
   log "${_name} 升级完成"
 }
 
@@ -958,6 +1035,116 @@ check_all_updates() {
   fi
 }
 
+# ═══════════════════════════════════════════════════════════════════
+# 全部升级：把所有「可升级（↑）」的已安装服务依次升级
+# - 仅升级缓存状态为 ↑ 的服务；? / ✓ 跳过
+# - 升级前自动备份在此集中做一次（受 AUTO_BEFORE_UPGRADE 控制），
+#   之后逐个服务通过 _BATCH_UPGRADE_BACKUP_DONE 跳过重复备份
+# - 各服务升级确认通过 _BATCH_UPGRADE_YES 自动应答
+# 参数：传入 "key|name|type|target" 形式的服务数组
+# ═══════════════════════════════════════════════════════════════════
+upgrade_all_services() {
+  local -a _SVCS=("$@")
+
+  # 筛出缓存里状态为 ↑ 的服务
+  local -a _TODO=()
+  local _e _key _name _type _svc
+  for _e in "${_SVCS[@]}"; do
+    IFS='|' read -r _key _name _type _svc <<< "$_e"
+    local _cf="${_UPDATE_CACHE_DIR}/${_key}"
+    [[ -s "$_cf" ]] || continue
+    local _ck _cn _ccur _cnew _cstate
+    IFS='|' read -r _ck _cn _ccur _cnew _cstate < "$_cf"
+    [[ "$_cstate" == "↑" ]] && _TODO+=("$_e")
+  done
+
+  print_header "全部升级（程序版本）"
+  if [[ ${#_TODO[@]} -eq 0 ]]; then
+    echo -e "  ${G}没有检测到可升级的服务${N}"
+    echo -e "  ${DIM}如缓存过期或网络刚恢复，可先按 [r] 重新检查更新${N}"
+    echo ""
+    read -erp "  按回车返回..." _
+    return 0
+  fi
+
+  echo -e "  ${Y}以下 ${#_TODO[@]} 个服务将被升级：${N}"
+  echo ""
+  for _e in "${_TODO[@]}"; do
+    IFS='|' read -r _key _name _type _svc <<< "$_e"
+    local _cf="${_UPDATE_CACHE_DIR}/${_key}"
+    local _ck _cn _ccur _cnew _cstate
+    IFS='|' read -r _ck _cn _ccur _cnew _cstate < "$_cf"
+    printf "    ${W}•${N} %-12s  ${Y}→ %s${N}\n" "$_name" "${_cnew:0:40}"
+  done
+  echo ""
+
+  local _go
+  askyn _go "确认依次升级以上全部服务？（每个服务升级时不再单独确认）" "n"
+  $_go || { info "已取消"; echo ""; read -erp "  按回车返回..." _; return 0; }
+
+  # 集中做一次升级前自动备份（若开启），之后各服务跳过重复备份
+  export _BATCH_UPGRADE_BACKUP_DONE=0
+  if declare -F backup_conf_get >/dev/null 2>&1; then
+    local _ab; _ab=$(backup_conf_get AUTO_BEFORE_UPGRADE "$BACKUP_AUTO_BEFORE_UPGRADE_DEFAULT")
+    if [[ "$_ab" == "true" ]]; then
+      local -a _targets=()
+      for _e in "${_TODO[@]}"; do
+        IFS='|' read -r _key _name _type _svc <<< "$_e"
+        _targets+=("$_svc")
+      done
+      local -a _scopes=()
+      mapfile -t _scopes < <(_upgrade_backup_scopes_for_services "${_targets[@]}")
+      if (( ${#_scopes[@]} > 0 )); then
+        echo ""
+        info "全部升级前自动备份：${_scopes[*]}"
+        local _dir
+        _dir=$(backup_create "全部升级前自动备份" "${_scopes[@]}" 2>/dev/null)
+        if [[ -n "$_dir" ]]; then
+          log "已备份 → $(basename "$_dir")"
+          local _keep; _keep=$(backup_conf_get KEEP "$BACKUP_KEEP_DEFAULT")
+          backup_apply_retention "$_keep" >/dev/null 2>&1
+          _BATCH_UPGRADE_BACKUP_DONE=1
+        else
+          warn "集中备份失败，将由各服务自行尝试备份"
+        fi
+      else
+        info "默认备份范围中没有匹配本次待升级服务的项目，跳过集中备份"
+      fi
+    fi
+  fi
+
+  export _BATCH_UPGRADE_YES=1
+
+  local _total=${#_TODO[@]} _idx=0 _ok=0 _fail=0
+  local -a _failed=()
+  for _e in "${_TODO[@]}"; do
+    IFS='|' read -r _key _name _type _svc <<< "$_e"
+    _idx=$((_idx+1))
+    echo ""
+    echo -e "${W}${C}  ── [${_idx}/${_total}] 升级 ${_name} ───────────────────────────${N}"
+    if [[ "$_type" == "docker" ]]; then
+      if upgrade_single_service "$_name" "$_svc"; then _ok=$((_ok+1)); else _fail=$((_fail+1)); _failed+=("$_name"); fi
+    else
+      if upgrade_systemd_service "$_name" "$_svc"; then _ok=$((_ok+1)); else _fail=$((_fail+1)); _failed+=("$_name"); fi
+    fi
+    # 升级后让该服务缓存失效
+    rm -f "${_UPDATE_CACHE_DIR}/${_key}" 2>/dev/null
+  done
+
+  unset _BATCH_UPGRADE_YES _BATCH_UPGRADE_BACKUP_DONE
+  _update_cache_invalidate
+
+  echo ""
+  echo -e "${W}  ── 全部升级完成 ──────────────────────────────${N}"
+  echo -e "    ${G}成功 ${_ok}${N}   ${R}失败 ${_fail}${N}   共 ${_total}"
+  if (( _fail > 0 )); then
+    echo -e "    ${R}失败服务：${_failed[*]}${N}"
+    echo -e "    ${DIM}可进入对应服务单独重试，或执行回滚${N}"
+  fi
+  echo ""
+  read -erp "  按回车返回..." _
+}
+
 upgrade_rollback_menu() {
   # 进入菜单时若缓存无效则先做一次检查（仅首次或过期时打印提示）
   local _need_initial_check=1
@@ -1066,6 +1253,7 @@ upgrade_rollback_menu() {
     if (( _n_upgrade > 0 )); then
       echo -e "  ${Y}有 ${_n_upgrade} 个服务可升级${N}"
       echo ""
+      echo -e "    ${W}[a]${N}  ${Y}全部升级（升级以上 ${_n_upgrade} 个可升级服务）${N}"
     fi
     echo -e "    ${W}[c]${N}  ${DIM}查看更新检查详情${N}"
     echo -e "    ${W}[r]${N}  ${DIM}重新检查所有服务更新${N}"
@@ -1082,6 +1270,11 @@ upgrade_rollback_menu() {
     fi
     if [[ "${_input,,}" == "r" ]]; then
       _update_cache_invalidate
+      _need_initial_check=1
+      continue
+    fi
+    if [[ "${_input,,}" == "a" ]]; then
+      upgrade_all_services "${_SVCS[@]}"
       _need_initial_check=1
       continue
     fi
@@ -1204,7 +1397,6 @@ _caddy_cur_ver() {
 
 upgrade_systemd_service() {
   local _name="$1" _svc="$2"
-  _upgrade_pre_backup_hook "$_svc" systemd
   case "$_svc" in
     sing-box) _upgrade_singbox "$_name" ;;
     caddy)    _upgrade_caddy "$_name" ;;
@@ -1214,18 +1406,26 @@ upgrade_systemd_service() {
 
 # 升级前自动备份 hook
 # 备份范围统一读 DEFAULT_SCOPES（与设置页「默认备份范围」一致）
+# 在「全部升级」批量场景下，由调用方先做一次集中备份并设置 _BATCH_UPGRADE_BACKUP_DONE=1，
+# 这里直接跳过逐个服务的重复备份。
 _upgrade_pre_backup_hook() {
   local _svc=$1 _type=$2
   declare -F backup_conf_get >/dev/null 2>&1 || return 0
   local _enabled; _enabled=$(backup_conf_get AUTO_BEFORE_UPGRADE "$BACKUP_AUTO_BEFORE_UPGRADE_DEFAULT")
   [[ "$_enabled" != "true" ]] && return 0
 
-  local _csv; _csv=$(backup_conf_get DEFAULT_SCOPES "$BACKUP_DEFAULT_SCOPES_DEFAULT")
-  [[ -z "$_csv" ]] && { info "升级前自动备份已开启但默认备份范围为空，跳过"; return 0; }
+  if [[ "${_BATCH_UPGRADE_BACKUP_DONE:-}" == "1" ]]; then
+    echo ""
+    info "升级前自动备份：已在「全部升级」入口集中完成，跳过 ${_svc}"
+    return 0
+  fi
 
   local -a _scopes=()
-  local _s
-  for _s in ${_csv//,/ }; do _scopes+=("$_s"); done
+  mapfile -t _scopes < <(_upgrade_backup_scopes_for_services "$_svc")
+  if (( ${#_scopes[@]} == 0 )); then
+    info "默认备份范围中没有匹配 ${_svc} 的项目，跳过升级前自动备份"
+    return 0
+  fi
 
   echo ""
   info "升级前自动备份：${_scopes[*]} （服务：$_svc）"
@@ -1271,7 +1471,11 @@ _upgrade_singbox() {
   fi
   echo ""
   local _go
-  askyn _go "确认升级到 ${_latest}？" "y"
+  if [[ "${_BATCH_UPGRADE_YES:-}" == "1" ]]; then
+    _go=true; echo -e "  ${DIM}（全部升级：自动确认）${N}"
+  else
+    askyn _go "确认升级到 ${_latest}？" "y"
+  fi
   $_go || { info "已取消"; return 0; }
 
   case $(uname -m) in
@@ -1280,6 +1484,8 @@ _upgrade_singbox() {
     armv7l)  _arch="armv7" ;;
     *) warn "不支持的架构：$(uname -m)"; return 1 ;;
   esac
+
+  _upgrade_pre_backup_hook "sing-box" systemd
 
   # 备份旧二进制
   local _bdir; _bdir=$(_BIN_BACKUP_DIR)
@@ -1432,8 +1638,14 @@ _upgrade_caddy() {
   fi
 
   local _go
-  askyn _go "确认升级 caddy 到 ${_candidate}？" "y"
+  if [[ "${_BATCH_UPGRADE_YES:-}" == "1" ]]; then
+    _go=true; echo -e "  ${DIM}（全部升级：自动确认）${N}"
+  else
+    askyn _go "确认升级 caddy 到 ${_candidate}？" "y"
+  fi
   $_go || { info "已取消"; return 0; }
+
+  _upgrade_pre_backup_hook "caddy" systemd
 
   # 写历史栈（升级前版本号）
   local _f; _f=$(_HISTORY_FILE "caddy")
