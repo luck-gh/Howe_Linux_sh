@@ -7,6 +7,26 @@
 
 ## [Unreleased]
 
+### Added
+- **恢复前置检查 `_mig_preflight_tools`**：把恢复顺序纠正为「先有运行环境，
+  再落数据」。原先直接解压数据，新机没装 Docker 时 `ai-pg` 必然失败，用户
+  还得自己从「ai-db 容器未运行」倒推根因。
+  - ① Docker：bundle 含容器化 scope 且本机缺 Docker 时，说明后果并询问是否
+    安装（官方脚本，装最新版）；已装则只报版本差异不改动——官方脚本无版本
+    参数，硬降级风险大于收益
+  - ② 原生二进制对账：读 `host-inventory.json` 的 `native_versions`，逐项
+    判定已一致 / 版本不同 / 未安装，三种处置模式（按旧机版本安装切换 /
+    仅补缺失项 / 全部跳过）
+  - ③ 才执行数据恢复
+- **锁版本安装器 `mig_install_singbox_pinned` / `mig_install_frps_pinned`**：
+  现有 `install_singbox` 与 `install_frp_server` 都是「查 GitHub latest 后
+  装」，且失败时调 `err()`（内部 `exit 1`）——在恢复流程里调用会直接杀掉整个
+  脚本。新写的这套版本由调用方指定，失败只 `warn` + `return 1`。
+  - `armv7l` 的架构串两个项目不一致（frp 用 `arm`，sing-box 用 `armv7`），
+    已分别复刻，写错会导致 x86 正常而 ARM 下载 404
+  - Caddy 走 apt 无法干净锁版本，只报差异并提示到「AI 服务栈 → 安装」处理；
+    不在恢复流程里调 `install_caddy`，同样因为它内部会 `exit`
+
 ### Fixed
 - **误敲回车穿透多层菜单**：长任务（打包 / 备份 / 传输）执行期间用户敲的回车
   滞留 tty 输入队列，随后被菜单里连续的 `read` 逐个消费——「按回车继续」暂停

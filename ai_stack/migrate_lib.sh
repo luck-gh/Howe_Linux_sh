@@ -604,6 +604,101 @@ for s in d.get("scopes",[]):
 PY
 }
 
+# ── 原生二进制锁版本安装 ──────────────────────────────────────────
+# 现有 install_singbox / install_frp_server 都是「查 GitHub latest 后装」，
+# 且失败时调 err()（内部 exit 1）——在恢复流程里调用会直接杀掉整个脚本。
+# 这里另写一套：版本由调用方指定，失败只 warn + return 1。
+#
+# 注意 armv7l 的架构字符串两个项目不一致：
+#   frp      → arm
+#   sing-box → armv7
+# 写错会导致 x86 正常、ARM 下载 404。
+
+# $1 = 项目（singbox|frps）
+# 输出该项目对应的架构串；不支持的架构返回 1
+_mig_arch_for() {
+  local proj=$1 m; m=$(uname -m)
+  case "$proj:$m" in
+    singbox:x86_64)  echo amd64 ;;
+    singbox:aarch64) echo arm64 ;;
+    singbox:armv7l)  echo armv7 ;;
+    frps:x86_64)     echo amd64 ;;
+    frps:aarch64)    echo arm64 ;;
+    frps:armv7l)     echo arm   ;;
+    *) warn "不支持的架构：$m" >&2; return 1 ;;
+  esac
+}
+
+# 按指定版本安装 sing-box
+# $1 = 版本号（不带 v 前缀，如 1.13.16）
+mig_install_singbox_pinned() {
+  local ver=$1
+  [[ -n "$ver" ]] || { warn "未指定 sing-box 版本"; return 1; }
+  local arch; arch=$(_mig_arch_for singbox) || return 1
+
+  local tmp; tmp=$(mktemp -d /tmp/howe-mig-sb.XXXXXX) || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  local url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}.tar.gz"
+  info "下载 sing-box v${ver}（${arch}）..."
+  wget -qO "$tmp/sb.tar.gz" "$url" || { warn "下载失败：$url"; return 1; }
+  tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || { warn "解压失败"; return 1; }
+
+  local bin="$tmp/sing-box-${ver}-linux-${arch}/sing-box"
+  [[ -f "$bin" ]] || { warn "包内未找到 sing-box 二进制"; return 1; }
+  install -m 755 "$bin" "${SINGBOX_BIN:-/usr/local/bin/sing-box}" \
+    || { warn "安装失败（权限或路径问题）"; return 1; }
+  log "sing-box 已装到 v${ver}"
+}
+
+# 按指定版本安装 frps
+# $1 = 版本号（不带 v 前缀，如 0.68.1）
+mig_install_frps_pinned() {
+  local ver=$1
+  [[ -n "$ver" ]] || { warn "未指定 frps 版本"; return 1; }
+  local arch; arch=$(_mig_arch_for frps) || return 1
+
+  local tmp; tmp=$(mktemp -d /tmp/howe-mig-frp.XXXXXX) || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  local dir="frp_${ver}_linux_${arch}"
+  local url="https://github.com/fatedier/frp/releases/download/v${ver}/${dir}.tar.gz"
+  info "下载 frp v${ver}（${arch}）..."
+  wget -qO "$tmp/frp.tar.gz" "$url" || { warn "下载失败：$url"; return 1; }
+  tar -xzf "$tmp/frp.tar.gz" -C "$tmp" || { warn "解压失败"; return 1; }
+
+  local bin="$tmp/${dir}/frps"
+  [[ -f "$bin" ]] || { warn "包内未找到 frps 二进制"; return 1; }
+  install -m 755 "$bin" /usr/local/bin/frps \
+    || { warn "安装失败（权限或路径问题）"; return 1; }
+  log "frps 已装到 v${ver}"
+}
+
+# 读取本机某工具的当前版本（未安装则输出空）
+# $1 = caddy|sing-box|frps|docker
+mig_local_tool_version() {
+  case "$1" in
+    caddy)
+      command -v caddy >/dev/null 2>&1 || return 0
+      caddy version 2>/dev/null | awk 'NR==1{print $1}' | tr -d 'v'
+      ;;
+    sing-box)
+      command -v sing-box >/dev/null 2>&1 || return 0
+      sing-box version 2>/dev/null | awk '/version/{print $NF; exit}'
+      ;;
+    frps)
+      command -v frps >/dev/null 2>&1 || return 0
+      frps --version 2>/dev/null | awk '{print $NF; exit}'
+      ;;
+    docker)
+      command -v docker >/dev/null 2>&1 || return 0
+      docker --version 2>/dev/null | awk '{print $3}' | tr -d ','
+      ;;
+  esac
+}
+
 # ── 镜像版本对账 ──────────────────────────────────────────────────
 # 读 docker-images.lock.json，逐镜像对比新机现状，让用户决定版本取向。
 #

@@ -415,6 +415,200 @@ except Exception: pass
   done
 }
 
+# ── 恢复前置：运行环境就位 ────────────────────────────────────────
+# 正确的恢复顺序是「先有运行环境，再落数据」：
+#   ① Docker 存在（ai-pg 恢复要求 ai-db 容器在跑，没 docker 直接失败）
+#   ② 原生二进制到位且版本可控（sing-box 配置与版本强相关）
+#   ③ 才解压数据到目标位置
+# 原先直接进第 ③ 步，所以新机没装 docker 时 ai-pg 必然失败，用户还得自己
+# 从「ai-db 容器未运行」这条信息倒推出根因。
+#
+# $1 = 备份点目录（含 host-inventory.json）
+# 返回 0 = 可继续恢复；1 = 用户选择中止
+_mig_preflight_tools() {
+  local bp_dir=$1
+  local inv="$bp_dir/host-inventory.json"
+
+  section "恢复前置检查"
+
+  # 判断这个 bundle 是否需要容器运行时
+  local needs_docker=0
+  [[ -f "$bp_dir/ai-config.tar.gz" || -f "$bp_dir/ai-pg.tar.gz" \
+     || -f "$bp_dir/ai-data.tar.gz" || -f "$bp_dir/docker-images.tar.gz" ]] \
+    && needs_docker=1
+
+  # ── ① Docker ──
+  local docker_want=""
+  [[ -f "$inv" ]] && command -v python3 >/dev/null 2>&1 && \
+    docker_want=$(python3 -c "
+import json,sys
+try: print(json.load(open(sys.argv[1])).get('docker_version','') or '')
+except Exception: pass
+" "$inv" 2>/dev/null)
+
+  local docker_have; docker_have=$(mig_local_tool_version docker)
+
+  if (( needs_docker )); then
+    if [[ -z "$docker_have" ]]; then
+      warn "本机未安装 Docker，但此 bundle 含容器化服务"
+      echo -e "  ${DIM}不装 Docker 的话：ai-pg 无法恢复（需 ai-db 容器在跑），"
+      echo -e "  ai-config / ai-data 恢复后也无法启动${N}"
+      echo ""
+      local yn
+      askyn yn "现在安装 Docker（官方脚本，装最新版）？" y
+      if $yn; then
+        info "安装 Docker（可能需要几分钟）..."
+        if curl -fsSL "${URL_DOCKER_OFFICIAL:-https://get.docker.com}" | bash -s -- --quiet; then
+          log "Docker 已安装：$(mig_local_tool_version docker)"
+          systemctl enable --now docker >/dev/null 2>&1 || true
+        else
+          warn "Docker 安装失败"
+          local yn2; askyn yn2 "仍要继续恢复（容器相关 scope 会失败）？" n
+          $yn2 || { info "已中止恢复"; return 1; }
+        fi
+      else
+        local yn3; askyn yn3 "跳过安装，继续恢复（容器相关 scope 会失败）？" n
+        $yn3 || { info "已中止恢复"; return 1; }
+      fi
+    else
+      # 已装：只报差异，不动它。Docker 官方脚本无版本参数，硬降级风险大
+      if [[ -n "$docker_want" && "$docker_want" != "$docker_have" ]]; then
+        info "Docker 本机 ${docker_have}，旧机 ${docker_want}（版本差异通常无影响，不改动）"
+      else
+        log "Docker ${docker_have} 就绪"
+      fi
+    fi
+  fi
+
+  # ── ② 原生二进制版本对账 ──
+  [[ -f "$inv" ]] || { info "备份点无环境清单，跳过二进制对账"; return 0; }
+  command -v python3 >/dev/null 2>&1 || { info "无 python3，跳过二进制对账"; return 0; }
+
+  # 读 native_versions：每行 key|want
+  local -a rows=()
+  mapfile -t rows < <(python3 -c "
+import json,sys
+try: nv=json.load(open(sys.argv[1])).get('native_versions',{}) or {}
+except Exception: nv={}
+for k in ('caddy','sing_box','frps'):
+    v=nv.get(k) or ''
+    if v: print(f'{k}|{v}')
+" "$inv" 2>/dev/null)
+
+  (( ${#rows[@]} == 0 )) && { info "旧机无原生二进制记录，跳过"; return 0; }
+
+  # 逐项判定状态
+  local -a t_key=() t_name=() t_want=() t_have=() t_state=() t_pin=()
+  local row
+  for row in "${rows[@]}"; do
+    local k want; IFS='|' read -r k want <<< "$row"
+    local name pinnable
+    case "$k" in
+      caddy)    name="caddy";    pinnable=0 ;;  # apt 装，无法干净锁版本
+      sing_box) name="sing-box"; pinnable=1 ;;
+      frps)     name="frps";     pinnable=1 ;;
+      *) continue ;;
+    esac
+    local have; have=$(mig_local_tool_version "$name")
+    local state
+    if [[ -z "$have" ]]; then
+      state="未安装"
+    elif [[ "$have" == "$want" ]]; then
+      state="已一致"
+    else
+      state="版本不同"
+    fi
+    t_key+=("$k"); t_name+=("$name"); t_want+=("$want")
+    t_have+=("$have"); t_state+=("$state"); t_pin+=("$pinnable")
+  done
+
+  (( ${#t_name[@]} == 0 )) && return 0
+
+  echo ""
+  printf "  %-12s %-12s %-12s %s\n" "工具" "旧机版本" "本机版本" "状态"
+  echo -e "  ${DIM}────────────────────────────────────────────────────────${N}"
+  local i need_action=0
+  for i in "${!t_name[@]}"; do
+    local sc="${t_state[$i]}" col="$N"
+    case "$sc" in
+      已一致)   col="$G" ;;
+      版本不同) col="$Y"; need_action=1 ;;
+      未安装)   col="$C"; need_action=1 ;;
+    esac
+    local pad=$(( 8 - ${#sc} * 2 )); (( pad < 1 )) && pad=1
+    # 备注段用 %b 而非 %s：DIM/N 存的是字面 \033[..m，%s 不会解释
+    local note=""
+    (( t_pin[i] == 0 )) && note="  ${DIM}(apt 管理，不锁版本)${N}"
+    printf "  %-12s %-12s %-12s ${col}%s${N}%*s%b\n" \
+      "${t_name[$i]}" "${t_want[$i]}" "${t_have[$i]:-—}" "$sc" "$pad" "" "$note"
+  done
+
+  if (( ! need_action )); then
+    echo ""
+    log "原生二进制均与旧机一致"
+    return 0
+  fi
+
+  echo ""
+  echo -e "  ${DIM}sing-box 的配置与版本相关性较强，建议对齐旧机版本；"
+  echo -e "  若你有意升级，选「保持本机」并自行验证配置兼容性${N}"
+  echo ""
+  input_choose "如何处理" \
+    "按旧机版本安装/切换（推荐，可锁版本的项）" \
+    "仅安装缺失项（已装的保持本机版本）" \
+    "全部跳过（稍后手动处理）"
+
+  local mode=$INPUT_RESULT
+  (( mode < 0 )) && { info "已跳过二进制处理"; return 0; }
+  (( mode == 2 )) && { info "已跳过二进制处理"; return 0; }
+
+  echo ""
+  for i in "${!t_name[@]}"; do
+    local name="${t_name[$i]}" want="${t_want[$i]}" have="${t_have[$i]}"
+    local state="${t_state[$i]}" pinnable="${t_pin[$i]}"
+    [[ "$state" == "已一致" ]] && continue
+    # 模式 1「仅安装缺失项」：已装的一律不动
+    (( mode == 1 )) && [[ -n "$have" ]] && {
+      info "[$name] 保持本机 ${have}"
+      continue
+    }
+    _mig_install_native "$name" "$want" "$have" "$pinnable" \
+      || warn "[$name] 处理失败，可稍后手动安装"
+  done
+  return 0
+}
+
+# 安装/切换单个原生二进制
+# $1=工具名 $2=目标版本 $3=当前版本 $4=是否可锁版本(1/0)
+_mig_install_native() {
+  local name=$1 want=$2 have=$3 pinnable=$4
+
+  if (( ! pinnable )); then
+    # caddy：apt 源装，锁版本需额外配 repo pinning，风险大于收益
+    if [[ -z "$have" ]]; then
+      # 不在此处调 install_caddy：它内部用 err()（exit 1），会杀掉恢复流程
+      warn "[$name] 本机缺失。恢复完成后请到「AI 服务栈 → 安装」装 Caddy"
+      info "  apt 源无法锁到旧机的 ${want}，装到的是当前最新版"
+    else
+      info "[$name] 本机 ${have} / 旧机 ${want}，apt 管理不锁版本，保持现状"
+    fi
+    return 0
+  fi
+
+  case "$name" in
+    sing-box)
+      [[ -n "$have" ]] && info "[$name] ${have} → ${want}（覆盖安装）"
+      mig_install_singbox_pinned "$want" || return 1
+      ;;
+    frps)
+      [[ -n "$have" ]] && info "[$name] ${have} → ${want}（覆盖安装）"
+      mig_install_frps_pinned "$want" || return 1
+      ;;
+    *)
+      warn "[$name] 无锁版本安装实现"; return 1 ;;
+  esac
+}
+
 migrate_action_pack() {
   print_header "打包迁移 bundle"
   echo -e "  ${DIM}所有传输方式（本地保存 / 推送 / 拉取）共用同一套打包逻辑${N}"
@@ -901,6 +1095,10 @@ PY
   warn "恢复将覆盖当前主机对应文件与数据库"
   local yn; askyn yn "确认执行以上 ${#restore_plan[@]} 项？" n
   $yn || { info "已取消"; return 0; }
+
+  # 前置：先让运行环境（Docker / 原生二进制）就位，再落数据。
+  # 顺序颠倒的话，ai-pg 会因为 ai-db 容器不存在而失败。
+  _mig_preflight_tools "$bk_dir" || return 0
 
   # 逐项执行
   echo ""
