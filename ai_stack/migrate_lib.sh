@@ -351,6 +351,74 @@ mig_unpack_bundle() {
 # ~/.ssh/config / 密钥 / ssh-agent。若目标机需口令登录，交由 ssh 自身
 # 交互提示。
 
+# 统一 SSH 选项：
+#   ConnectTimeout   —— 不设时地址填错要等 tcp_syn_retries 耗尽（默认约 127s）
+#                       才失败，期间无任何输出，表现为「卡住然后莫名退出」
+#   ServerAlive*     —— 传输中途链路断掉时 30s 内失败，而不是无限挂着
+# 不加 BatchMode：目标机可能需要口令登录，要留给 ssh 交互提示
+MIG_SSH_CONNECT_TIMEOUT=10
+mig_ssh_opts() {
+  echo "-o ConnectTimeout=${MIG_SSH_CONNECT_TIMEOUT}" \
+       "-o ServerAliveInterval=15" \
+       "-o ServerAliveCountMax=2"
+}
+
+# SSH 连通性预检
+# $1 = user@host  $2 = 端口
+# 成功返回 0；失败打印分类诊断并返回 1
+# 交互提示（口令 / 首次连接确认 host key）直通 tty，不做捕获
+mig_ssh_check() {
+  local remote=$1 port=${2:-22}
+  local -a opts; read -ra opts <<< "$(mig_ssh_opts)"
+
+  # 首次连接新机时 ssh 会交互确认 host key。若 stdin 残留按键（如打包/传输
+  # 期间误敲的回车），确认提示会被空行自动答掉并判定验证失败。
+  declare -F flush_stdin >/dev/null 2>&1 && flush_stdin
+
+  info "检测 SSH 连通性：${remote}:${port}（最长 ${MIG_SSH_CONNECT_TIMEOUT}s）..." >&2
+  local errf; errf=$(mktemp /tmp/howe-sshchk.XXXXXX)
+  local rc=0
+  # stderr 收进文件用于分类诊断；口令与 host key 确认提示由 ssh 直接写 /dev/tty，
+  # 不受此重定向影响，用户照常能看到并作答
+  ssh -p "$port" "${opts[@]}" "$remote" 'exit 0' 2>"$errf" || rc=$?
+
+  local emsg; emsg=$(cat "$errf" 2>/dev/null); rm -f "$errf"
+
+  if (( rc == 0 )); then
+    log "SSH 连通" >&2
+    return 0
+  fi
+
+  # 失败才回显 ssh 原始错误，避免成功路径打印无关警告
+  [[ -n "$emsg" ]] && sed 's/^/  /' <<< "$emsg" >&2
+  err "SSH 无法连通 ${remote}:${port}" >&2
+  case "$emsg" in
+    *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION HAS CHANGED"*)
+      # known_hosts 里 22 端口存裸主机名，非标端口存 [host]:port
+      local _h="${remote##*@}" _kh
+      [[ "$port" == "22" ]] && _kh="$_h" || _kh="[${_h}]:${port}"
+      echo -e "  ${Y}host key 校验失败${N}（新机首连或对端重装过系统）" >&2
+      echo -e "  ${DIM}先手工连一次并输入 yes 确认指纹：${N}" >&2
+      echo -e "  ${DIM}  ssh -p ${port} ${remote}${N}" >&2
+      echo -e "  ${DIM}若对端重装过，需先删旧记录：ssh-keygen -R '${_kh}'${N}" >&2
+      ;;
+    *"Connection timed out"*|*"No route to host"*|*"Network is unreachable"*)
+      echo -e "  ${DIM}网络不可达：地址写错、防火墙拦截、或对端未放行该端口${N}" >&2
+      ;;
+    *"Connection refused"*)
+      echo -e "  ${DIM}端口拒绝连接：对端 sshd 未运行，或 SSH 端口不是 ${port}${N}" >&2
+      ;;
+    *"Permission denied"*)
+      echo -e "  ${DIM}认证失败：密钥未授权到对端，或用户名不对${N}" >&2
+      ;;
+    *)
+      echo -e "  ${DIM}ssh 退出码 $rc${N}" >&2
+      ;;
+  esac
+  echo -e "  ${DIM}可先在命令行自行验证：ssh -p ${port} ${remote}${N}" >&2
+  return 1
+}
+
 # rsync 推送本机 bundle 到远端
 # $1 = 本地 bundle 完整路径
 # $2 = ssh 目标（user@host）
@@ -359,11 +427,14 @@ mig_unpack_bundle() {
 mig_rsync_push() {
   local local_path=$1 remote=$2 remote_dir=$3 port=${4:-22}
   mig_ensure_dep rsync || return 1
+  local sshopts; sshopts=$(mig_ssh_opts)
+  local -a opts; read -ra opts <<< "$sshopts"
   # 建远端目录 + 同步 bundle 与 sha256
-  ssh -p "$port" "$remote" "mkdir -p '$remote_dir' && chmod 0700 '$remote_dir'" || {
-    err "ssh 无法连通 $remote:$port" >&2; return 1
+  ssh -p "$port" "${opts[@]}" "$remote" \
+      "mkdir -p '$remote_dir' && chmod 0700 '$remote_dir'" || {
+    err "无法在 $remote:$remote_dir 创建目录（检查路径权限）" >&2; return 1
   }
-  rsync -e "ssh -p $port" -av --partial --progress \
+  rsync -e "ssh -p $port $sshopts" -av --partial --progress \
         "$local_path" "$local_path.sha256" \
         "$remote:$remote_dir/" || {
     err "rsync 推送失败" >&2; return 1
@@ -381,7 +452,8 @@ mig_rsync_pull() {
   mig_ensure_dep rsync || return 1
   local_dir=${local_dir:-$(migrate_root)}
   mkdir -p "$local_dir" && chmod 0700 "$local_dir"
-  rsync -e "ssh -p $port" -av --partial --progress \
+  local sshopts; sshopts=$(mig_ssh_opts)
+  rsync -e "ssh -p $port $sshopts" -av --partial --progress \
         "$remote:$remote_path" "$remote:$remote_path.sha256" \
         "$local_dir/" >&2 || {
     err "rsync 拉取失败" >&2; return 1
@@ -530,6 +602,239 @@ for s in d.get("scopes",[]):
     cp = json.dumps(s.get("custom_paths",[]), ensure_ascii=False)
     print(f"{s['scope']}|{s['file']}|{s.get('size',0)}|{s.get('description','')}|{s.get('pack_strategy','')}|{strats}|{cp}")
 PY
+}
+
+# ── 镜像版本对账 ──────────────────────────────────────────────────
+# 读 docker-images.lock.json，逐镜像对比新机现状，让用户决定版本取向。
+#
+# 之所以必须做这一步：compose 里 :latest / :main 这类可变 tag 直接
+# `docker compose up -d` 拉到的是「此刻的 latest」，不是旧机当时在跑的版本。
+# 锁文件记了 RepoDigest（不可变），据此可精确还原。
+#
+# 落地手法：按 digest 拉取 → retag 回原 tag。retag 是零成本别名（同一
+# image ID），且 compose 默认 pull_policy=missing，本地已有该 tag 就不会
+# 再去拉 latest，因此无需改写用户的 docker-compose.yml。
+
+# 判断本地是否已有该 digest 对应的镜像
+# $1 = digest 引用（repo@sha256:...）
+_mig_img_has_digest() {
+  local dref=$1
+  [[ -n "$dref" ]] || return 1
+  local want="${dref##*@}"
+  [[ -n "$want" ]] || return 1
+  # 用 --digests 直接列出所有镜像的 digest，避免把镜像 ID 全部展开成 argv
+  docker images --digests --format '{{.Digest}}' 2>/dev/null | grep -qF "$want"
+}
+
+# 取本地某 tag 当前指向的 digest（无则空）
+_mig_img_local_digest() {
+  local ref=$1
+  docker image inspect "$ref" --format \
+    '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' 2>/dev/null | head -1
+}
+
+# 主对账入口
+# $1 = 备份点目录（含 docker-images.lock.json）
+# 返回 0 表示流程正常结束（含用户取消）
+mig_reconcile_images() {
+  local bp_dir=$1
+  local lock="$bp_dir/docker-images.lock.json"
+
+  [[ -f "$lock" ]] || { info "备份点无镜像版本锁，跳过镜像对账"; return 0; }
+  command -v docker >/dev/null 2>&1 || { warn "本机无 docker，跳过镜像对账"; return 0; }
+  docker info >/dev/null 2>&1 || { warn "docker 未运行，跳过镜像对账"; return 0; }
+  command -v python3 >/dev/null 2>&1 || { warn "无 python3，无法解析镜像锁"; return 0; }
+
+  # 读锁文件：每行 service|ref|digest|tag|mutable|created
+  local -a rows=()
+  mapfile -t rows < <(python3 - "$lock" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+for i in d.get("images", []):
+    print("|".join([
+        i.get("service", "") or i.get("container", ""),
+        i.get("ref", ""),
+        i.get("digest", ""),
+        i.get("tag", ""),
+        "1" if i.get("mutable_tag") else "0",
+        (i.get("created", "") or "")[:10],
+    ]))
+PY
+  )
+  (( ${#rows[@]} == 0 )) && { info "镜像锁内无记录，跳过"; return 0; }
+
+  section "镜像版本对账"
+  echo -e "  ${DIM}锁文件记录了旧机运行时的精确镜像版本（digest）${N}"
+  echo ""
+
+  # 逐条判定状态，生成候选策略
+  local -a m_svc=() m_ref=() m_dg=() m_state=() m_ids=() m_labels=() m_cur=()
+  local row
+  for row in "${rows[@]}"; do
+    local svc ref dg tag mut created
+    IFS='|' read -r svc ref dg tag mut created <<< "$row"
+    [[ -n "$ref" ]] || continue
+
+    local local_dg; local_dg=$(_mig_img_local_digest "$ref")
+    local state ids labels
+
+    if [[ -z "$dg" ]]; then
+      # 旧机侧没有 digest（本地构建镜像等），只能按 tag 拉
+      state="无digest"
+      ids="pull_tag skip"
+      labels="按 tag 拉取（无法锁版本）"$'\x1f'"跳过"
+    elif [[ -n "$local_dg" && "${local_dg##*@}" == "${dg##*@}" ]]; then
+      state="已一致"
+      ids="keep pull_tag"
+      labels="保持现状（版本已匹配）"$'\x1f'"改拉 tag 最新版"
+    elif [[ -n "$local_dg" ]]; then
+      # 本机已有同 tag 但 digest 不同 —— 版本不一致，需用户决定
+      state="版本不同"
+      ids="pin pull_tag keep"
+      labels="用 bundle 版本（回退/对齐）"$'\x1f'"拉 tag 最新版（更新）"$'\x1f'"保持本机现状"
+    elif _mig_img_has_digest "$dg"; then
+      state="缺tag"
+      ids="pin pull_tag"
+      labels="用 bundle 版本并打 tag"$'\x1f'"按 tag 重新拉取"
+    else
+      state="未安装"
+      ids="pin pull_tag skip"
+      labels="拉 bundle 版本（推荐）"$'\x1f'"拉 tag 最新版"$'\x1f'"跳过"
+    fi
+
+    m_svc+=("$svc"); m_ref+=("$ref"); m_dg+=("$dg")
+    m_state+=("$state"); m_ids+=("$ids"); m_labels+=("$labels"); m_cur+=(0)
+  done
+
+  (( ${#m_svc[@]} == 0 )) && return 0
+
+  # 交互：一屏切换
+  local _msg=""
+  while true; do
+    echo ""
+    printf "  %-4s %-14s %-30s %-10s %s\n" "" "SERVICE" "IMAGE" "状态" "将执行"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────${N}"
+    local n=0 z
+    for z in "${!m_svc[@]}"; do
+      n=$((n + 1))
+      local -a _ids=() _labs=()
+      read -ra _ids <<< "${m_ids[$z]}"
+      IFS=$'\x1f' read -ra _labs <<< "${m_labels[$z]}"
+      local cur=${m_cur[$z]}
+      local sc="${m_state[$z]}" scol="$N"
+      case "$sc" in
+        已一致)   scol="$G" ;;
+        版本不同) scol="$Y" ;;
+        未安装)   scol="$C" ;;
+        无digest) scol="$Y" ;;
+        缺tag)    scol="$C" ;;
+      esac
+      # 中文占 2 个显示宽度但 printf 按字符数计，故状态列手工补空格对齐
+      local pad=$(( 10 - ${#sc} * 2 )); (( pad < 1 )) && pad=1
+      printf "  %2d.  %-14s %-30s ${scol}%s${N}%*s %s\n" \
+        "$n" "${m_svc[$z]:0:14}" "${m_ref[$z]:0:30}" "$sc" "$pad" "" "${_labs[$cur]}"
+    done
+    echo ""
+    echo -e "  ${DIM}输入编号切换该项 | a=全部用 bundle 版本 | t=全部拉最新 | 回车执行 | q 跳过${N}"
+    [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; }
+
+    local _in; read -erp "  选择: " _in
+    [[ -z "$_in" ]] && break
+    case "${_in,,}" in
+      q|quit) info "已跳过镜像对账"; return 0 ;;
+      a)
+        # 对齐到 bundle 版本：已一致的项本就是 bundle 版本，keep 即达成目标，
+        # 不存在 pin 候选也属正常，如实统计避免「按了没反应」的错觉
+        local changed=0 already=0
+        for z in "${!m_svc[@]}"; do
+          local -a _ids=(); read -ra _ids <<< "${m_ids[$z]}"
+          local k hit=-1
+          for k in "${!_ids[@]}"; do
+            [[ "${_ids[$k]}" == "pin" ]] && { hit=$k; break; }
+          done
+          if (( hit >= 0 )); then
+            (( m_cur[z] != hit )) && changed=$((changed + 1))
+            m_cur[$z]=$hit
+          else
+            # 无 pin 候选：已一致（keep 就是 bundle 版本）或无 digest 可锁
+            [[ "${m_state[$z]}" == "已一致" ]] && already=$((already + 1))
+          fi
+        done
+        _msg="已对齐 bundle 版本：${changed} 项调整"
+        (( already > 0 )) && _msg+="，${already} 项本就一致"
+        ;;
+      t)
+        for z in "${!m_svc[@]}"; do
+          local -a _ids=(); read -ra _ids <<< "${m_ids[$z]}"
+          local k
+          for k in "${!_ids[@]}"; do
+            [[ "${_ids[$k]}" == "pull_tag" ]] && { m_cur[$z]=$k; break; }
+          done
+        done
+        _msg="已全部切为拉取 tag 最新版"
+        ;;
+      *)
+        if [[ "$_in" =~ ^[0-9]+$ ]] && (( _in >= 1 && _in <= ${#m_svc[@]} )); then
+          z=$((_in - 1))
+          local -a _ids=(); read -ra _ids <<< "${m_ids[$z]}"
+          m_cur[$z]=$(( (m_cur[z] + 1) % ${#_ids[@]} ))
+        else
+          _msg="无效输入：$_in"
+        fi
+        ;;
+    esac
+  done
+
+  # 执行
+  echo ""
+  local ok=0 fail=0 skipped=0 z
+  for z in "${!m_svc[@]}"; do
+    local -a _ids=(); read -ra _ids <<< "${m_ids[$z]}"
+    local act="${_ids[${m_cur[$z]}]}"
+    local ref="${m_ref[$z]}" dg="${m_dg[$z]}" svc="${m_svc[$z]}"
+
+    case "$act" in
+      keep|skip)
+        skipped=$((skipped + 1))
+        ;;
+      pin)
+        # 本地已有该 digest 时直接 retag：docker pull 即便命中本地也会联网
+        # 校验，离网环境会无谓失败
+        if _mig_img_has_digest "$dg"; then
+          info "[$svc] 本地已有该版本，直接打 tag"
+        else
+          info "[$svc] 拉取 bundle 版本 ${dg##*@}"
+          if ! docker pull "$dg" >/dev/null 2>&1; then
+            warn "  ✗ $dg 拉取失败（镜像可能已从仓库删除）"
+            fail=$((fail + 1))
+            continue
+          fi
+        fi
+        # retag 回 compose 里写的 tag，使 compose 无需改写即命中该版本
+        if docker tag "$dg" "$ref" 2>/dev/null; then
+          log "  ✓ $ref → ${dg##*@}"
+          ok=$((ok + 1))
+        else
+          warn "  ✗ $ref retag 失败"
+          fail=$((fail + 1))
+        fi
+        ;;
+      pull_tag)
+        info "[$svc] 拉取 $ref 最新版"
+        if docker pull "$ref" >/dev/null 2>&1; then
+          log "  ✓ $ref"
+          ok=$((ok + 1))
+        else
+          warn "  ✗ $ref 拉取失败"
+          fail=$((fail + 1))
+        fi
+        ;;
+    esac
+  done
+
+  echo ""
+  echo -e "  ${W}镜像对账完成${N}：${G}${ok} 成功${N} / ${R}${fail} 失败${N} / ${DIM}${skipped} 保持不变${N}"
+  return 0
 }
 
 # ── 策略执行器 ────────────────────────────────────────────────────

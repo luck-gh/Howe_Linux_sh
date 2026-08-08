@@ -7,6 +7,60 @@
 
 ## [Unreleased]
 
+### Fixed
+- **误敲回车穿透多层菜单**：长任务（打包 / 备份 / 传输）执行期间用户敲的回车
+  滞留 tty 输入队列，随后被菜单里连续的 `read` 逐个消费——「按回车继续」暂停
+  失效、`print_header` 的 `clear` 冲掉执行结果、菜单自行退回上层。表现为打包
+  成功后一闪回到顶层主菜单，看不到 bundle 路径。
+  - 新增 `flush_stdin`（`lib/utils.sh`）丢弃缓冲按键，长任务返回后调用
+  - `migrate_menu` 的 `0|*) break` 拆分：仅显式 `0` 退出，空输入与无效输入
+    留在菜单（原写法让任何无效输入都等于退出，是穿透的最后一环）
+- **SSH 推送/拉取卡死无提示**：`ssh` 未设 `ConnectTimeout`，地址或端口填错要
+  等 `tcp_syn_retries` 耗尽（默认约 127 秒）才失败，期间零输出，看起来像
+  「卡住后莫名退出」。
+  - 新增 `mig_ssh_opts`：统一 `ConnectTimeout=10` + `ServerAliveInterval=15`
+    / `ServerAliveCountMax=2`（后者管传输中途断链，30s 内失败而非无限挂着）
+  - 新增 `mig_ssh_check`：传输前预检，按 ssh stderr 分类诊断 host key 校验
+    失败（附 `ssh-keygen -R` 命令，按端口给出 known_hosts 的正确格式）/
+    网络不可达 / 端口拒绝 / 认证失败
+  - 首连新机时 host key 确认提示会被 stdin 残留回车自动答掉，预检前先 flush
+- **恢复策略逐项弹窗**：选中 N 个 scope 后要连点 N 次单选框。根因是每个
+  scope 的候选策略都含 `skip`，让「只剩一个策略就免问」的判断永远不成立——
+  而选中 scope 本身已表达「不跳过」，`skip` 是冗余项。
+  - 剔除 `skip` 候选后，多数 scope 只剩单一策略，直接采用不再打扰
+  - 改为一屏展示完整恢复计划，只有存在真实分支的项（`docker-images` save 模式
+    的 load/pull、`custom` 的原路径/前缀目录）可输编号切换
+- **手动 scp 漏传校验和**：原提示只给 bundle 本身，遗漏同名 `.sha256`，
+  导致新机解包时跳过完整性校验。现给出通配两文件的完整命令。
+
+### Added
+- **镜像版本锁 `docker-images.lock.json`**：每次 `backup_create` 都写，与是否
+  勾选 `docker-images` scope 无关。
+  - 动机：compose 里大量使用 `:latest` / `:main` 等可变 tag（本项目的
+    new-api / 9router / open-webui / litellm 均是），新机 `docker compose up -d`
+    拉到的是「此刻的 latest」而非旧机当时实际运行的版本，迁移后版本漂移。
+    仅靠 tag 字面量无法还原。
+  - 记录每个运行容器镜像的 compose service、镜像引用、`RepoDigest`（不可变）、
+    image ID、构建时间，并标记 tag 是否可变
+- **恢复时镜像版本对账 `mig_reconcile_images`**：恢复 `ai-config` 后自动触发，
+  逐镜像对比新机现状并让用户决定版本取向。
+  - 状态判定：已一致 / 版本不同 / 未安装 / 缺 tag（本地有该 digest 但未打 tag）
+    / 无 digest（本地构建镜像，无法锁定）
+  - 可选动作覆盖新装、回退、更新、保持四种诉求；支持 `a` 全部对齐 bundle 版本、
+    `t` 全部拉 tag 最新版、输编号单项切换
+  - 落地手法：按 digest 拉取后 `docker tag` 回 compose 里写的 tag。retag 是
+    零成本别名（同一 image ID），且 compose 默认 `pull_policy=missing`，本地
+    已有该 tag 就不会再拉 latest —— 因此无需改写用户的 docker-compose.yml
+  - 本地已有目标 digest 时跳过 `docker pull` 直接 retag（pull 即便命中本地也会
+    联网校验，离网环境会无谓失败）
+  - 镜像就位后询问是否 `docker compose up -d`
+- **打包前补齐清单与镜像锁**：仅选 `docker-images`/`custom`（不走 `backup_create`）、
+  复用本功能上线前创建的旧备份点、`backup_create` 当时 docker 不可用——这三种
+  路径原本都不会生成 `host-inventory.json` 与镜像锁，现于打包前检测补写。
+- **传递阶段明示落地路径**：传递菜单顶部直接标出新机必须放置 bundle 的目录，
+  「无 bundle」提示也改为可操作（给出目录、命名规则与现成 scp 命令），
+  不必等点进恢复才发现路径不对。
+
 ### Changed
 - **备份进度显示**：`backup_create` 逐 scope 显示 `[i/N]` + spinner（tty）
   或阶段行（非 tty / 定时任务），完成后汇总"X 成功 / Y 失败 / 总耗时 / 合计大小"。

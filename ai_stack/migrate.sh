@@ -106,9 +106,18 @@ _mig_maybe_create_backup() {
 _mig_pick_bundle() {
   MIG_BUNDLE_PATH=""
   local -a lines=()
+  local mroot; mroot=$(migrate_root)
   mapfile -t lines < <(mig_list_bundles)
   if (( ${#lines[@]} == 0 )); then
-    warn "本机 $(migrate_root) 下无 bundle"
+    warn "$mroot 下没有找到 bundle"
+    echo ""
+    echo -e "  ${W}bundle 需要放在：${N}${mroot}/"
+    echo -e "  ${DIM}识别规则：文件名以 migrate- 开头，扩展名为 .tar / .tar.enc / .tar.age${N}"
+    echo ""
+    echo -e "  ${W}从旧机传过来（在旧机执行）：${N}"
+    echo "    scp /var/backups/howe-migrate/migrate-*.tar* root@$(hostname -I 2>/dev/null | awk '{print $1}'):${mroot}/"
+    echo ""
+    echo -e "  ${DIM}或用菜单 3「从旧机拉取」自动完成${N}"
     return 1
   fi
   local -a labels=() paths=()
@@ -345,6 +354,13 @@ migrate_action_pack() {
     echo '{"timestamp":"'"$bk_ts"'","scopes_ok":[],"scopes_fail":[]}' > "$bk_dir/manifest.json"
   fi
 
+  # 补齐环境清单与镜像版本锁。三条路径都要覆盖：
+  #   仅选 docker-images/custom（未走 backup_create）、复用旧备份点（可能是
+  #   本功能上线前创建的）、以及 backup_create 当时 docker 不可用的情况。
+  # 缺了镜像锁，新机就无法按旧机的确切版本拉镜像。
+  [[ -f "$bk_dir/host-inventory.json" ]]      || _bk_write_inventory  "$bk_dir" >&2 || true
+  [[ -f "$bk_dir/docker-images.lock.json" ]]  || _bk_write_image_lock "$bk_dir" >&2 || true
+
   # 4) 特殊 scope 打入备份点目录
   local -a packed_scopes=()
   mapfile -t packed_scopes < <(backup_point_scopes "$bk_ts" 2>/dev/null || true)
@@ -409,6 +425,12 @@ migrate_action_transfer() {
   fi
   local size; size=$(stat -c '%s' "$bundle" 2>/dev/null || echo 0)
   echo -e "  ${W}bundle：${N}$(basename "$bundle")  $(_bk_human "$size")"
+  echo -e "  ${W}本机路径：${N}$bundle"
+  echo ""
+  # 提前点明新机的落地目录：三种方式最终都要求 bundle 出现在这里，
+  # 否则新机「③ 解包恢复」扫不到文件
+  echo -e "  ${Y}新机必须把 bundle 放到：${N}$(migrate_root)/"
+  echo -e "  ${DIM}（该目录不存在时新机会自动创建；放别处则解包菜单列不出来）${N}"
   echo ""
 
   input_choose "选择传递方式" \
@@ -419,12 +441,33 @@ migrate_action_transfer() {
   case $INPUT_RESULT in
     0)  # 推送：旧机 → 新机
       local ruser rhost rport rdir
+      echo ""
+      echo -e "  ${DIM}任一项留空可中止；全部填完后会先显示汇总再确认${N}"
       ask ruser "新机 SSH 用户名" "root"
+      [[ -z "$ruser" ]] && { info "已取消"; return 0; }
       ask rhost "新机地址（IP 或域名）" ""
-      [[ -z "$rhost" ]] && { err "地址为空"; return 1; }
+      [[ -z "$rhost" ]] && { info "已取消"; return 0; }
       ask rport "SSH 端口" "22"
+      [[ -z "$rport" ]] && { info "已取消"; return 0; }
       ask rdir  "新机存放目录" "$(migrate_root)"
+      [[ -z "$rdir" ]] && { info "已取消"; return 0; }
+
+      # 汇总确认：填错信息时不必等 SSH 超时才发现
+      echo ""
+      echo -e "  ${W}请核对推送信息${N}"
+      echo -e "  ${DIM}────────────────────────────────${N}"
+      echo -e "    bundle    $(basename "$bundle")  $(_bk_human "$size")"
+      echo -e "    目标      ${ruser}@${rhost}:${rport}"
+      echo -e "    存放目录  ${rdir}"
+      echo ""
+      local yn2; askyn yn2 "信息正确，开始推送？" y
+      $yn2 || { info "已取消，bundle 保留本地：$bundle"; return 0; }
+
       mig_ensure_dep rsync || return 1
+      # 先预检连通性：避免 rsync 阶段无输出干等
+      mig_ssh_check "${ruser}@${rhost}" "$rport" || {
+        err "推送中止，bundle 保留本地：$bundle"; return 1
+      }
       info "推送中..."
       mig_rsync_push "$bundle" "${ruser}@${rhost}" "$rdir" "$rport" \
         && log "推送完成 → ${rhost}:${rdir}/$(basename "$bundle")" \
@@ -439,15 +482,26 @@ migrate_action_transfer() {
       echo "  3. 输入旧机 SSH 信息"
       ;;
     2)  # 手动中转：给出 scp 命令
+      local _mroot; _mroot=$(migrate_root)
+      local _bname; _bname=$(basename "$bundle")
       echo ""
-      echo -e "  ${W}下载到本地（在你的本地机器执行）：${N}"
-      echo "    scp root@<旧机IP>:${bundle} ./"
+      echo -e "  ${W}要传输 2 个文件${N}（.sha256 是校验和，不传则新机跳过完整性校验）"
+      echo -e "  ${DIM}────────────────────────────────${N}"
+      echo "    ${bundle}"
+      echo "    ${bundle}.sha256"
       echo ""
-      echo -e "  ${W}上传到新机：${N}"
-      echo "    scp $(basename "$bundle") root@<新机IP>:$(migrate_root)/"
+      echo -e "  ${W}① 下载到本地（在你自己的电脑执行）：${N}"
+      echo "    scp -P 22 'root@<旧机IP>:${bundle}*' ./"
       echo ""
-      echo -e "  ${DIM}如果旧机有固定域名，直接在本地操作：${N}"
-      echo "    scp root@<旧机>:${bundle} root@<新机>:$(migrate_root)/"
+      echo -e "  ${W}② 上传到新机：${N}"
+      echo "    ssh root@<新机IP> 'mkdir -p ${_mroot}'"
+      echo "    scp -P 22 ${_bname}* root@<新机IP>:${_mroot}/"
+      echo ""
+      echo -e "  ${DIM}两端都有公网直连时，可跳过本地中转：${N}"
+      echo "    scp -3 'root@<旧机>:${bundle}*' 'root@<新机>:${_mroot}/'"
+      echo ""
+      echo -e "  ${Y}注意：新机的目标目录必须是 ${_mroot}/${N}"
+      echo -e "  ${DIM}放到别处，新机「③ 解包恢复」会提示无 bundle${N}"
       echo ""
       info "传输完成后，在新机菜单 → ③ 解包恢复"
       ;;
@@ -462,17 +516,34 @@ migrate_action_pull_from_old() {
   print_header "从旧机拉取 bundle（新机操作）"
 
   local remote_user remote_host remote_port remote_path
+  echo ""
+  echo -e "  ${DIM}任一项留空可中止；填完后会先显示汇总再确认${N}"
   ask remote_user "旧机 SSH 用户名" "root"
+  [[ -z "$remote_user" ]] && { info "已取消"; return 0; }
   ask remote_host "旧机地址（IP 或域名）" ""
-  [[ -z "$remote_host" ]] && { err "地址为空"; return 1; }
+  [[ -z "$remote_host" ]] && { info "已取消"; return 0; }
   ask remote_port "SSH 端口" "22"
+  [[ -z "$remote_port" ]] && { info "已取消"; return 0; }
+
+  echo ""
+  echo -e "  ${W}请核对旧机信息${N}"
+  echo -e "  ${DIM}────────────────────────────────${N}"
+  echo -e "    源      ${remote_user}@${remote_host}:${remote_port}"
+  echo -e "    落地到  $(migrate_root)/"
+  echo ""
+  local yn0; askyn yn0 "信息正确，开始连接？" y
+  $yn0 || { info "已取消"; return 0; }
+
+  # 预检：地址/端口错时 10s 内明确失败，不必等 TCP 超时
+  mig_ssh_check "${remote_user}@${remote_host}" "$remote_port" || return 1
 
   # 尝试列出远端可用 bundle
-  info "尝试列出旧机 $(migrate_root) 下的 bundle..."
+  info "列出旧机 $(migrate_root) 下的 bundle..."
   local remote_root
   remote_root=$(migrate_root)
+  local -a _sopts; read -ra _sopts <<< "$(mig_ssh_opts)"
   local remote_ls
-  remote_ls=$(ssh -p "$remote_port" "${remote_user}@${remote_host}" \
+  remote_ls=$(ssh -p "$remote_port" "${_sopts[@]}" "${remote_user}@${remote_host}" \
               "ls -1t ${remote_root}/migrate-*.tar ${remote_root}/migrate-*.tar.enc ${remote_root}/migrate-*.tar.age 2>/dev/null" \
               2>/dev/null || true)
 
@@ -603,58 +674,146 @@ print(f'  包含 {len(scopes)} 个 scope，合计 {h(total)}')
   input_multi "选择要恢复的 scope（回车确认）" "${labels[@]}"
   (( ${#INPUT_RESULTS[@]} == 0 )) && { info "未选择任何 scope，取消"; return 0; }
 
-  # 每个选中 scope 选策略
-  local -a restore_plan=()
+  # 定策略。两条原则让这一步从「逐个弹窗」压缩成「一屏可改」：
+  #   1) skip 不进候选——选中 scope 本身已表达「要恢复」，再问一次是冗余，
+  #      且正是它让原来的「只剩 1 个策略就免问」判断永远不成立
+  #   2) 剔除 skip 后只剩单一策略的 scope 直接采用，不打扰用户；
+  #      只有 docker-images(save) / custom 这类存在真实分支的才需要决定
+  local -a plan_scope=() plan_ids=() plan_labels=() plan_cur=()
   local i
   for i in "${INPUT_RESULTS[@]}"; do
     local sk="${scope_names[$i]}"
-    local row="${scope_rows[$i]}"
-    local strats_json; IFS='|' read -r _ _ _ _ _ strats_json _ <<< "$row"
+    local strats_json; IFS='|' read -r _ _ _ _ _ strats_json _ <<< "${scope_rows[$i]}"
 
-    local -a strat_opts=() strat_ids=()
-    mapfile -t strat_opts < <(python3 -c "
-import json,sys
-for s in json.loads(sys.argv[1]): print(s['label'])
-" "$strats_json" 2>/dev/null)
-    mapfile -t strat_ids < <(python3 -c "
-import json,sys
-for s in json.loads(sys.argv[1]): print(s['id'])
-" "$strats_json" 2>/dev/null)
+    # 一次 python 调用同时取出 id 列表与 label 列表（label 含空格，用 \x1f 分隔）
+    local pair
+    pair=$(python3 - "$strats_json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    arr = [s for s in json.loads(sys.argv[1]) if s.get("id") != "skip"]
+except Exception:
+    arr = []
+if not arr:
+    arr = [{"id": "restore", "label": "恢复"}]
+print(" ".join(s["id"] for s in arr))
+print("\x1f".join(s.get("label", s["id"]) for s in arr))
+PY
+    )
+    local ids_line labels_line
+    ids_line=$(sed -n 1p <<< "$pair")
+    labels_line=$(sed -n 2p <<< "$pair")
+    [[ -z "$ids_line" ]] && { ids_line="restore"; labels_line="恢复"; }
 
-    if (( ${#strat_opts[@]} <= 1 )); then
-      restore_plan+=("${sk}:${strat_ids[0]:-restore}")
+    plan_scope+=("$sk")
+    plan_ids+=("$ids_line")
+    plan_labels+=("$labels_line")
+    plan_cur+=(0)
+  done
+
+  (( ${#plan_scope[@]} == 0 )) && { info "无恢复计划，取消"; return 0; }
+
+  # 一屏展示计划，仅多策略项可切换
+  local _pmsg=""
+  while true; do
+    clear
+    echo ""
+    echo -e "  ${W}恢复计划${N}"
+    echo -e "  ${DIM}输入编号切换该项策略 | 回车确认 | q 取消${N}"
+    echo ""
+    local n=0 z
+    for z in "${!plan_scope[@]}"; do
+      n=$((n + 1))
+      local -a _ids=() _labs=()
+      read -ra _ids <<< "${plan_ids[$z]}"
+      IFS=$'\x1f' read -ra _labs <<< "${plan_labels[$z]}"
+      local cur=${plan_cur[$z]}
+      if (( ${#_ids[@]} > 1 )); then
+        printf "  %2d. %-14s ${G}%s${N}  ${DIM}[%d/%d 可切换]${N}\n" \
+          "$n" "${plan_scope[$z]}" "${_labs[$cur]}" "$((cur + 1))" "${#_ids[@]}"
+      else
+        printf "  %2d. %-14s %s\n" "$n" "${plan_scope[$z]}" "${_labs[$cur]}"
+      fi
+    done
+    echo ""
+    [[ -n "$_pmsg" ]] && { echo -e "  ${Y}$_pmsg${N}"; _pmsg=""; echo ""; }
+
+    local _in; read -erp "  选择: " _in
+    [[ -z "$_in" ]] && break
+    case "${_in,,}" in
+      q|quit) info "已取消"; return 0 ;;
+    esac
+    if [[ "$_in" =~ ^[0-9]+$ ]] && (( _in >= 1 && _in <= ${#plan_scope[@]} )); then
+      z=$((_in - 1))
+      local -a _ids=()
+      read -ra _ids <<< "${plan_ids[$z]}"
+      if (( ${#_ids[@]} > 1 )); then
+        plan_cur[$z]=$(( (plan_cur[z] + 1) % ${#_ids[@]} ))
+      else
+        _pmsg="${plan_scope[$z]} 只有一种恢复方式，无需切换"
+      fi
     else
-      echo ""
-      input_choose "[$sk] 恢复策略" "${strat_opts[@]}"
-      [[ $INPUT_RESULT -lt 0 ]] && continue
-      restore_plan+=("${sk}:${strat_ids[$INPUT_RESULT]}")
+      _pmsg="无效输入：$_in（编号范围 1-${#plan_scope[@]}）"
     fi
   done
 
-  [[ ${#restore_plan[@]} -eq 0 ]] && { info "无恢复计划，取消"; return 0; }
+  # 组装最终计划
+  local -a restore_plan=()
+  for z in "${!plan_scope[@]}"; do
+    local -a _ids=()
+    read -ra _ids <<< "${plan_ids[$z]}"
+    restore_plan+=("${plan_scope[$z]}:${_ids[${plan_cur[$z]}]}")
+  done
 
-  # 展示计划 + 确认
+  # 计划仍在屏上，这里只补破坏性警告 + 显式确认
   echo ""
   warn "恢复将覆盖当前主机对应文件与数据库"
-  echo -e "  ${W}恢复计划：${N}"
-  local pair
-  for pair in "${restore_plan[@]}"; do
-    echo "    • ${pair%%:*}  →  ${pair##*:}"
-  done
-  local yn; askyn yn "确认执行？" n
+  local yn; askyn yn "确认执行以上 ${#restore_plan[@]} 项？" n
   $yn || { info "已取消"; return 0; }
 
   # 逐项执行
   echo ""
+  local pair
+  local restored_ai_config=0
   for pair in "${restore_plan[@]}"; do
     local sk="${pair%%:*}" strat="${pair##*:}"
     section "$sk → $strat"
-    mig_execute_strategy "$sk" "$strat" "$bk_dir" || warn "$sk 执行失败，继续"
+    if mig_execute_strategy "$sk" "$strat" "$bk_dir"; then
+      [[ "$sk" == "ai-config" ]] && restored_ai_config=1
+    else
+      warn "$sk 执行失败，继续"
+    fi
   done
+
+  # 镜像版本对账：恢复了 ai-config（compose 文件已就位）才有意义。
+  # docker-images scope 走自己的 pull/load 策略，这里不重复处理。
+  if (( restored_ai_config )) && [[ " ${restore_plan[*]} " != *" docker-images:"* ]]; then
+    echo ""
+    mig_reconcile_images "$bk_dir"
+    _mig_offer_compose_up
+  fi
 
   echo ""
   log "恢复流程完成"
   _mig_show_inventory "$bk_dir"
+}
+
+# 镜像就位后询问是否直接起容器
+_mig_offer_compose_up() {
+  local base="${BACKUP_AI_BASE:-/opt/ai-stack}"
+  [[ -f "$base/docker-compose.yml" ]] || return 0
+  command -v docker >/dev/null 2>&1 || return 0
+
+  echo ""
+  local yn
+  askyn yn "立即启动服务栈（docker compose up -d）？" y
+  $yn || {
+    info "稍后可手动执行：cd $base && docker compose up -d"
+    return 0
+  }
+  info "启动容器..."
+  ( cd "$base" && docker compose up -d ) \
+    && log "服务栈已启动" \
+    || warn "启动失败，可手动排查：cd $base && docker compose up -d"
 }
 
 # v1 兜底：无 manifest v2 的旧 bundle
@@ -825,7 +984,7 @@ migrate_menu() {
     echo "  0. 返回"
     echo ""
     local choice
-    read -erp "  请输入选择：" choice
+    read -erp "  请输入选择（0 返回）：" choice
     case "$choice" in
       1) migrate_action_pack ;;
       2) migrate_action_transfer ;;
@@ -834,9 +993,14 @@ migrate_menu() {
       5) migrate_action_list ;;
       6) migrate_action_delete ;;
       7) migrate_show_guide ;;
-      0|*) break ;;
+      0) break ;;
+      # 空输入 / 无效输入不退出菜单：迁移动作耗时长，期间误敲的回车会滞留
+      # stdin，若这里 break 会连带退出上层菜单并 clear 掉执行结果
+      "") continue ;;
+      *)  warn "无效选择：$choice"; sleep 1; continue ;;
     esac
     echo ""
+    flush_stdin
     read -rsp "  按回车继续..." _
     echo ""
   done

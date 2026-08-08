@@ -729,6 +729,108 @@ PY
   fi
 }
 
+# ── 镜像版本锁 docker-images.lock.json ────────────────────────────
+# 每次 backup_create 都写，与是否勾选 docker-images scope 无关。
+#
+# 为什么需要：compose 里大量用 :latest / :main 这类可变 tag（本项目的
+# new-api / 9router / open-webui / litellm 都是），新机 `docker compose
+# up -d` 拉到的是「此刻的 latest」，而不是旧机当时实际在跑的那个版本。
+# 光靠 docker_images 里的 tag 字面量无法还原版本。
+#
+# 解法：记录每个运行容器镜像的 RepoDigest（不可变）。新机按 digest 拉取，
+# 再 retag 回原 tag —— retag 是零成本别名（同一 image ID），且 compose
+# 默认 pull_policy=missing，本地已有该 tag 就不会再去拉 latest，从而在
+# 不改写用户 docker-compose.yml 的前提下锁死版本。
+_bk_write_image_lock() {
+  local dir=$1
+  local out=$dir/docker-images.lock.json
+  command -v docker >/dev/null 2>&1 || return 0
+  docker info >/dev/null 2>&1 || return 0
+
+  local tsv; tsv=$(mktemp /tmp/howe-imglock.XXXXXX)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tsv'" RETURN
+
+  local cid
+  while read -r cid; do
+    [[ -n "$cid" ]] || continue
+    # 容器侧字段：名字 / compose service / compose project / compose 里写的镜像引用 / image id
+    local cline
+    cline=$(docker inspect "$cid" --format \
+      '{{.Name}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.project"}}|{{.Config.Image}}|{{.Image}}' \
+      2>/dev/null) || continue
+    [[ -n "$cline" ]] || continue
+
+    local imgid="${cline##*|}"
+    # 镜像侧字段：RepoDigest（取第一个）/ 创建时间
+    local iline
+    iline=$(docker image inspect "$imgid" --format \
+      '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}|{{.Created}}' \
+      2>/dev/null) || iline="|"
+    printf '%s|%s\n' "$cline" "$iline" >> "$tsv"
+  done < <(docker ps -q 2>/dev/null)
+
+  [[ -s "$tsv" ]] || return 0
+
+  if command -v python3 >/dev/null 2>&1; then
+    # 数据文件走 argv 传入而非 stdin：`python3 -` 的脚本本身就占用 stdin
+    # （heredoc），再用 < 重定向喂数据会被 heredoc 覆盖，读到 0 行
+    python3 - "$out" "$(hostname)" "$tsv" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+
+out, host, tsv = sys.argv[1], sys.argv[2], sys.argv[3]
+# 可变 tag 白名单：这些 tag 指向的内容会随时间变化，迁移时必须靠 digest 锁定
+MUTABLE = {"latest", "main", "master", "stable", "edge", "dev", "nightly", "beta"}
+
+images = []
+project = ""
+with open(tsv, encoding="utf-8") as fh:
+    rows = fh.readlines()
+for raw in rows:
+    raw = raw.rstrip("\n")
+    if not raw:
+        continue
+    parts = raw.split("|")
+    if len(parts) < 7:
+        continue
+    name, svc, proj, ref, image_id, digest, created = parts[:7]
+    name = name.lstrip("/")
+    project = project or proj
+    # 解析 tag：注意 registry 可能带端口（ghcr.io:443/x），需从最后一个 / 之后找 :
+    tail = ref.rsplit("/", 1)[-1]
+    tag = tail.split(":", 1)[1] if ":" in tail else ""
+    images.append({
+        "container": name,
+        "service": svc,
+        "ref": ref,
+        "digest": digest,
+        "image_id": image_id,
+        "created": created,
+        "tag": tag or "latest",
+        "mutable_tag": (tag or "latest") in MUTABLE,
+        "pinnable": bool(digest),
+    })
+
+d = {
+    "format_version": 1,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "source_host": host,
+    "compose_project": project,
+    "images": images,
+}
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+
+mut = sum(1 for i in images if i["mutable_tag"])
+unp = sum(1 for i in images if not i["pinnable"])
+print(f"  镜像版本锁：{len(images)} 个镜像"
+      + (f"，{mut} 个用可变 tag（已按 digest 锁定）" if mut else "")
+      + (f"，{unp} 个无 digest 无法锁定" if unp else ""))
+PY
+  fi
+}
+
 # ── 顶层调度 ─────────────────────────────────────────────────────
 
 # 创建一个备份点，备份指定 scope 列表
@@ -784,6 +886,9 @@ backup_create() {
 
   # 写主机清单（新机迁移时对照用）
   _bk_write_inventory "$dir" >&2 || true
+  # 写镜像版本锁：与是否勾选 docker-images scope 无关，恢复 ai-config 后
+  # 需要它把 :latest 之类可变 tag 还原到旧机当时的实际版本
+  _bk_write_image_lock "$dir" >&2 || true
 
   # 写 manifest（note 通过 python json.dumps 安全转义；缺 python 时退化为基础转义）
   local host kernel created_iso note_json

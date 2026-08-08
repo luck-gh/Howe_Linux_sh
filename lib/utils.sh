@@ -27,6 +27,20 @@ reset_terminal() {
   stty sane 2>/dev/null || true
 }
 
+# 丢弃 stdin 中已缓冲但尚未读取的按键
+# 场景：长任务（备份 / 打包 / rsync 传输）执行期间用户误敲回车，这些按键会
+# 滞留在 tty 输入队列，随后被菜单里连续的 read 逐个消费，表现为「一次输入
+# 穿透多层菜单」——暂停不生效、clear 冲掉执行结果、菜单自己退回上层。
+# 在长任务返回后调用，可保证紧随其后的暂停/菜单 read 真的等待用户输入。
+flush_stdin() {
+  [[ -t 0 ]] || return 0
+  local _junk _i=0
+  while (( _i < 50 )) && read -rsn 4096 -t 0.05 _junk 2>/dev/null; do
+    _i=$((_i + 1))
+  done
+  return 0
+}
+
 # 操作完成，按任意键继续
 break_end() {
   reset_terminal
