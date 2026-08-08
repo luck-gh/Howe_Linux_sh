@@ -308,6 +308,113 @@ _mig_collect_passphrase() {
   return 1
 }
 
+# 按磁盘实际情况重写 manifest 的 scopes_ok / scopes_fail
+# 重试后需要同步 manifest，否则后续按 manifest 判断的地方仍看到旧状态
+_mig_resync_manifest() {
+  local bp_dir=$1
+  local mf="$bp_dir/manifest.json"
+  [[ -f "$mf" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$mf" "$bp_dir" <<'PY' 2>/dev/null
+import json, os, sys
+mf, d = sys.argv[1], sys.argv[2]
+try:
+    m = json.load(open(mf))
+except Exception:
+    sys.exit(0)
+known = set(m.get("scopes_ok", [])) | set(m.get("scopes_fail", []))
+ok, fail = [], []
+for s in sorted(known):
+    arc = os.path.join(d, f"{s}.tar.gz")
+    # .sha256 只在 scope 成功后写入，是「这个归档可用」的唯一可靠标志
+    (ok if os.path.exists(arc + ".sha256") else fail).append(s)
+m["scopes_ok"], m["scopes_fail"] = ok, fail
+json.dump(m, open(mf, "w"), ensure_ascii=False, indent=2)
+PY
+}
+
+# 打包前的失败 scope 闸门
+# $1 = 备份点目录
+# 返回 0 = 可以继续打包；1 = 用户选择中止
+#
+# 动机：scope 失败时原流程直接继续打包，残缺归档随通配符进 bundle，
+# 新机解包时校验失败导致整个恢复中止 —— 91MB 传过去全废。
+# 这里停下来让用户决定，而不是替他做主。
+_mig_gate_failed_scopes() {
+  local bp_dir=$1
+  local mf="$bp_dir/manifest.json"
+  [[ -f "$mf" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  while true; do
+    local -a failed=()
+    mapfile -t failed < <(python3 -c "
+import json,sys
+try: print('\n'.join(json.load(open(sys.argv[1])).get('scopes_fail',[])))
+except Exception: pass
+" "$mf" 2>/dev/null)
+    # 过滤空行
+    local -a f2=(); local x
+    for x in "${failed[@]}"; do [[ -n "$x" ]] && f2+=("$x"); done
+    failed=("${f2[@]}")
+
+    (( ${#failed[@]} == 0 )) && return 0
+
+    echo ""
+    warn "以下 ${#failed[@]} 个 scope 备份失败："
+    local sk
+    for sk in "${failed[@]}"; do
+      echo -e "    ${R}✗${N} $(printf '%-14s' "$sk") $(backup_scope_desc "$sk")"
+    done
+    echo ""
+    echo -e "  ${DIM}继续打包会得到不完整的 bundle：失败项不会进包，新机缺这部分数据${N}"
+    echo ""
+
+    input_choose "如何处理" \
+      "重试失败的 scope" \
+      "接受缺口，仅打包成功的 scope" \
+      "中止打包（回菜单）"
+
+    case $INPUT_RESULT in
+      0)
+        echo ""
+        local fn rc
+        for sk in "${failed[@]}"; do
+          fn="_bk_do_${sk//-/_}"
+          if ! declare -F "$fn" >/dev/null 2>&1; then
+            warn "$sk 无对应实现，跳过"
+            continue
+          fi
+          info "重试 $sk ..."
+          if "$fn" "$bp_dir" >/dev/null 2>&1; then
+            log "  ✓ $sk"
+          else
+            warn "  ✗ $sk 仍然失败"
+            # 清掉本轮可能留下的残缺归档，避免它被误认为有效
+            [[ -f "$bp_dir/$sk.tar.gz" && ! -f "$bp_dir/$sk.tar.gz.sha256" ]] \
+              && rm -f "$bp_dir/$sk.tar.gz"
+          fi
+        done
+        _mig_resync_manifest "$bp_dir"
+        # 回到循环顶部重新读 manifest：全成功则自动返回，否则再问一轮
+        ;;
+      1)
+        # 清掉所有无校验和的残缺归档，确保它们不进 bundle
+        for sk in "${failed[@]}"; do
+          [[ -f "$bp_dir/$sk.tar.gz" && ! -f "$bp_dir/$sk.tar.gz.sha256" ]] \
+            && rm -f "$bp_dir/$sk.tar.gz"
+        done
+        warn "已接受缺口，失败项不会进入 bundle"
+        return 0
+        ;;
+      *)
+        info "已中止打包"
+        return 1
+        ;;
+    esac
+  done
+}
+
 migrate_action_pack() {
   print_header "打包迁移 bundle"
   echo -e "  ${DIM}所有传输方式（本地保存 / 推送 / 拉取）共用同一套打包逻辑${N}"
@@ -353,6 +460,9 @@ migrate_action_pack() {
     mkdir -p "$bk_dir" && chmod 0700 "$bk_dir"
     echo '{"timestamp":"'"$bk_ts"'","scopes_ok":[],"scopes_fail":[]}' > "$bk_dir/manifest.json"
   fi
+
+  # 3.5) 失败 scope 闸门：有失败项时停下来问，不默默打出残缺 bundle
+  _mig_gate_failed_scopes "$bk_dir" || { unset MIG_PASSPHRASE; return 1; }
 
   # 补齐环境清单与镜像版本锁。三条路径都要覆盖：
   #   仅选 docker-images/custom（未走 backup_create）、复用旧备份点（可能是
@@ -712,49 +822,71 @@ PY
 
   (( ${#plan_scope[@]} == 0 )) && { info "无恢复计划，取消"; return 0; }
 
-  # 一屏展示计划，仅多策略项可切换
-  local _pmsg=""
-  while true; do
+  # 统计有多少项真的存在可选分支。若一项都没有，这个界面没有任何可操作
+  # 内容，展示「输入编号切换」只会误导用户去按编号、再收到「无需切换」的
+  # 无效反馈。此时直接列出计划走确认即可。
+  local switchable=0 z
+  for z in "${!plan_scope[@]}"; do
+    local -a _c=(); read -ra _c <<< "${plan_ids[$z]}"
+    (( ${#_c[@]} > 1 )) && switchable=$((switchable + 1))
+  done
+
+  if (( switchable == 0 )); then
     clear
     echo ""
-    echo -e "  ${W}恢复计划${N}"
-    echo -e "  ${DIM}输入编号切换该项策略 | 回车确认 | q 取消${N}"
+    echo -e "  ${W}恢复计划${N}  ${DIM}（各项均只有一种恢复方式）${N}"
     echo ""
-    local n=0 z
+    local n=0
     for z in "${!plan_scope[@]}"; do
       n=$((n + 1))
-      local -a _ids=() _labs=()
-      read -ra _ids <<< "${plan_ids[$z]}"
-      IFS=$'\x1f' read -ra _labs <<< "${plan_labels[$z]}"
-      local cur=${plan_cur[$z]}
-      if (( ${#_ids[@]} > 1 )); then
-        printf "  %2d. %-14s ${G}%s${N}  ${DIM}[%d/%d 可切换]${N}\n" \
-          "$n" "${plan_scope[$z]}" "${_labs[$cur]}" "$((cur + 1))" "${#_ids[@]}"
+      local -a _labs=(); IFS=$'\x1f' read -ra _labs <<< "${plan_labels[$z]}"
+      printf "  %2d. %-14s %s\n" "$n" "${plan_scope[$z]}" "${_labs[${plan_cur[$z]}]}"
+    done
+  else
+    # 有可切换项才进入交互循环
+    local _pmsg=""
+    while true; do
+      clear
+      echo ""
+      echo -e "  ${W}恢复计划${N}"
+      echo -e "  ${DIM}输入编号切换策略（仅标注「可切换」的项）| 回车确认 | q 取消${N}"
+      echo ""
+      local n=0
+      for z in "${!plan_scope[@]}"; do
+        n=$((n + 1))
+        local -a _ids=() _labs=()
+        read -ra _ids <<< "${plan_ids[$z]}"
+        IFS=$'\x1f' read -ra _labs <<< "${plan_labels[$z]}"
+        local cur=${plan_cur[$z]}
+        if (( ${#_ids[@]} > 1 )); then
+          printf "  %2d. %-14s ${G}%s${N}  ${DIM}[%d/%d 可切换]${N}\n" \
+            "$n" "${plan_scope[$z]}" "${_labs[$cur]}" "$((cur + 1))" "${#_ids[@]}"
+        else
+          printf "  %2d. %-14s %s\n" "$n" "${plan_scope[$z]}" "${_labs[$cur]}"
+        fi
+      done
+      echo ""
+      [[ -n "$_pmsg" ]] && { echo -e "  ${Y}$_pmsg${N}"; _pmsg=""; echo ""; }
+
+      local _in; read -erp "  选择: " _in
+      [[ -z "$_in" ]] && break
+      case "${_in,,}" in
+        q|quit) info "已取消"; return 0 ;;
+      esac
+      if [[ "$_in" =~ ^[0-9]+$ ]] && (( _in >= 1 && _in <= ${#plan_scope[@]} )); then
+        z=$((_in - 1))
+        local -a _ids=()
+        read -ra _ids <<< "${plan_ids[$z]}"
+        if (( ${#_ids[@]} > 1 )); then
+          plan_cur[$z]=$(( (plan_cur[z] + 1) % ${#_ids[@]} ))
+        else
+          _pmsg="${plan_scope[$z]} 只有一种恢复方式，无需切换"
+        fi
       else
-        printf "  %2d. %-14s %s\n" "$n" "${plan_scope[$z]}" "${_labs[$cur]}"
+        _pmsg="无效输入：$_in（编号范围 1-${#plan_scope[@]}）"
       fi
     done
-    echo ""
-    [[ -n "$_pmsg" ]] && { echo -e "  ${Y}$_pmsg${N}"; _pmsg=""; echo ""; }
-
-    local _in; read -erp "  选择: " _in
-    [[ -z "$_in" ]] && break
-    case "${_in,,}" in
-      q|quit) info "已取消"; return 0 ;;
-    esac
-    if [[ "$_in" =~ ^[0-9]+$ ]] && (( _in >= 1 && _in <= ${#plan_scope[@]} )); then
-      z=$((_in - 1))
-      local -a _ids=()
-      read -ra _ids <<< "${plan_ids[$z]}"
-      if (( ${#_ids[@]} > 1 )); then
-        plan_cur[$z]=$(( (plan_cur[z] + 1) % ${#_ids[@]} ))
-      else
-        _pmsg="${plan_scope[$z]} 只有一种恢复方式，无需切换"
-      fi
-    else
-      _pmsg="无效输入：$_in（编号范围 1-${#plan_scope[@]}）"
-    fi
-  done
+  fi
 
   # 组装最终计划
   local -a restore_plan=()

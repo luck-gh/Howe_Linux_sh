@@ -37,7 +37,9 @@ askyn() {
 
 # ── 通用工具函数（input_choose / break_end 等）──────────────────
 _AI_STACK_DIR="${BASH_SOURCE[0]%/*}"
-# 拆分后 utils.sh 仍在 lib/，从 ai_stack/ 引入需要 ../lib
+# 拆分后 utils.sh / colors.sh 仍在 lib/，从 ai_stack/ 引入需要 ../lib
+# shellcheck source=../lib/colors.sh
+source "${_AI_STACK_DIR}/../lib/colors.sh" 2>/dev/null || true
 # shellcheck source=../lib/utils.sh
 source "${_AI_STACK_DIR}/../lib/utils.sh" 2>/dev/null || {
   # 兜底：utils.sh 不存在时提供最小实现

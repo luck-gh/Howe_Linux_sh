@@ -213,6 +213,31 @@ backup_scope_desc() {
   done
 }
 
+# ── tar 包装：区分 warning 与 fatal ──────────────────────────────
+# tar 退出码语义：
+#   0 = 完全成功
+#   1 = warning，最典型的是 "file changed as we read it"（活跃日志/数据库
+#       文件在读取期间被写入）。归档本身可用，条目齐全，只是那个文件的
+#       快照可能不一致。
+#   2 = fatal，归档不可用。
+# 原先统一 `|| return 1`，导致 1 也被当失败：函数提前返回、_bk_seal 不执行、
+# 但 tar 已把归档写在磁盘上 —— 残缺包(无 .sha256)随后被通配符扫进 bundle。
+# 用法：_bk_tar <输出文件> <tar 的其余参数...>
+_bk_tar() {
+  local out=$1; shift
+  local errf; errf=$(mktemp /tmp/howe-bk-tar.XXXXXX)
+  tar czf "$out" "$@" 2>"$errf"
+  local rc=$?
+  if (( rc >= 2 )); then
+    warn "tar 失败（退出码 $rc）：$(head -3 "$errf" | tr '\n' ' ')" >&2
+    rm -f "$errf"
+    return 1
+  fi
+  (( rc == 1 )) && info "  tar 提示（不影响归档）：$(head -1 "$errf")" >&2
+  rm -f "$errf"
+  return 0
+}
+
 # ── 单 scope 备份实现 ────────────────────────────────────────────
 # 输出 .tar.gz 到 $1（备份点目录），返回 0 成功 / 非 0 失败
 # 失败时不留半成品。
@@ -246,7 +271,9 @@ _bk_do_ai_data() {
     [[ -d "$BACKUP_AI_BASE/$d" ]] && inc+=("$d")
   done
   [[ ${#inc[@]} -eq 0 ]] && { warn "AI 服务栈数据目录为空"; return 1; }
-  ( cd "$BACKUP_AI_BASE" && tar czf "$out" "${inc[@]}" ) || return 1
+  # 排除 logs/：sub2api.log 这类活跃日志体积大(实测 83MB)、迁移无价值，
+  # 且持续写入会触发 tar 的 file-changed warning
+  ( cd "$BACKUP_AI_BASE" && _bk_tar "$out" --exclude='*/logs' "${inc[@]}" ) || return 1
   _bk_seal "$out"
 }
 
@@ -256,7 +283,7 @@ _bk_do_ai_config() {
   [[ -f "$BACKUP_AI_BASE/docker-compose.yml" ]] && inc+=("docker-compose.yml")
   [[ -f "$BACKUP_AI_BASE/.env" ]]               && inc+=(".env")
   [[ ${#inc[@]} -eq 0 ]] && { warn "AI 服务栈顶层配置不存在"; return 1; }
-  ( cd "$BACKUP_AI_BASE" && tar czf "$out" "${inc[@]}" ) || return 1
+  ( cd "$BACKUP_AI_BASE" && _bk_tar "$out" "${inc[@]}" ) || return 1
   _bk_seal "$out"
 }
 
@@ -264,7 +291,7 @@ _bk_do_clash() {
   local out=$1/clash.tar.gz
   [[ -d "$BACKUP_AI_BASE/clash" ]] || return 1
   # 排除 __pycache__；output/ 含订阅 token 一并打入
-  ( cd "$BACKUP_AI_BASE" && tar czf "$out" \
+  ( cd "$BACKUP_AI_BASE" && _bk_tar "$out" \
       --exclude='clash/__pycache__' \
       clash ) || return 1
   _bk_seal "$out"
@@ -273,7 +300,7 @@ _bk_do_clash() {
 _bk_do_singbox() {
   local out=$1/singbox.tar.gz
   [[ -d /etc/sing-box ]] || return 1
-  ( cd /etc && tar czf "$out" sing-box ) || return 1
+  ( cd /etc && _bk_tar "$out" sing-box ) || return 1
   _bk_seal "$out"
 }
 
@@ -283,7 +310,7 @@ _bk_do_caddy() {
   [[ -d /etc/caddy ]]     && inc+=("etc/caddy")
   [[ -d /var/lib/caddy ]] && inc+=("var/lib/caddy")
   (( ${#inc[@]} == 0 )) && return 1
-  ( cd / && tar czf "$out" "${inc[@]}" ) || return 1
+  ( cd / && _bk_tar "$out" "${inc[@]}" ) || return 1
   _bk_seal "$out"
 }
 
@@ -295,7 +322,7 @@ _bk_do_ai_cli() {
     [[ -d "$HOME/$d" ]] && inc+=("$d")
   done
   [[ ${#inc[@]} -eq 0 ]] && { warn "AI CLI 配置目录均不存在"; return 1; }
-  ( cd "$HOME" && tar czf "$out" "${inc[@]}" ) || return 1
+  ( cd "$HOME" && _bk_tar "$out" "${inc[@]}" ) || return 1
   _bk_seal "$out"
 }
 
@@ -374,7 +401,7 @@ _bk_rs_ai_cli()  { tar xzf "$1" -C "$HOME"; }
 _bk_do_kiro() {
   local out=$1/kiro.tar.gz
   [[ -d "$BACKUP_AI_BASE/kiro-rs/config" ]] || return 1
-  ( cd "$BACKUP_AI_BASE" && tar czf "$out" kiro-rs/config ) || return 1
+  ( cd "$BACKUP_AI_BASE" && _bk_tar "$out" kiro-rs/config ) || return 1
   _bk_seal "$out"
 }
 
@@ -386,7 +413,7 @@ _bk_rs_kiro() {
 _bk_do_nrouter() {
   local out=$1/nrouter.tar.gz
   [[ -d "$BACKUP_AI_BASE/9router/data" ]] || return 1
-  ( cd "$BACKUP_AI_BASE" && tar czf "$out" 9router/data ) || return 1
+  ( cd "$BACKUP_AI_BASE" && _bk_tar "$out" 9router/data ) || return 1
   _bk_seal "$out"
 }
 
@@ -951,12 +978,24 @@ backup_list() {
 }
 
 # 列出指定备份点内的 scope 列表（用于交互选择恢复）
+#
+# 以 .sha256 的存在为准，而非直接通配 *.tar.gz：_bk_seal 只在 scope 成功后
+# 才执行，失败的 scope 可能已被 tar 写下残缺归档但没有校验和。若按 *.tar.gz
+# 通配，残缺包会被当成有效 scope 打进 bundle，新机解包时 backup_verify 发现
+# 它缺校验和 → mig_unpack_bundle 返回 2 → 整个恢复中止，其余完好的 scope
+# 一并作废。
 backup_point_scopes() {
   BACKUP_ROOT=$(backup_root)
   local ts=$1
   local d=$BACKUP_ROOT/$ts
   [[ -d "$d" ]] || return 1
-  ls "$d"/*.tar.gz 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.tar\.gz$//'
+  local f base
+  for f in "$d"/*.tar.gz; do
+    [[ -f "$f" ]] || continue
+    [[ -f "$f.sha256" ]] || continue
+    base=$(basename "$f")
+    echo "${base%.tar.gz}"
+  done
 }
 
 # 校验备份点完整性
