@@ -204,8 +204,9 @@ install_or_update() {
   preflight      # 系统/网络预检，探测资源，获取 VPS IP
 
   # 配置收集 + 确认循环（Esc 可返回重新配置）
+  # collect_config 返回 1 = 用户在首屏按 0，要返回上一级菜单
   while true; do
-    collect_config
+    collect_config || return 0
     confirm_installation && break
   done
 
@@ -401,6 +402,7 @@ uninstall_stack() {
 
   echo ""
   log "卸载完成"
+  _docker_ps_refresh   # 卸载改变了容器状态，刷新快照供菜单重绘
   read -erp "  按回车继续..." _
 }
 

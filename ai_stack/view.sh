@@ -391,6 +391,8 @@ manage_services() {
             log "$_name 已重启"
             ;;
         esac
+        # 状态已变更，刷新 docker 快照，避免循环重绘读到旧缓存
+        _docker_ps_refresh
         break_end
       done
     fi
@@ -1098,7 +1100,7 @@ upgrade_all_services() {
         echo ""
         info "全部升级前自动备份：${_scopes[*]}"
         local _dir
-        _dir=$(backup_create "全部升级前自动备份" "${_scopes[@]}" 2>/dev/null)
+        _dir=$(backup_create "全部升级前自动备份" "${_scopes[@]}")
         if [[ -n "$_dir" ]]; then
           log "已备份 → $(basename "$_dir")"
           local _keep; _keep=$(backup_conf_get KEEP "$BACKUP_KEEP_DEFAULT")
@@ -1430,7 +1432,7 @@ _upgrade_pre_backup_hook() {
   echo ""
   info "升级前自动备份：${_scopes[*]} （服务：$_svc）"
   local _dir
-  _dir=$(backup_create "升级前自动备份：${_svc}" "${_scopes[@]}" 2>/dev/null)
+  _dir=$(backup_create "升级前自动备份：${_svc}" "${_scopes[@]}")
   if [[ -n "$_dir" ]]; then
     log "已备份 → $(basename "$_dir")"
     local _keep; _keep=$(backup_conf_get KEEP "$BACKUP_KEEP_DEFAULT")

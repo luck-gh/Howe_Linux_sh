@@ -1,0 +1,572 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════
+# Howe_Linux_sh — VPS 迁移 低层函数库
+#
+# 迁移包 = 一个 backup point 目录 → tar → 可选加密 → 单文件
+# 复用 backup_lib.sh 的 scope 打包 / 校验 / 恢复能力，只加：
+#   1) 单文件 bundle 封装 + migration manifest
+#   2) 加密流层（age / openssl / none）
+#   3) 传输层（本地 / rsync-pull / rsync-push）
+#
+# bundle 文件结构（tar 内容）：
+#   migration.json      迁移元信息（版本 / 源主机 / cipher / 时间戳）
+#   manifest.json       原备份点 manifest（scope 列表）
+#   <scope>.tar.gz      各 scope 归档
+#   <scope>.sha256      各 scope 校验和
+#
+# 加密后扩展名：.tar (none) / .tar.age (age) / .tar.enc (openssl)
+# bundle 同目录会再落一个 <bundle>.sha256 供外层校验
+# ═══════════════════════════════════════════════════════════════════
+
+MIGRATE_BUNDLE_VERSION=1
+MIGRATE_ROOT_DEFAULT=/var/backups/howe-migrate
+
+# 迁移落地根目录（与 backup 分开，避免 backup_apply_retention 误删）
+migrate_root() {
+  local r
+  r=$(backup_conf_get MIGRATE_ROOT "$MIGRATE_ROOT_DEFAULT")
+  echo "$r"
+}
+
+# ── 运行时检测 ────────────────────────────────────────────────────
+
+mig_has_age()     { command -v age >/dev/null 2>&1; }
+mig_has_openssl() { command -v openssl >/dev/null 2>&1; }
+mig_has_rsync()   { command -v rsync >/dev/null 2>&1; }
+mig_has_ssh()     { command -v ssh >/dev/null 2>&1; }
+
+# 引导安装缺失依赖（apt 系）
+mig_ensure_dep() {
+  local pkg=$1
+  command -v "$pkg" >/dev/null 2>&1 && return 0
+  warn "缺少 $pkg"
+  local yn
+  askyn yn "自动 apt install $pkg?" y
+  if $yn; then
+    apt-get install -y -qq "$pkg" >/dev/null 2>&1 \
+      && { log "$pkg 已安装"; return 0; } \
+      || { err "$pkg 安装失败"; return 1; }
+  fi
+  return 1
+}
+
+# 支持的 cipher 列表（按运行时能力过滤）
+mig_available_ciphers() {
+  echo "none"
+  mig_has_age     && echo "age"
+  mig_has_openssl && echo "openssl"
+}
+
+# ── 口令交互（不落盘、不出现在 argv、read -s 无回显）─────────────────
+
+# 双次输入并校验；结果写入 stdout 的 fd 由调用方通过管道消费
+# 用法：passphrase=$(mig_prompt_passphrase_new) || return 1
+mig_prompt_passphrase_new() {
+  # 测试钩子（CI/fixture 用）
+  if [[ -n "${MIG_TEST_PASSPHRASE:-}" ]]; then
+    printf '%s' "$MIG_TEST_PASSPHRASE"; return 0
+  fi
+  # 预设口令钩子（migrate_action_pack 提前收集后设置）
+  if [[ -n "${MIG_PASSPHRASE:-}" ]]; then
+    printf '%s' "$MIG_PASSPHRASE"; return 0
+  fi
+  local p1="" p2=""
+  read -rsp "  设置加密口令（至少 8 位）: " p1 </dev/tty >&2
+  echo >&2
+  if (( ${#p1} < 8 )); then
+    err "口令过短" >&2; return 1
+  fi
+  read -rsp "  再次输入以确认: " p2 </dev/tty >&2
+  echo >&2
+  if [[ "$p1" != "$p2" ]]; then
+    err "两次口令不一致" >&2; return 1
+  fi
+  printf '%s' "$p1"
+}
+
+mig_prompt_passphrase_open() {
+  if [[ -n "${MIG_TEST_PASSPHRASE:-}" ]]; then
+    printf '%s' "$MIG_TEST_PASSPHRASE"
+    return 0
+  fi
+  local p=""
+  read -rsp "  输入解密口令: " p </dev/tty >&2
+  echo >&2
+  [[ -z "$p" ]] && { err "口令为空" >&2; return 1; }
+  printf '%s' "$p"
+}
+
+# ── 加密 / 解密（流式；口令通过 fd 传递，不出现在 argv）───────────────
+
+# 用法：cat plain | _mig_encrypt <cipher> <pass_fd> > cipher
+_mig_encrypt() {
+  local cipher=$1 pass_fd=$2
+  case "$cipher" in
+    none)
+      cat
+      ;;
+    age)
+      # age -p 从 tty 读，不适合非交互；改用 --passphrase 从 stdin?
+      # age 官方无 --pass-fd，实践：用 age-plugin 或改走 openssl。
+      # 折中：age 场景走对称口令时借助 expect 麻烦，这里改用 age 的
+      # scrypt recipient（-R -）不适用；因此 age 场景要求用户装 age 且
+      # 使用 -p（交互）——由调用侧 detach tty；此处为一致 API，把口令
+      # 写入 stdin 的做法在 age 上不通用。
+      # 简化：age 模式必须走密钥文件（-r / -i），口令模式回退 openssl。
+      err "age 口令模式请改用 openssl 或密钥文件（见 _mig_encrypt_age_keyfile）" >&2
+      return 1
+      ;;
+    openssl)
+      openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+        -pass "fd:${pass_fd}"
+      ;;
+    *)
+      err "未知 cipher: $cipher" >&2; return 1
+      ;;
+  esac
+}
+
+_mig_decrypt() {
+  local cipher=$1 pass_fd=$2
+  case "$cipher" in
+    none)
+      cat
+      ;;
+    openssl)
+      openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+        -pass "fd:${pass_fd}"
+      ;;
+    *)
+      err "未知 cipher: $cipher" >&2; return 1
+      ;;
+  esac
+}
+
+# age 密钥文件模式（-r <recipient> 加密 / -i <identity> 解密）
+_mig_encrypt_age_recipient() {
+  local recipient_file=$1
+  age -R "$recipient_file"
+}
+_mig_decrypt_age_identity() {
+  local identity_file=$1
+  age -d -i "$identity_file"
+}
+
+# age 交互口令模式（tty passphrase，直接 -p / -d，让 age 自行提示）
+_mig_encrypt_age_passphrase() { age -p; }
+_mig_decrypt_age_passphrase() { age -d; }
+
+# ── 打包：把一个 backup point 封成 bundle 单文件 ───────────────────
+
+# 写 migration manifest 到指定目录
+_mig_write_manifest() {
+  local dir=$1 cipher=$2 backup_ts=$3
+  local host kernel created bundle_ts
+  host=$(hostname)
+  kernel=$(uname -r)
+  created=$(date -Iseconds)
+  bundle_ts=$(date +%Y%m%d-%H%M%S)
+  cat > "$dir/migration.json" <<JSON
+{
+  "bundle_version": ${MIGRATE_BUNDLE_VERSION},
+  "created_at": "${created}",
+  "bundle_ts": "${bundle_ts}",
+  "source_host": "${host}",
+  "source_kernel": "${kernel}",
+  "cipher": "${cipher}",
+  "backup_ts": "${backup_ts}"
+}
+JSON
+}
+
+# 主打包函数
+# $1 = backup point timestamp（已通过 backup_create 生成）
+# $2 = cipher (none|openssl|age-pass|age-keyfile)
+# $3 = 输出目录（默认 migrate_root）
+# $4 = age recipient 文件（仅 age-keyfile 用）
+# 成功：echo <bundle 完整路径>；失败：返回非 0
+mig_pack_bundle() {
+  local backup_ts=$1 cipher=$2 out_dir=${3:-} recipient=${4:-}
+  local bkroot; bkroot=$(backup_root)
+  local src_dir="$bkroot/$backup_ts"
+  [[ -d "$src_dir" ]] || { err "备份点不存在：$backup_ts" >&2; return 1; }
+
+  out_dir=${out_dir:-$(migrate_root)}
+  mkdir -p "$out_dir" && chmod 0700 "$out_dir" 2>/dev/null
+
+  local bundle_ts host ext
+  bundle_ts=$(date +%Y%m%d-%H%M%S)
+  host=$(hostname)
+  case "$cipher" in
+    none)          ext="tar" ;;
+    openssl)       ext="tar.enc" ;;
+    age-pass)      ext="tar.age" ;;
+    age-keyfile)   ext="tar.age" ;;
+    *) err "未知 cipher: $cipher" >&2; return 1 ;;
+  esac
+
+  local out="$out_dir/migrate-${host}-${bundle_ts}.${ext}"
+
+  # 临时目录：拷贝 backup point 内容 + 写 migration.json
+  local tmp; tmp=$(mktemp -d /tmp/howe-mig-pack.XXXXXX) || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  cp -a "$src_dir"/. "$tmp/"
+  _mig_write_manifest "$tmp" "$cipher" "$backup_ts"
+
+  # 打包 + 加密（流式，避免落中间明文）
+  case "$cipher" in
+    none)
+      ( cd "$tmp" && tar cf - . ) > "$out" || return 1
+      ;;
+    openssl)
+      local pass; pass=$(mig_prompt_passphrase_new) || return 1
+      # 通过 fd 3 传口令；不写临时文件
+      if ( cd "$tmp" && tar cf - . ) \
+          | _mig_encrypt openssl 3 3< <(printf '%s' "$pass") > "$out"; then
+        :
+      else
+        rm -f "$out"
+        err "加密失败" >&2
+        return 1
+      fi
+      unset pass
+      ;;
+    age-pass)
+      mig_has_age || { err "age 未安装" >&2; return 1; }
+      # age 直接读 tty 提示口令
+      ( cd "$tmp" && tar cf - . ) | _mig_encrypt_age_passphrase > "$out" || {
+        rm -f "$out"; err "age 加密失败" >&2; return 1
+      }
+      ;;
+    age-keyfile)
+      mig_has_age || { err "age 未安装" >&2; return 1; }
+      [[ -f "$recipient" ]] || { err "recipient 文件不存在：$recipient" >&2; return 1; }
+      ( cd "$tmp" && tar cf - . ) | _mig_encrypt_age_recipient "$recipient" > "$out" || {
+        rm -f "$out"; err "age 加密失败" >&2; return 1
+      }
+      ;;
+  esac
+
+  chmod 0600 "$out"
+  # 外层 sha256（供传输后校验）
+  ( cd "$(dirname "$out")" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
+  echo "$out"
+}
+
+# ── 解包：把 bundle 还原为 backup point ────────────────────────────
+
+# $1 = bundle 文件路径
+# $2 = cipher（none|openssl|age-pass|age-keyfile）
+# $3 = age identity 文件（仅 age-keyfile 用）
+# 成功：echo <还原后的 backup point 目录>；失败非 0
+mig_unpack_bundle() {
+  local bundle=$1 cipher=$2 identity=${3:-}
+  [[ -f "$bundle" ]] || { err "bundle 不存在：$bundle" >&2; return 1; }
+
+  # 外层 sha256 校验（若存在）
+  if [[ -f "$bundle.sha256" ]]; then
+    ( cd "$(dirname "$bundle")" && sha256sum -c "$(basename "$bundle").sha256" >/dev/null 2>&1 ) \
+      || { err "bundle sha256 校验失败" >&2; return 1; }
+    info "bundle 完整性校验通过" >&2
+  else
+    warn "未找到 $(basename "$bundle").sha256，跳过外层校验" >&2
+  fi
+
+  local tmp; tmp=$(mktemp -d /tmp/howe-mig-unpack.XXXXXX) || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  case "$cipher" in
+    none)
+      tar xf "$bundle" -C "$tmp" || { err "解包失败" >&2; return 1; }
+      ;;
+    openssl)
+      local pass; pass=$(mig_prompt_passphrase_open) || return 1
+      if _mig_decrypt openssl 3 3< <(printf '%s' "$pass") < "$bundle" \
+          | tar xf - -C "$tmp"; then
+        :
+      else
+        err "解密/解包失败（口令错误或包已损坏）" >&2
+        return 1
+      fi
+      unset pass
+      ;;
+    age-pass)
+      mig_has_age || { err "age 未安装" >&2; return 1; }
+      _mig_decrypt_age_passphrase < "$bundle" | tar xf - -C "$tmp" || {
+        err "age 解密/解包失败" >&2; return 1
+      }
+      ;;
+    age-keyfile)
+      mig_has_age || { err "age 未安装" >&2; return 1; }
+      [[ -f "$identity" ]] || { err "identity 文件不存在：$identity" >&2; return 1; }
+      _mig_decrypt_age_identity "$identity" < "$bundle" | tar xf - -C "$tmp" || {
+        err "age 解密/解包失败" >&2; return 1
+      }
+      ;;
+    *)
+      err "未知 cipher: $cipher" >&2; return 1
+      ;;
+  esac
+
+  # 校验 migration.json 存在
+  [[ -f "$tmp/migration.json" ]] || { err "包内缺少 migration.json" >&2; return 1; }
+  [[ -f "$tmp/manifest.json"  ]] || { err "包内缺少 manifest.json" >&2; return 1; }
+
+  # 解出 backup_ts 并放到本机 backup_root/<ts>/
+  local backup_ts
+  backup_ts=$(grep -oE '"backup_ts":\s*"[^"]+"' "$tmp/migration.json" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  [[ -n "$backup_ts" ]] || { err "无法解析 backup_ts" >&2; return 1; }
+
+  local bkroot; bkroot=$(backup_root)
+  mkdir -p "$bkroot" && chmod 0700 "$bkroot" 2>/dev/null
+
+  # 冲突处理：目标点已存在则改名保存原状
+  local dst="$bkroot/$backup_ts"
+  if [[ -e "$dst" ]]; then
+    local sfx; sfx=$(date +%s)
+    mv "$dst" "${dst}.pre-migrate.${sfx}"
+    warn "已存在同名备份点，原目录已改名保存" >&2
+  fi
+  mv "$tmp" "$dst" || { err "落地失败" >&2; return 1; }
+  chmod 0700 "$dst"
+  # 从 trap 中释放（已改名到目标位置）
+  trap - RETURN
+
+  # 用 backup_lib 的 verify 校验每个 scope 完整
+  local bad
+  bad=$(backup_verify "$backup_ts") || true
+  if [[ -n "$bad" ]]; then
+    warn "以下 scope 校验失败：$bad" >&2
+    return 2
+  fi
+
+  echo "$backup_ts"
+}
+
+# ── 传输层 ────────────────────────────────────────────────────────
+# 均通过 rsync -e ssh；不在参数里嵌任何口令；SSH 认证走用户既有的
+# ~/.ssh/config / 密钥 / ssh-agent。若目标机需口令登录，交由 ssh 自身
+# 交互提示。
+
+# rsync 推送本机 bundle 到远端
+# $1 = 本地 bundle 完整路径
+# $2 = ssh 目标（user@host）
+# $3 = 远端目录
+# $4 = 远端 ssh 端口（默认 22）
+mig_rsync_push() {
+  local local_path=$1 remote=$2 remote_dir=$3 port=${4:-22}
+  mig_ensure_dep rsync || return 1
+  # 建远端目录 + 同步 bundle 与 sha256
+  ssh -p "$port" "$remote" "mkdir -p '$remote_dir' && chmod 0700 '$remote_dir'" || {
+    err "ssh 无法连通 $remote:$port" >&2; return 1
+  }
+  rsync -e "ssh -p $port" -av --partial --progress \
+        "$local_path" "$local_path.sha256" \
+        "$remote:$remote_dir/" || {
+    err "rsync 推送失败" >&2; return 1
+  }
+  log "已推送到 $remote:$remote_dir/$(basename "$local_path")"
+}
+
+# rsync 从远端拉取 bundle 到本机
+# $1 = ssh 源（user@host）
+# $2 = 远端 bundle 完整路径
+# $3 = 本地目录（默认 migrate_root）
+# $4 = 远端 ssh 端口（默认 22）
+mig_rsync_pull() {
+  local remote=$1 remote_path=$2 local_dir=${3:-} port=${4:-22}
+  mig_ensure_dep rsync || return 1
+  local_dir=${local_dir:-$(migrate_root)}
+  mkdir -p "$local_dir" && chmod 0700 "$local_dir"
+  rsync -e "ssh -p $port" -av --partial --progress \
+        "$remote:$remote_path" "$remote:$remote_path.sha256" \
+        "$local_dir/" >&2 || {
+    err "rsync 拉取失败" >&2; return 1
+  }
+  local base; base=$(basename "$remote_path")
+  echo "$local_dir/$base"
+}
+
+# ── 列表 / 删除 ───────────────────────────────────────────────────
+
+# 列出本机 bundles（每行：filename|size_bytes|cipher_ext|mtime）
+mig_list_bundles() {
+  local dir; dir=$(migrate_root)
+  [[ -d "$dir" ]] || return 0
+  local f
+  for f in "$dir"/migrate-*.tar "$dir"/migrate-*.tar.enc "$dir"/migrate-*.tar.age; do
+    [[ -f "$f" ]] || continue
+    local size mtime ext base
+    size=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
+    mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+    base=$(basename "$f")
+    ext="${base##*.}"
+    echo "$base|$size|$ext|$mtime"
+  done | sort -t'|' -k4 -rn
+}
+
+# 删除 bundle（同时删 .sha256）
+mig_delete_bundle() {
+  local name=$1
+  local dir; dir=$(migrate_root)
+  local p="$dir/$name"
+  [[ -f "$p" ]] || { err "bundle 不存在：$name" >&2; return 1; }
+  rm -f "$p" "$p.sha256"
+  log "已删除：$name"
+}
+
+# ── migrate-manifest.json v2 ──────────────────────────────────────
+# 打包时写入备份点根目录，解包后随 bundle 传递到新机。
+# 记录每个 scope 的文件名、描述、可选解包策略，驱动新机的选择式恢复。
+
+_mig_scope_strategies() {
+  # 返回 scope 可用策略列表（JSON 数组片段），仅 python3 调用
+  local scope=$1 pack_strategy=${2:-}
+  case "$scope" in
+    ai-pg)
+      echo '[{"id":"restore","label":"从dump恢复（覆盖现有数据）"},{"id":"skip","label":"跳过"}]'
+      ;;
+    ai-data|ai-config|clash|singbox|caddy|ai-cli|kiro|nrouter)
+      echo '[{"id":"restore","label":"从备份恢复"},{"id":"skip","label":"跳过"}]'
+      ;;
+    system-sec)
+      echo '[{"id":"staging","label":"落到 staging 不 apply（安全）"},{"id":"skip","label":"跳过"}]'
+      ;;
+    system-tune)
+      echo '[{"id":"restore","label":"恢复并立即 sysctl --system"},{"id":"skip","label":"跳过"}]'
+      ;;
+    docker-images)
+      if [[ "$pack_strategy" == "save" ]]; then
+        echo '[{"id":"load","label":"docker load 从包恢复"},{"id":"pull","label":"docker pull 重新拉取"},{"id":"skip","label":"跳过"}]'
+      else
+        echo '[{"id":"pull","label":"docker pull 重新拉取（推荐，包内仅有镜像名单）"},{"id":"skip","label":"跳过"}]'
+      fi
+      ;;
+    custom)
+      echo '[{"id":"restore_original","label":"恢复到原路径"},{"id":"restore_prefix","label":"恢复到指定前缀目录"},{"id":"skip","label":"跳过"}]'
+      ;;
+    *)
+      echo '[{"id":"restore","label":"恢复"},{"id":"skip","label":"跳过"}]'
+      ;;
+  esac
+}
+
+# 写 migrate-manifest.json v2 到备份点目录
+# $1 = 备份点目录  $2 = cipher  $3... = 已成功打包的 scope 列表
+mig_write_manifest_v2() {
+  local dir=$1 cipher=$2; shift 2
+  local -a scopes=("$@")
+  command -v python3 >/dev/null 2>&1 || { warn "无 python3，跳过 manifest v2 生成" >&2; return 0; }
+
+  # 收集每个 scope 的元数据
+  local scope_data=""
+  local sep=""
+  for sk in "${scopes[@]}"; do
+    local f="$dir/${sk}.tar.gz"
+    [[ -f "$f" ]] || continue
+    local size; size=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
+    local desc; desc=$(backup_scope_desc "$sk")
+    local pack_strat=""
+    [[ "$sk" == "docker-images" && -f "$dir/pack-strategy" ]] && \
+      pack_strat=$(cat "$dir/pack-strategy" 2>/dev/null || echo "record")
+    # 解包 pack-strategy 从 docker-images.tar.gz 内部读取
+    if [[ "$sk" == "docker-images" ]]; then
+      pack_strat=$(tar xzf "$f" -O ./pack-strategy 2>/dev/null | head -1 || echo "record")
+    fi
+    local custom_paths=""
+    if [[ "$sk" == "custom" ]]; then
+      custom_paths=$(tar xzf "$f" -O ./.custom-paths 2>/dev/null | head -50 | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip().splitlines()))" 2>/dev/null || echo "[]")
+    fi
+    local strategies; strategies=$(_mig_scope_strategies "$sk" "$pack_strat")
+    scope_data+="${sep}{\"scope\":\"${sk}\",\"file\":\"${sk}.tar.gz\",\"size\":${size},\"description\":\"${desc}\",\"pack_strategy\":\"${pack_strat}\",\"custom_paths\":${custom_paths:-[]},\"unpack_strategies\":${strategies}}"
+    sep=","
+  done
+
+  python3 - "$dir" "$cipher" "[${scope_data}]" <<'PY'
+import json, sys, os, subprocess
+from datetime import datetime, timezone
+
+out_dir, cipher, scopes_json = sys.argv[1], sys.argv[2], sys.argv[3]
+host = subprocess.check_output("hostname", text=True).strip()
+os_name = ""
+try:
+    with open("/etc/os-release") as f:
+        for line in f:
+            if line.startswith("PRETTY_NAME="):
+                os_name = line.split("=",1)[1].strip().strip('"')
+                break
+except:
+    pass
+
+d = {
+    "format_version": 2,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "source_host": host,
+    "source_os": os_name,
+    "cipher": cipher,
+    "scopes": json.loads(scopes_json)
+}
+with open(os.path.join(out_dir, "migrate-manifest.json"), "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+PY
+}
+
+# 读取 migrate-manifest.json v2，返回 scope 信息供 migrate.sh 使用
+# 输出：每行 scope|file|size|description|pack_strategy|strategies_json
+mig_read_manifest_scopes() {
+  local mfile=$1
+  [[ -f "$mfile" ]] || return 1
+  python3 - "$mfile" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if d.get("format_version",1) < 2:
+    print("__v1__")
+    sys.exit(0)
+for s in d.get("scopes",[]):
+    strats = json.dumps(s.get("unpack_strategies",[]), ensure_ascii=False)
+    cp = json.dumps(s.get("custom_paths",[]), ensure_ascii=False)
+    print(f"{s['scope']}|{s['file']}|{s.get('size',0)}|{s.get('description','')}|{s.get('pack_strategy','')}|{strats}|{cp}")
+PY
+}
+
+# ── 策略执行器 ────────────────────────────────────────────────────
+# $1 = scope  $2 = strategy  $3 = 备份点目录
+mig_execute_strategy() {
+  local scope=$1 strategy=$2 bp_dir=$3
+  local arc="$bp_dir/${scope}.tar.gz"
+  [[ -f "$arc" ]] || { err "scope 文件不存在：$arc" >&2; return 1; }
+
+  case "$scope:$strategy" in
+    # ── 标准 backup_lib 恢复 ──
+    ai-pg:restore)     _bk_rs_ai_pg "$arc" ;;
+    ai-data:restore)   _bk_rs_ai_data "$arc" ;;
+    ai-config:restore) _bk_rs_ai_config "$arc" ;;
+    clash:restore)     _bk_rs_clash "$arc" ;;
+    singbox:restore)   _bk_rs_singbox "$arc" ;;
+    caddy:restore)     _bk_rs_caddy "$arc" ;;
+    ai-cli:restore)    _bk_rs_ai_cli "$arc" ;;
+    kiro:restore)      _bk_rs_kiro "$arc" ;;
+    nrouter:restore)   _bk_rs_nrouter "$arc" ;;
+    # ── 特殊策略 ──
+    system-sec:staging)    _bk_rs_system_sec "$arc" ;;
+    system-tune:restore)   _bk_rs_system_tune "$arc" ;;
+    docker-images:pull)    _bk_rs_docker_images "$arc" pull ;;
+    docker-images:load)    _bk_rs_docker_images "$arc" load ;;
+    custom:restore_original) _bk_rs_custom "$arc" / ;;
+    custom:restore_prefix)
+      local prefix; ask prefix "恢复目标根目录（如 /tmp/restore）" "/tmp/migrate-restore"
+      [[ -n "$prefix" ]] && _bk_rs_custom "$arc" "$prefix"
+      ;;
+    # ── 跳过 ──
+    *:skip)
+      info "跳过 $scope" ;;
+    *)
+      warn "未知策略 $scope:$strategy，尝试默认恢复" >&2
+      local fn="_bk_rs_${scope//-/_}"
+      declare -F "$fn" >/dev/null 2>&1 && "$fn" "$arc" || return 1
+      ;;
+  esac
+}

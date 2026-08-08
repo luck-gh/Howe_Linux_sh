@@ -81,76 +81,6 @@ preflight() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-# 模式选择
-# ═══════════════════════════════════════════════════════════════════
-choose_deploy_mode() {
-  local _core=520
-  local _avail=$(( SYS_MEM_MB - _core ))
-  [[ $_avail -lt 0 ]] && _avail=0
-
-  while true; do
-    clear
-    echo -e "${W}${C}"
-    echo "  ╔═══════════════════════════════════════════════════════════════"
-    echo "  ║                     选择安装模式"
-    echo "  ╠═══════════════════════════════════════════════════════════════"
-    printf "  ║  VPS：%-3s核 CPU  RAM %-5sMB  磁盘 %-4sGB  核心后剩余 %-5sMB\n" \
-           "$SYS_CPU" "$SYS_MEM_MB" "$SYS_DISK_GB" "$_avail"
-    echo "  ╚═══════════════════════════════════════════════════════════════"
-    echo -e "${N}"
-
-    local _aio_warn=""
-    if [[ $_avail -lt 512 ]]; then
-      _aio_warn="${R}（警告：核心后剩余 ${_avail}MB，此 VPS 可能 OOM）${N}"
-    else
-      _aio_warn="${Y}（内存裕量有限 ${_avail}MB，建议只装轻量服务）${N}"
-    fi
-
-    echo "    1. All-in-One   所有服务跑在 VPS"
-    echo -e "       ${_aio_warn}"
-    echo ""
-    echo -e "    2. 分布式部署   重服务放本地，VPS 只跑核心 + 代理"
-    echo -e "       ${G}（推荐：本 VPS 1GB RAM 下的最优方案）${N}"
-    echo ""
-    echo "    0. 退出脚本"
-    echo ""
-    local _choice
-    read -erp "  选择：" _choice
-
-    case "$_choice" in
-      0) echo -e "  ${DIM}已退出${N}"; exit 0 ;;
-      1) DEPLOY_MODE="allinone"; LOCAL_OS="" ; break ;;
-      2) DEPLOY_MODE="distributed" ;;
-      *) continue ;;
-    esac
-
-    # ── 本地系统选择（仅分布式）────────────────────────────────
-    while true; do
-      clear
-      echo ""
-      echo -e "  ${W}本地机器系统：${N}"
-      echo ""
-      echo "    1. Linux    生成 install-local.sh + docker-compose + frpc.toml"
-      echo "    2. Windows  生成 docker-compose + frpc.toml + start.bat"
-      echo ""
-      echo "    0. 返回上一级"
-      echo ""
-      local _os_choice
-      read -erp "  选择：" _os_choice
-
-      case "$_os_choice" in
-        0) continue 2 ;;  # 返回模式选择
-        1) LOCAL_OS="linux";  break 2 ;;
-        2) LOCAL_OS="windows"; break 2 ;;
-      esac
-    done
-  done
-
-  log "模式：$([[ "$DEPLOY_MODE" == "distributed" ]] && echo "分布式（本地 ${LOCAL_OS}）" || echo "All-in-One")"
-  sleep 1
-}
-
-# ═══════════════════════════════════════════════════════════════════
 # 服务安装状态探测（统一检测框架）
 # ═══════════════════════════════════════════════════════════════════
 
@@ -158,6 +88,32 @@ choose_deploy_mode() {
 _ensure_path() {
   [[ -d "$HOME/.local/bin" ]] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && export PATH="$HOME/.local/bin:$PATH"
   [[ -d "/usr/local/bin" ]] && [[ ":$PATH:" != *":/usr/local/bin:"* ]] && export PATH="/usr/local/bin:$PATH"
+}
+
+# ── docker ps 快照缓存 ────────────────────────────────────────────
+# 每个服务各 spawn 一次 docker 会造成进程风暴（一次菜单渲染约 18 次
+# docker ps）。这里把容器名单快照到变量，同一波检测复用，避免反复
+# CLI→daemon 往返。用 bash 内置 SECONDS（无子进程）做 TTL。
+_DOCKER_PS_ALL=""      # 所有容器名（docker ps -a），换行分隔
+_DOCKER_PS_RUN=""      # 运行中容器名（docker ps）
+_DOCKER_PS_TS=-100     # 上次刷新时的 SECONDS；初值确保首次必刷
+_DOCKER_PS_TTL=3       # 缓存有效期（秒）
+
+# 强制刷新快照（状态变更后可显式调用以立即反映）
+_docker_ps_refresh() {
+  if command -v docker &>/dev/null; then
+    _DOCKER_PS_ALL=$(docker ps -a --format '{{.Names}}' 2>/dev/null)
+    _DOCKER_PS_RUN=$(docker ps --format '{{.Names}}' 2>/dev/null)
+  else
+    _DOCKER_PS_ALL=""; _DOCKER_PS_RUN=""
+  fi
+  _DOCKER_PS_TS=$SECONDS
+}
+
+# 按 TTL 惰性刷新：新鲜则复用，过期才重新 spawn docker
+_docker_ps_ensure() {
+  (( SECONDS - _DOCKER_PS_TS < _DOCKER_PS_TTL )) && return 0
+  _docker_ps_refresh
 }
 
 # 通用服务状态检测
@@ -169,7 +125,8 @@ svc_check() {
   case "$_type" in
     docker)
       command -v docker &>/dev/null || return 1
-      docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "$_target"
+      _docker_ps_ensure
+      grep -Fxq "$_target" <<< "$_DOCKER_PS_ALL"
       ;;
     systemd)
       command -v "$_target" &>/dev/null
@@ -191,7 +148,8 @@ svc_running() {
   case "$_type" in
     docker)
       command -v docker &>/dev/null || return 1
-      docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$_target"
+      _docker_ps_ensure
+      grep -Fxq "$_target" <<< "$_DOCKER_PS_RUN"
       ;;
     systemd)
       systemctl is-active "$_target" &>/dev/null

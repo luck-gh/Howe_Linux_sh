@@ -52,8 +52,8 @@ mod_ai_stack_main() {
           continue
         fi
         # 独立运行（非 source），脚本自带第一页面菜单
+        # 脚本内部有完整菜单循环，退出时已清屏，无需再 break_end
         bash "$AI_STACK_SCRIPT"
-        break_end
         ;;
       2)
         _ai_stack_status

@@ -9,8 +9,8 @@
 |------|---------|-------------|
 | `ai-stack-setup.sh` | ~60 | **入口 / loader**。`set -uo pipefail`，stty trap，按顺序 `source` 下列模块，最后 `if BASH_SOURCE==$0; main "$@"`. |
 | `core.sh` | ~210 | 颜色 / `log` `warn` `err` `info` / `step` / `ask` `askyn` / `print_header` / `dc_cmd` / `multi_select_input` / 全局常量（`PREFIX_*` `BASE_DIR` `SINGBOX_DIR` 等）/ 加载 `lib/utils.sh`。**最先 source，所有模块都依赖。** |
-| `detect.sh` | ~310 | `detect_resources` / `assess_svc` / `preflight` / `choose_deploy_mode` / 服务安装状态探测（`SVC_REGISTRY_*` / `svc_check` / `svc_running` / `detect_installed_services` / `detect_ai_agents` / `has_*_service`）。 |
-| `select.sh` | ~480 | `select_services`（输入式服务多选）/ `assign_service_locations`（分布式 VPS 或本地）/ `collect_config`（域名 / frp / Clash 端口段 等）/ `check_dns`。 |
+| `detect.sh` | ~310 | `detect_resources` / `assess_svc` / `preflight` / 服务安装状态探测（`SVC_REGISTRY_*` / `svc_check` / `svc_running` / `detect_installed_services` / `detect_ai_agents` / `has_*_service`）。 |
+| `select.sh` | ~480 | `select_services`（输入式服务多选）/ `assign_service_locations`（可分配服务选 VPS 或本地）/ `derive_deploy_mode`（由服务位置派生 `DEPLOY_MODE`）/ `choose_local_os`（distributed 时选 Linux/Windows）/ `collect_config`（编排 + 域名 / frp / Clash 端口段 等）/ `check_dns`。 |
 | `base.sh` | ~85 | `install_deps` / `setup_dirs` / `sync_brand_assets` / `refresh_brand_assets`。**轻量公用步骤。** |
 | `clash.sh` | ~1080 | Clash 多订阅子系统：路径辅助 (`_clash_dir/_clash_py/_clash_stats_py`)，端口段 (`_clash_port_range/_sync_clash_ufw`)，`setup_clash_subscription / setup_clash_stats_timer / render_clash_subscription`，订阅菜单 `_clash_menu_*` (`pick_one/show/add/edit/remove/defaults/refresh/static`)，字段编辑循环 `_clash_field_loop`（支持「将继承默认值」与 [修改] 高亮），静态 IP 资源管理 `_static_menu_*`（list/add/remove/replace/clear/strategy）+ `_static_pick_target`（默认池 / 订阅池切换）+ `_static_apply_changes`（render + reload sing-box），静态 IP 子菜单全套支持 `[q]` 退出 + 服务包注释说明（`_STATIC_QUIT` 协调）。 |
 | `compose.sh` | ~400 | `write_env`（生成 `/opt/ai-stack/.env`）/ `write_compose`（生成 `docker-compose.yml`，按服务和分布式模式裁剪）/ `write_litellm_config`。 |
@@ -18,8 +18,10 @@
 | `services.sh` | ~370 | `install_singbox`（含 anytls 多 inbound 渲染 + nft 表 + reload 钩子 `reload_clash_subscription` / `setup_clash_nft` / `write_singbox_config`，config 用 jq 拼装并注入静态 IP outbounds + `user→outbound` 路由）/ `install_frp_server` / `configure_firewall` / `start_services` / `health_check` / `setup_dify` / `sync_newapi_logo`。 |
 | `local_pkg.sh` | ~340 | `generate_local_package` — 生成分布式架构里跑在本地机器上的安装包（Linux `install-local.sh` / Windows `start.bat` / docker-compose / frpc.toml），含大段 HEREDOC。 |
 | `lifecycle.sh` | ~400 | `print_clash_link` / `print_summary` / `confirm_installation` / `install_or_update`（主安装流水线）/ `uninstall_stack`（多选卸载）。 |
-| `backup_lib.sh` | ~615 | 备份/恢复底层库：备份点扫描、tar 流式打包/解包、PG 容器内 pg_dump/pg_restore、Caddy/sing-box/frp/`/opt/ai-stack` 目录快照，幂等钩子。 |
+| `backup_lib.sh` | ~900 | 备份/恢复底层库。scope 共13个（9原有 + system-sec / system-tune / docker-images / custom）。`docker-images`：`MIG_DOCKER_STRATEGY=record/save`；`custom`：`MIG_CUSTOM_PATHS` 驱动，保留原目录结构。每次 `backup_create` 末尾自动写 `host-inventory.json`（OS/镜像/二进制/待办清单）。 |
 | `backup.sh` | ~540 | 备份子菜单与编排：`_backup_menu`（创建 / 列出 / 恢复 / 删除 / 计划任务）/ `do_backup` / `do_restore`，调用 `backup_lib.sh` 的低层函数。 |
+| `migrate_lib.sh` | ~580 | VPS 迁移底层库。`mig_pack_bundle`/`mig_unpack_bundle`（加密+sha256双层）；`mig_write_manifest_v2`/`mig_read_manifest_scopes`（per-scope策略元数据）；`mig_execute_strategy`（scope×strategy分派）；`mig_rsync_push`/`mig_rsync_pull`；口令走 fd 不进 argv，`MIG_TEST_PASSPHRASE` 测试钩子。 |
+| `migrate.sh` | ~730 | VPS 迁移菜单：三段独立流程——① 打包（多选scope+加密）② 传递（推送/拉取/手动scp三选一）③ 解包恢复（manifest v2驱动多选scope+per-scope策略，v1兼容降级）。`migrate_show_guide` 首次进入展示指引。 |
 | `view.sh` | ~1480 | `show_secrets` / `show_db_connection` / `show_config`（已安装栈的运行状态 + 可改项）/ 服务管理（启动/停止/重启）/ 升级回滚菜单（含进入时检查上游版本）。 |
 | `main.sh` | ~540 | `service_stack_menu`（AI 服务栈子菜单：安装 / 配置 / 卸载 / 刷新 / 查看密钥 / 服务管理 / 订阅 ...）/ `ai_agent_menu`（智能体 CLI 工具：Claude Code / Codex / OpenCode / OpenClaw 安装管理）/ `main`（顶级两选一）。 |
 
@@ -27,7 +29,7 @@
 
 ```
 core → detect → select → base → clash → compose → caddy → services
-     → local_pkg → lifecycle → backup_lib → backup → view → main
+     → local_pkg → lifecycle → backup_lib → backup → migrate_lib → migrate → view → main
 ```
 
 约束来源：
@@ -37,6 +39,7 @@ core → detect → select → base → clash → compose → caddy → services
 - `lifecycle.sh` 调度上面所有写文件的函数，必须在它们之后 source。
 - `backup_lib.sh` 提供低层备份 / 恢复函数；`backup.sh` 是它的菜单和编排层，依赖前者。
 - `view.sh` 的升级回滚菜单调用 `backup.sh` 的恢复入口，所以排在 backup 之后。
+- `migrate_lib.sh` 依赖 `backup_lib` 提供的 `backup_root`/`backup_create` 等；`migrate.sh` 菜单又调用 `migrate_lib`，故都排在 `backup*` 之后。
 - `main.sh` 是顶层菜单，所有功能都从这里分发，最后 source。
 
 ## 共享变量（跨模块使用，避免重复定义）
@@ -48,9 +51,9 @@ core → detect → select → base → clash → compose → caddy → services
 | `SINGBOX_DIR` / `SINGBOX_BIN` | core.sh | sing-box 配置和二进制路径 |
 | `_AI_STACK_DIR` | core.sh | `${BASH_SOURCE[0]%/*}`，指向 `ai_stack/` 自身（用来定位同级的 `doc/`） |
 | `INST_<SVC>` | select.sh / detect.sh | 用户选了 / 已安装的服务布尔变量 |
-| `LOC_<SVC>` | select.sh | 分布式模式下服务跑在 VPS 还是本地（`vps`/`local`） |
+| `LOC_<SVC>` | select.sh | 可分配服务跑在 VPS 还是本地（`vps`/`local`）；有任一为 `local` 则派生 `DEPLOY_MODE=distributed` |
 | `DOMAIN` / `VPS_IP` / `FRP_TOKEN` 等 | select.sh / detect.sh / `.env` | 用户配置；持久化到 `/opt/ai-stack/.env`，下次启动 source 进来 |
-| `DEPLOY_MODE` | select.sh | `aio` 或 `distributed` |
+| `DEPLOY_MODE` | select.sh | `allinone` 或 `distributed`；由 `derive_deploy_mode` 从服务位置派生，非用户直接选择 |
 
 ## 修改建议
 

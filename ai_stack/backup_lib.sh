@@ -21,7 +21,7 @@
 
 BACKUP_ROOT_DEFAULT=/var/backups/howe
 BACKUP_KEEP_DEFAULT=7
-BACKUP_DEFAULT_SCOPES_DEFAULT="ai-pg,ai-data,ai-config,clash,singbox,caddy,kiro"
+BACKUP_DEFAULT_SCOPES_DEFAULT="ai-pg,ai-data,ai-config,clash,singbox,caddy,kiro,system-sec,system-tune"
 BACKUP_AUTO_BEFORE_UPGRADE_DEFAULT=true
 BACKUP_TIMER_ENABLED_DEFAULT=false
 BACKUP_TIMER_SCHEDULE_DEFAULT=daily
@@ -64,10 +64,14 @@ BACKUP_SCOPES=(
   "ai-config|AI 服务栈顶层配置（docker-compose.yml / .env）|_bk_has_ai_config"
   "clash|Clash 多订阅子系统（订阅库 / nft 状态）|_bk_has_clash"
   "singbox|sing-box 配置（/etc/sing-box）|_bk_has_singbox"
-  "caddy|Caddy 配置（/etc/caddy）|_bk_has_caddy"
+  "caddy|Caddy 配置与证书（/etc/caddy + /var/lib/caddy）|_bk_has_caddy"
   "ai-cli|AI CLI 配置（claude / codex / opencode / openclaw）|_bk_has_ai_cli"
   "kiro|kiro-rs 配置（config.json / credentials.json）|_bk_has_kiro"
   "nrouter|9router 数据目录（/opt/ai-stack/9router/data）|_bk_has_nrouter"
+  "system-sec|主机安全（fail2ban / iptables / ipset）|_bk_has_system_sec"
+  "system-tune|主机调优（sysctl / zram / earlyoom / crontab）|_bk_has_system_tune"
+  "docker-images|Docker 镜像（记录名单或 docker save 打包）|_bk_has_docker_images"
+  "custom|自定义路径（由 MIG_CUSTOM_PATHS 指定）|_bk_has_custom"
 )
 
 # ── 检测函数（决定 scope 是否对当前主机可用）────────────────────────
@@ -80,6 +84,27 @@ _bk_has_caddy()     { [[ -f /etc/caddy/Caddyfile ]] || [[ -d /etc/caddy ]]; }
 _bk_has_ai_cli()    { local d; for d in ~/.claude ~/.codex ~/.opencode ~/.openclaw; do [[ -d "$d" ]] && return 0; done; return 1; }
 _bk_has_kiro()      { [[ -d "$BACKUP_AI_BASE/kiro-rs/config" ]]; }
 _bk_has_nrouter()   { [[ -d "$BACKUP_AI_BASE/9router/data" ]]; }
+_bk_has_system_sec() {
+  # 有实际内容才算可用（避免只装了命令但没配任何规则时误判）
+  [[ -f /etc/fail2ban/jail.local ]] && return 0
+  compgen -G "/etc/fail2ban/jail.d/*.local" >/dev/null 2>&1 && return 0
+  compgen -G "/etc/fail2ban/jail.d/*.conf"  >/dev/null 2>&1 && return 0
+  [[ -f /etc/iptables/rules.v4 ]] && return 0
+  [[ -f /etc/iptables/rules.v6 ]] && return 0
+  command -v ipset >/dev/null 2>&1 && ipset list -n 2>/dev/null | grep -q . && return 0
+  return 1
+}
+_bk_has_system_tune() {
+  compgen -G "/etc/sysctl.d/99-howe-*.conf" >/dev/null 2>&1 \
+    || [[ -f /etc/default/zramswap ]] || [[ -f /etc/default/earlyoom ]] \
+    || crontab -l -u root 2>/dev/null | grep -q .
+}
+_bk_has_docker_images() {
+  command -v docker >/dev/null 2>&1 && docker ps -q 2>/dev/null | grep -q .
+}
+_bk_has_custom() {
+  [[ -n "${MIG_CUSTOM_PATHS:-}" ]]
+}
 
 # ── 工具函数 ─────────────────────────────────────────────────────
 _bk_ts() { date +%Y%m%d-%H%M%S; }
@@ -93,6 +118,68 @@ _bk_human() {
     else if (b > 1024) printf "%.1fK", b/1024;
     else printf "%dB", b;
   }'
+}
+
+# ── 备份进度显示 ─────────────────────────────────────────────────
+_BK_SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# 是否显示动画进度（stderr 是 tty 且未被显式关闭）
+_bk_progress_tty() {
+  [[ "${BACKUP_PROGRESS:-auto}" != "off" ]] && [[ -t 2 ]]
+}
+
+# 起止时间戳（ns）转 "N.Ns"
+_bk_dur_s() {
+  local diff=$(( $2 - $1 ))
+  (( diff < 0 )) && diff=0
+  local s=$(( diff / 1000000000 ))
+  local ms=$(( (diff / 100000000) % 10 ))
+  printf "%d.%ds" "$s" "$ms"
+}
+
+# 运行单个 scope 备份并渲染进度
+# $1=idx $2=total $3=scope $4=desc $5=fn $6=dir
+_bk_run_scope_with_progress() {
+  local idx=$1 total=$2 sk=$3 desc=$4 fn=$5 dir=$6
+  local prefix; prefix=$(printf "[%d/%d]" "$idx" "$total")
+  local start end rc dur sz
+  local log; log=$(mktemp /tmp/howe-bk-scope.XXXXXX)
+  start=$(date +%s%N)
+
+  if _bk_progress_tty; then
+    ( "$fn" "$dir" ) >"$log" 2>&1 &
+    local pid=$! i=0 frame
+    while kill -0 "$pid" 2>/dev/null; do
+      frame=${_BK_SPIN_FRAMES[$(( i % ${#_BK_SPIN_FRAMES[@]} ))]}
+      printf "\r\033[K  %s %s %-14s ${DIM}%s${N}" "$prefix" "$frame" "$sk" "$desc" >&2
+      i=$((i+1))
+      sleep 0.1
+    done
+    wait "$pid"; rc=$?
+    end=$(date +%s%N); dur=$(_bk_dur_s "$start" "$end")
+    if (( rc == 0 )); then
+      sz=$(stat -c%s "$dir/$sk.tar.gz" 2>/dev/null || echo 0)
+      printf "\r\033[K  %s ${G}✓${N} %-14s %s   %s\n" \
+        "$prefix" "$sk" "$(_bk_human "$sz")" "$dur" >&2
+    else
+      printf "\r\033[K  %s ${R}✗${N} %-14s ${R}失败${N}   %s\n" \
+        "$prefix" "$sk" "$dur" >&2
+      [[ -s "$log" ]] && sed 's/^/      /' "$log" >&2
+    fi
+  else
+    "$fn" "$dir" >"$log" 2>&1; rc=$?
+    end=$(date +%s%N); dur=$(_bk_dur_s "$start" "$end")
+    if (( rc == 0 )); then
+      sz=$(stat -c%s "$dir/$sk.tar.gz" 2>/dev/null || echo 0)
+      printf "  %s ✓ %-14s %s   %s\n" \
+        "$prefix" "$sk" "$(_bk_human "$sz")" "$dur" >&2
+    else
+      printf "  %s ✗ %-14s 失败   %s\n" "$prefix" "$sk" "$dur" >&2
+      [[ -s "$log" ]] && sed 's/^/      /' "$log" >&2
+    fi
+  fi
+  rm -f "$log"
+  return "$rc"
 }
 
 # 写 sha256 校验文件
@@ -192,8 +279,11 @@ _bk_do_singbox() {
 
 _bk_do_caddy() {
   local out=$1/caddy.tar.gz
-  [[ -d /etc/caddy ]] || return 1
-  ( cd /etc && tar czf "$out" caddy ) || return 1
+  local -a inc=()
+  [[ -d /etc/caddy ]]     && inc+=("etc/caddy")
+  [[ -d /var/lib/caddy ]] && inc+=("var/lib/caddy")
+  (( ${#inc[@]} == 0 )) && return 1
+  ( cd / && tar czf "$out" "${inc[@]}" ) || return 1
   _bk_seal "$out"
 }
 
@@ -272,7 +362,13 @@ _bk_rs_clash() {
 }
 
 _bk_rs_singbox() { tar xzf "$1" -C /etc; }
-_bk_rs_caddy()   { tar xzf "$1" -C /etc; }
+_bk_rs_caddy() {
+  tar xzf "$1" -C /
+  # 归还 caddy 用户所有权（跨机 uid/gid 可能不同）
+  if id caddy >/dev/null 2>&1 && [[ -d /var/lib/caddy ]]; then
+    chown -R caddy:caddy /var/lib/caddy 2>/dev/null || true
+  fi
+}
 _bk_rs_ai_cli()  { tar xzf "$1" -C "$HOME"; }
 
 _bk_do_kiro() {
@@ -299,6 +395,340 @@ _bk_rs_nrouter() {
   tar xzf "$1" -C "$BACKUP_AI_BASE"
 }
 
+# ── system-sec：主机层安全配置 ────────────────────────────────────
+# 打包：fail2ban 配置 + iptables 规则文件 + ipset 名单导出
+# 不打包运行时 iptables/ipset 内存状态（新机上要 restore 后 iptables-restore）
+_bk_do_system_sec() {
+  local out=$1/system-sec.tar.gz
+  local tmp; tmp=$(mktemp -d /tmp/howe-bk-sec.XXXXXX)
+  trap "rm -rf '$tmp'" RETURN
+
+  local -a inc=()
+  if [[ -d /etc/fail2ban ]]; then
+    ( cd /etc && tar cf - \
+        --exclude='fail2ban/*.sock' \
+        --exclude='fail2ban/*.pid' \
+        fail2ban 2>/dev/null ) | ( cd "$tmp" && tar xf - ) 2>/dev/null \
+      && inc+=("fail2ban") || true
+  fi
+  if [[ -d /etc/iptables ]]; then
+    cp -a /etc/iptables "$tmp/" 2>/dev/null && inc+=("iptables") || true
+  fi
+  # 导出当前 iptables/ip6tables 规则（新机可直接 iptables-restore）
+  if command -v iptables-save >/dev/null 2>&1; then
+    iptables-save > "$tmp/iptables.rules.v4" 2>/dev/null && inc+=("iptables-runtime") || true
+  fi
+  if command -v ip6tables-save >/dev/null 2>&1; then
+    ip6tables-save > "$tmp/iptables.rules.v6" 2>/dev/null || true
+  fi
+  # 导出 ipset 名单
+  if command -v ipset >/dev/null 2>&1 && ipset list -n 2>/dev/null | grep -q .; then
+    ipset save > "$tmp/ipset.save" 2>/dev/null && inc+=("ipset") || true
+  fi
+  [[ ${#inc[@]} -eq 0 ]] && { warn "system-sec 无可打包内容"; return 1; }
+
+  ( cd "$tmp" && tar czf "$out" . ) || return 1
+  _bk_seal "$out"
+}
+
+# 恢复：写文件到位；iptables/ipset 需要用户确认后手动 apply（避免锁住 SSH）
+_bk_rs_system_sec() {
+  local arc=$1
+  local tmp; tmp=$(mktemp -d /tmp/howe-rs-sec.XXXXXX)
+  trap "rm -rf '$tmp'" RETURN
+  tar xzf "$arc" -C "$tmp" || return 1
+
+  # fail2ban：直接落到 /etc
+  if [[ -d "$tmp/fail2ban" ]]; then
+    mkdir -p /etc/fail2ban
+    ( cd "$tmp" && tar cf - fail2ban ) | ( cd /etc && tar xf - )
+    log "已恢复 /etc/fail2ban（需要 systemctl restart fail2ban 生效）"
+  fi
+  # iptables 规则文件：落回 /etc/iptables
+  if [[ -d "$tmp/iptables" ]]; then
+    mkdir -p /etc/iptables
+    cp -a "$tmp/iptables/." /etc/iptables/
+    log "已恢复 /etc/iptables 规则文件"
+  fi
+  # 运行时规则和 ipset：只放到目录里，不 apply（避免锁 SSH）
+  local staging=/root/howe-migrate-restore
+  mkdir -p "$staging"
+  local staged=0
+  for f in iptables.rules.v4 iptables.rules.v6 ipset.save; do
+    [[ -f "$tmp/$f" ]] && cp "$tmp/$f" "$staging/" && staged=1
+  done
+  if (( staged )); then
+    warn "以下规则已放入 $staging，未自动 apply（防止误封 SSH）："
+    ls -1 "$staging" | sed 's/^/    /'
+    echo "    请在确认好后手动执行："
+    echo "      iptables-restore < $staging/iptables.rules.v4"
+    echo "      ip6tables-restore < $staging/iptables.rules.v6"
+    echo "      ipset restore < $staging/ipset.save"
+  fi
+}
+
+# ── system-tune：主机层内核/调度配置 ───────────────────────────────
+_bk_do_system_tune() {
+  local out=$1/system-tune.tar.gz
+  local tmp; tmp=$(mktemp -d /tmp/howe-bk-tune.XXXXXX)
+  trap "rm -rf '$tmp'" RETURN
+
+  local -a inc=()
+  # 项目专属 sysctl 配置（99-howe-*.conf）
+  if compgen -G "/etc/sysctl.d/99-howe-*.conf" >/dev/null; then
+    mkdir -p "$tmp/sysctl.d"
+    cp /etc/sysctl.d/99-howe-*.conf "$tmp/sysctl.d/" 2>/dev/null && inc+=("sysctl.d") || true
+  fi
+  # zram / earlyoom 配置
+  [[ -f /etc/default/zramswap ]] && { mkdir -p "$tmp/default"; cp /etc/default/zramswap "$tmp/default/" && inc+=("zramswap"); }
+  [[ -f /etc/default/earlyoom ]] && { mkdir -p "$tmp/default"; cp /etc/default/earlyoom "$tmp/default/" && inc+=("earlyoom"); }
+  # root crontab
+  if command -v crontab >/dev/null 2>&1; then
+    crontab -l -u root > "$tmp/root.crontab" 2>/dev/null && [[ -s "$tmp/root.crontab" ]] && inc+=("crontab") || rm -f "$tmp/root.crontab"
+  fi
+  [[ ${#inc[@]} -eq 0 ]] && { warn "system-tune 无可打包内容"; return 1; }
+
+  ( cd "$tmp" && tar czf "$out" . ) || return 1
+  _bk_seal "$out"
+}
+
+_bk_rs_system_tune() {
+  local arc=$1
+  local tmp; tmp=$(mktemp -d /tmp/howe-rs-tune.XXXXXX)
+  trap "rm -rf '$tmp'" RETURN
+  tar xzf "$arc" -C "$tmp" || return 1
+
+  if [[ -d "$tmp/sysctl.d" ]]; then
+    cp "$tmp/sysctl.d/"*.conf /etc/sysctl.d/ 2>/dev/null || true
+    log "已恢复 /etc/sysctl.d/99-howe-*.conf（sysctl --system 生效）"
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+  if [[ -d "$tmp/default" ]]; then
+    [[ -f "$tmp/default/zramswap" ]] && cp "$tmp/default/zramswap" /etc/default/ && log "已恢复 /etc/default/zramswap"
+    [[ -f "$tmp/default/earlyoom" ]] && cp "$tmp/default/earlyoom" /etc/default/ && log "已恢复 /etc/default/earlyoom"
+  fi
+  if [[ -f "$tmp/root.crontab" ]]; then
+    # 不覆盖：写入待应用文件，让用户对比
+    cp "$tmp/root.crontab" /root/howe-migrate-restore/root.crontab 2>/dev/null || {
+      mkdir -p /root/howe-migrate-restore
+      cp "$tmp/root.crontab" /root/howe-migrate-restore/
+    }
+    warn "旧机 root crontab 已放入 /root/howe-migrate-restore/root.crontab（未自动 apply）"
+    echo "    对比后可执行： crontab /root/howe-migrate-restore/root.crontab"
+  fi
+}
+
+# ── docker-images scope ───────────────────────────────────────────
+# MIG_DOCKER_STRATEGY = "record"（默认，仅记录镜像名）或 "save"（docker save 打包）
+_bk_do_docker_images() {
+  local out=$1/docker-images.tar.gz
+  local strategy="${MIG_DOCKER_STRATEGY:-record}"
+  local tmp; tmp=$(mktemp -d /tmp/howe-bk-docker.XXXXXX)
+  trap "rm -rf '$tmp'" RETURN
+
+  # 始终记录运行中镜像名单（解包时 pull 用）
+  docker ps --format '{{.Image}}' 2>/dev/null | sort -u > "$tmp/running-images.list"
+  docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | sort -u > "$tmp/all-images.list"
+  echo "$strategy" > "$tmp/pack-strategy"
+
+  if [[ "$strategy" == "save" ]]; then
+    local -a imgs=()
+    mapfile -t imgs < "$tmp/running-images.list"
+    if (( ${#imgs[@]} > 0 )); then
+      info "docker save ${#imgs[@]} 个镜像，可能需要较长时间..." >&2
+      docker save "${imgs[@]}" 2>/dev/null | gzip > "$tmp/docker-images.tar.gz" \
+        || { warn "docker save 失败，降级为 record 模式" >&2; echo "record" > "$tmp/pack-strategy"; }
+    fi
+  fi
+
+  ( cd "$tmp" && tar czf "$out" . ) || return 1
+  _bk_seal "$out"
+}
+
+# $1 = tar.gz $2 = strategy (pull|load|skip)
+_bk_rs_docker_images() {
+  local arc=$1 strategy="${2:-pull}"
+  [[ "$strategy" == "skip" ]] && { info "跳过 docker 镜像"; return 0; }
+  local tmp; tmp=$(mktemp -d /tmp/howe-rs-docker.XXXXXX)
+  trap "rm -rf '$tmp'" RETURN
+  tar xzf "$arc" -C "$tmp" || return 1
+
+  case "$strategy" in
+    pull)
+      [[ -f "$tmp/running-images.list" ]] || { warn "包内无镜像名单"; return 1; }
+      local failed=0 ok=0
+      while IFS= read -r img; do
+        [[ -n "$img" ]] || continue
+        if docker pull "$img" >/dev/null 2>&1; then
+          log "  ✓ $img" >&2; ok=$((ok+1))
+        else
+          warn "  ✗ $img（失败）" >&2; failed=$((failed+1))
+        fi
+      done < "$tmp/running-images.list"
+      log "docker pull 完成：成功 $ok，失败 $failed"
+      ;;
+    load)
+      [[ -f "$tmp/docker-images.tar.gz" ]] || {
+        warn "包内无 docker save tar（打包时用的是 record 模式，请改用 pull 策略）" >&2
+        return 1
+      }
+      docker load < "$tmp/docker-images.tar.gz" && log "docker load 完成" || return 1
+      ;;
+  esac
+}
+
+# ── custom scope ──────────────────────────────────────────────────
+# MIG_CUSTOM_PATHS = 换行或空格分隔的路径列表
+_bk_do_custom() {
+  local out=$1/custom.tar.gz
+  local -a paths=()
+  # 支持换行与空格分隔
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && paths+=("$p")
+  done <<< "$(tr ' ' '\n' <<< "${MIG_CUSTOM_PATHS:-}")"
+  [[ ${#paths[@]} -eq 0 ]] && { warn "无自定义路径"; return 1; }
+
+  local tmp; tmp=$(mktemp -d /tmp/howe-bk-custom.XXXXXX)
+  trap "rm -rf '$tmp'" RETURN
+  printf '%s\n' "${paths[@]}" > "$tmp/.custom-paths"
+
+  local found=0
+  for p in "${paths[@]}"; do
+    [[ -e "$p" ]] || { warn "路径不存在，跳过：$p" >&2; continue; }
+    local rel="${p#/}"
+    mkdir -p "$tmp/$(dirname "$rel")"
+    cp -a "$p" "$tmp/$rel" 2>/dev/null && found=$((found+1)) || warn "复制失败：$p" >&2
+  done
+  (( found == 0 )) && { warn "自定义路径均不存在"; return 1; }
+
+  ( cd "$tmp" && tar czf "$out" . ) || return 1
+  _bk_seal "$out"
+}
+
+# $1 = tar.gz  $2 = 恢复目标根目录（默认 /）
+_bk_rs_custom() {
+  local arc=$1 target="${2:-/}"
+  local tmp; tmp=$(mktemp -d /tmp/howe-rs-custom.XXXXXX)
+  trap "rm -rf '$tmp'" RETURN
+  tar xzf "$arc" -C "$tmp" || return 1
+  # 按原目录结构恢复，排除元数据文件
+  ( cd "$tmp" && find . -mindepth 1 -not -name '.custom-paths' | \
+    tar cf - --files-from=- ) | tar xf - -C "$target" 2>/dev/null
+  log "自定义路径已恢复到 $target"
+  [[ -f "$tmp/.custom-paths" ]] && {
+    echo "  包含路径："; sed 's/^/    /' "$tmp/.custom-paths"
+  }
+}
+# 记录本次备份产生环境的关键状态，供新机迁移解包时对齐：
+#   - 已安装但未打包的组件（Docker 镜像 / 二进制 / systemd unit）
+#   - 已打包但需要重启才生效的服务
+#   - 建议在新机上手动重跑的加固/调优步骤
+_bk_write_inventory() {
+  local dir=$1
+  local out=$dir/host-inventory.json
+
+  # 收集 shell 侧变量，统一交给 python3 做 JSON 序列化（避免手拼 JSON 转义问题）
+  local host kernel os_pretty arch cpu mem_kb docker_ver
+  host=$(hostname)
+  kernel=$(uname -r)
+  arch=$(uname -m)
+  os_pretty=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")
+  cpu=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)
+  mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  docker_ver=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "")
+
+  local -a images=()
+  command -v docker >/dev/null 2>&1 && mapfile -t images < <(docker ps --format '{{.Image}}' 2>/dev/null | sort -u)
+
+  local caddy_ver singbox_ver frps_ver
+  caddy_ver=$(caddy version 2>/dev/null | awk 'NR==1{print $1}' | tr -d 'v' || echo "")
+  singbox_ver=$(sing-box version 2>/dev/null | awk '/version/{print $NF; exit}' || echo "")
+  frps_ver=$(frps --version 2>/dev/null | awk '{print $NF; exit}' || echo "")
+
+  local -a units=()
+  local u
+  for u in caddy sing-box frps clash-subs-serve clash-subs-stats; do
+    systemctl list-unit-files 2>/dev/null | grep -qE "^${u}\.(service|timer)" && units+=("$u")
+  done
+
+  local ssh_keys=0 cron_lines=0 f2b_jails=0 ipt_rules=0
+  if [[ -f /root/.ssh/authorized_keys ]]; then
+    ssh_keys=$(grep -cE '^(ssh|ecdsa|sk-)' /root/.ssh/authorized_keys 2>/dev/null) || ssh_keys=0
+  fi
+  cron_lines=$(crontab -l -u root 2>/dev/null | grep -cvE '^\s*(#|$)' 2>/dev/null) || cron_lines=0
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    f2b_jails=$(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/{print $2}' | tr ',' '\n' | grep -c .) || f2b_jails=0
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    ipt_rules=$(iptables -S 2>/dev/null | grep -cvE '^(-P|-N)') || ipt_rules=0
+  fi
+
+  # 待办清单（收集到数组再传给 python）
+  local -a todos=(
+    "在新机重新拉取 Docker 镜像：docker compose up -d"
+    "在新机重跑 ai-stack-setup.sh 安装原生服务（Caddy / sing-box / frps）"
+    "检查 DNS 是否指向新机 IP，验证 Caddy 证书签发"
+    "验证订阅链接 / 业务端点"
+  )
+  (( ssh_keys > 0 ))   && todos+=("导入 SSH authorized_keys（旧机 ${ssh_keys} 条，未打包）")
+  (( cron_lines > 0 )) && todos+=("重建 root crontab（旧机 ${cron_lines} 条，system-tune scope 已打包）")
+  (( f2b_jails > 0 ))  && todos+=("重启 fail2ban（system-sec 已恢复配置）")
+  (( ipt_rules > 0 ))  && todos+=("重启 iptables 或 iptables-restore（system-sec 已恢复规则）")
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$out" \
+      "$host" "$os_pretty" "$kernel" "$arch" \
+      "$cpu" "$mem_kb" "$docker_ver" \
+      "$caddy_ver" "$singbox_ver" "$frps_ver" \
+      "$ssh_keys" "$cron_lines" "$f2b_jails" "$ipt_rules" \
+      "${#images[@]}" "${images[@]+"${images[@]}"}" \
+      "${#units[@]}" "${units[@]+"${units[@]}"}" \
+      "${#todos[@]}" "${todos[@]+"${todos[@]}"}" \
+      <<'PY'
+import json, sys
+args = sys.argv[1:]
+out = args.pop(0)
+host, os_pretty, kernel, arch = args.pop(0), args.pop(0), args.pop(0), args.pop(0)
+cpu, mem_kb, docker_ver = int(args.pop(0)), int(args.pop(0)), args.pop(0)
+caddy_ver, singbox_ver, frps_ver = args.pop(0), args.pop(0), args.pop(0)
+ssh_keys, cron_lines, f2b_jails, ipt_rules = int(args.pop(0)), int(args.pop(0)), int(args.pop(0)), int(args.pop(0))
+n = int(args.pop(0)); images = [args.pop(0) for _ in range(n)]
+n = int(args.pop(0)); units  = [args.pop(0) for _ in range(n)]
+n = int(args.pop(0)); todos  = [args.pop(0) for _ in range(n)]
+d = {
+  "host": host, "os": os_pretty, "kernel": kernel, "arch": arch,
+  "cpu_count": cpu, "mem_kb": mem_kb,
+  "docker_version": docker_ver,
+  "docker_images": images,
+  "native_versions": {"caddy": caddy_ver, "sing_box": singbox_ver, "frps": frps_ver},
+  "systemd_units": units,
+  "unpacked_counters": {
+    "ssh_authorized_keys": ssh_keys,
+    "root_crontab_lines": cron_lines,
+    "fail2ban_jails": f2b_jails,
+    "iptables_rules": ipt_rules,
+  },
+  "new_host_todos": todos,
+}
+with open(out, 'w', encoding='utf-8') as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+PY
+  else
+    # 无 python3 时写简化版（纯 ASCII，足够新机读取）
+    {
+      echo '{'
+      echo "  \"host\": \"$host\","
+      echo "  \"os\": \"$os_pretty\","
+      echo "  \"kernel\": \"$kernel\","
+      echo "  \"arch\": \"$arch\","
+      echo "  \"cpu_count\": $cpu,"
+      echo "  \"mem_kb\": $mem_kb,"
+      echo "  \"note\": \"python3 unavailable, simplified inventory\""
+      echo '}'
+    } > "$out"
+  fi
+}
+
 # ── 顶层调度 ─────────────────────────────────────────────────────
 
 # 创建一个备份点，备份指定 scope 列表
@@ -319,15 +749,41 @@ backup_create() {
   chmod 0700 "$dir" 2>/dev/null
 
   local -a ok=() fail=()
-  local sk fn
+  local sk fn desc total idx=0 t_start t_end
+  total=${#scopes[@]}
+  echo "" >&2
+  echo -e "  ${W}开始备份 ${total} 个 scope ...${N}" >&2
+  echo "" >&2
+  t_start=$(date +%s%N)
   for sk in "${scopes[@]}"; do
+    idx=$((idx+1))
     fn=_bk_do_${sk//-/_}
-    if declare -F "$fn" >/dev/null 2>&1 && "$fn" "$dir" >&2; then
-      ok+=("$sk"); log "已备份：$sk" >&2
+    desc=$(backup_scope_desc "$sk")
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+      fail+=("$sk")
+      printf "  [%d/%d] ${R}✗${N} %-14s ${R}未知 scope${N}\n" "$idx" "$total" "$sk" >&2
+      continue
+    fi
+    if _bk_run_scope_with_progress "$idx" "$total" "$sk" "$desc" "$fn" "$dir"; then
+      ok+=("$sk")
     else
-      fail+=("$sk"); warn "备份失败：$sk" >&2
+      fail+=("$sk")
     fi
   done
+  t_end=$(date +%s%N)
+
+  local total_sz=0 f fsz
+  for f in "$dir"/*.tar.gz; do
+    [[ -f "$f" ]] || continue
+    fsz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    total_sz=$((total_sz + fsz))
+  done
+  echo "" >&2
+  echo -e "  ${W}完成${N}：${G}${#ok[@]} 成功${N} / ${R}${#fail[@]} 失败${N}   总耗时 $(_bk_dur_s "$t_start" "$t_end")   合计 $(_bk_human "$total_sz")" >&2
+  echo "" >&2
+
+  # 写主机清单（新机迁移时对照用）
+  _bk_write_inventory "$dir" >&2 || true
 
   # 写 manifest（note 通过 python json.dumps 安全转义；缺 python 时退化为基础转义）
   local host kernel created_iso note_json
@@ -631,7 +1087,9 @@ backup_estimate_size() {
         [[ -f "$BACKUP_AI_BASE/.env" ]]               && total=$((total + $(stat -c%s "$BACKUP_AI_BASE/.env" 2>/dev/null || echo 0))) ;;
       clash)     [[ -d "$BACKUP_AI_BASE/clash" ]] && total=$((total + $(du -sb "$BACKUP_AI_BASE/clash" 2>/dev/null | awk '{print $1}'))) ;;
       singbox)   [[ -d /etc/sing-box ]] && total=$((total + $(du -sb /etc/sing-box 2>/dev/null | awk '{print $1}'))) ;;
-      caddy)     [[ -d /etc/caddy ]]    && total=$((total + $(du -sb /etc/caddy 2>/dev/null | awk '{print $1}'))) ;;
+      caddy)
+        [[ -d /etc/caddy ]]     && total=$((total + $(du -sb /etc/caddy 2>/dev/null | awk '{print $1}')))
+        [[ -d /var/lib/caddy ]] && total=$((total + $(du -sb /var/lib/caddy 2>/dev/null | awk '{print $1}'))) ;;
       ai-cli)
         local d
         for d in ~/.claude ~/.codex ~/.opencode ~/.openclaw; do

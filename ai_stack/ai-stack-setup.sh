@@ -51,6 +51,10 @@ source "${_AI_STACK_ENTRY_DIR}/lifecycle.sh"
 source "${_AI_STACK_ENTRY_DIR}/backup_lib.sh"
 # shellcheck source=backup.sh
 source "${_AI_STACK_ENTRY_DIR}/backup.sh"
+# shellcheck source=migrate_lib.sh
+source "${_AI_STACK_ENTRY_DIR}/migrate_lib.sh"
+# shellcheck source=migrate.sh
+source "${_AI_STACK_ENTRY_DIR}/migrate.sh"
 # shellcheck source=view.sh
 source "${_AI_STACK_ENTRY_DIR}/view.sh"
 # shellcheck source=main.sh

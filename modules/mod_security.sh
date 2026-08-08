@@ -129,6 +129,161 @@ import_github_keys() {
   fi
 }
 
+# ── SSH 会话清理（关闭遗留会话，保留当前连接）──────────────────────
+
+# 沿父进程链向上查找当前进程所属的 sshd 会话进程 PID
+# 输出：会话 sshd 的 PID（找不到则无输出、返回 1）
+_ssh_current_sshd_pid() {
+  local pid=$$ guard=0 args
+  while [[ -n "$pid" && "$pid" != "0" && "$pid" != "1" ]]; do
+    guard=$((guard + 1)); [[ $guard -gt 40 ]] && break
+    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    # 会话进程形如 "sshd: root@pts/2" / "sshd: root@notty"，排除 listener
+    if [[ ( "$args" == sshd:* || "$args" == sshd-session:* ) \
+          && "$args" == *@* && "$args" != *"[listener]"* ]]; then
+      echo "$pid"; return 0
+    fi
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+
+# 解析当前终端 pts（形如 pts/2）；非 tty 返回 1
+_ssh_current_pts() {
+  local t; t=$(tty 2>/dev/null)
+  [[ "$t" == /dev/pts/* ]] && { echo "${t#/dev/}"; return 0; }
+  return 1
+}
+
+# SSH 遗留会话清理
+# 用法：ssh_cleanup_sessions [mode]
+#   mode = dry     仅预览
+#        = force   跳过确认直接清理
+#        = 空/其他 显示后交互确认（默认）
+ssh_cleanup_sessions() {
+  local mode="${1:-}"
+
+  root_use || return 1
+
+  # 1) 定位当前会话：优先靠父进程链（更可靠），tty 作辅助
+  local cur_pid cur_pts
+  cur_pid=$(_ssh_current_sshd_pid || true)
+  cur_pts=$(_ssh_current_pts || true)
+
+  # 2) 收集所有 sshd 交互/notty 会话（排除 listener）
+  #    每行格式：PID<TAB>PTS_OR_notty<TAB>ARGS
+  local -a rows=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local pid args tag
+    pid=$(awk '{print $1}' <<<"$line")
+    args=$(sed -E 's/^[[:space:]]*[0-9]+[[:space:]]+//' <<<"$line")
+    [[ "$args" == *"[listener]"* ]] && continue
+    # 只处理 sshd: xxx@yyy 形式
+    [[ ! "$args" =~ sshd(-session)?:[[:space:]]+[^@]+@ ]] && continue
+    tag="${args#*@}"; tag="${tag%% *}"
+    rows+=("${pid}"$'\t'"${tag}"$'\t'"${args}")
+  done < <(ps -eo pid=,args= 2>/dev/null | awk '/sshd(-session)?:/')
+
+  # 3) 分类：保留 vs 待清理
+  local -a keep_lines=() kill_pids=() kill_lines=()
+  local row pid tag args protect
+  for row in "${rows[@]}"; do
+    pid=${row%%$'\t'*}
+    tag=$(cut -f2 <<<"$row")
+    args=$(cut -f3- <<<"$row")
+    protect=0
+    # 保护规则：ancestor 匹配 或 pts 号匹配
+    [[ -n "$cur_pid" && "$pid" == "$cur_pid" ]] && protect=1
+    [[ -n "$cur_pts" && "$tag" == "$cur_pts" ]] && protect=1
+    if (( protect )); then
+      keep_lines+=("PID ${pid} ${args}")
+    else
+      kill_pids+=("$pid")
+      kill_lines+=("PID ${pid} ${args}")
+    fi
+  done
+
+  # 4) 展示
+  echo ""
+  if [[ -n "$cur_pts" ]]; then
+    echo -e "  ${W}当前终端：${N}${cur_pts}"
+  else
+    echo -e "  ${W}当前终端：${N}${DIM}(非 tty，仅按父进程链保护)${N}"
+  fi
+  [[ -n "$cur_pid" ]] && echo -e "  ${W}当前会话 sshd PID：${N}${cur_pid}"
+  echo ""
+
+  echo -e "  ${G}保留：${N}"
+  if ((${#keep_lines[@]} == 0)); then
+    echo -e "    ${DIM}(未识别到当前 SSH 会话；若你正通过 SSH 登录，请检查环境)${N}"
+  else
+    printf '    %s\n' "${keep_lines[@]}"
+  fi
+  echo ""
+
+  echo -e "  ${Y}准备关闭：${N}"
+  if ((${#kill_lines[@]} == 0)); then
+    echo -e "    ${DIM}(无遗留会话)${N}"
+    return 0
+  fi
+  printf '    %s\n' "${kill_lines[@]}"
+  echo ""
+
+  # 5) 模式分派
+  case "$mode" in
+    dry)
+      info "dry-run 模式，未执行任何 kill"
+      return 0
+      ;;
+    force)
+      ;;
+    *)
+      local _yn
+      askyn _yn "确认关闭以上 ${#kill_pids[@]} 个会话?" n
+      if ! $_yn; then
+        info "已取消"
+        return 0
+      fi
+      ;;
+  esac
+
+  # 6) 兜底安全检查：绝不 kill 自身或 listener
+  local ok=0 fail=0 p
+  for p in "${kill_pids[@]}"; do
+    if [[ "$p" == "$$" || "$p" == "$cur_pid" ]]; then
+      warn "跳过 PID ${p}（保护）"
+      continue
+    fi
+    local a; a=$(ps -o args= -p "$p" 2>/dev/null)
+    [[ "$a" == *"[listener]"* ]] && { warn "跳过 PID ${p}（listener）"; continue; }
+
+    if kill "$p" 2>/dev/null; then
+      # 给 sshd 一点时间自行退出
+      sleep 0.3
+      if kill -0 "$p" 2>/dev/null; then
+        kill -9 "$p" 2>/dev/null && ok=$((ok + 1)) || fail=$((fail + 1))
+      else
+        ok=$((ok + 1))
+      fi
+    else
+      # SIGTERM 直接失败（例如进程已消失或权限不足）
+      if kill -0 "$p" 2>/dev/null; then
+        kill -9 "$p" 2>/dev/null && ok=$((ok + 1)) || fail=$((fail + 1))
+      else
+        ok=$((ok + 1))
+      fi
+    fi
+  done
+
+  echo ""
+  log "清理完成：成功 ${ok} 个，失败 ${fail} 个"
+  # 展示当前残留（诊断用）
+  local remain
+  remain=$(ps -eo pid=,args= 2>/dev/null | awk '/sshd(-session)?:/ && !/\[listener\]/' | wc -l)
+  info "当前 sshd 会话进程数：${remain}"
+}
+
 # ── iptables 防火墙 ──────────────────────────────────────────────
 
 save_iptables_rules() {
@@ -433,6 +588,10 @@ _ssh_menu() {
     echo "  3. 从 GitHub 导入公钥"
     echo "  4. 修改 SSH 端口"
     echo "  5. 开启密钥登录（关闭密码）"
+    echo "  ─────────────────"
+    echo "  6. 预览遗留 SSH 会话（不执行）"
+    echo "  7. 清理遗留 SSH 会话（需确认）"
+    echo "  8. 强制清理遗留 SSH 会话（跳过确认）"
     echo "  0. 返回"
     echo ""
     local c; read -erp "  选择：" c
@@ -442,6 +601,9 @@ _ssh_menu() {
       3) import_github_keys; break_end ;;
       4) local p; read -erp "新端口号：" p; [[ -n "$p" ]] && change_ssh_port "$p"; break_end ;;
       5) sshkey_on; break_end ;;
+      6) ssh_cleanup_sessions dry; break_end ;;
+      7) ssh_cleanup_sessions; break_end ;;
+      8) ssh_cleanup_sessions force; break_end ;;
       0|*) break ;;
     esac
   done

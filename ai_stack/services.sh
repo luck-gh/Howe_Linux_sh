@@ -368,5 +368,6 @@ health_check() {
   else
     log "所有 VPS 服务运行正常"
   fi
+  _docker_ps_refresh   # 启动改变了容器状态，刷新快照供菜单重绘
 }
 

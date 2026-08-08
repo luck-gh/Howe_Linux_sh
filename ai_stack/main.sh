@@ -532,12 +532,14 @@ main() {
 
     input_choose "选择管理模块" \
       "AI 服务栈管理 — 部署/管理 New-API、Sub2API、sing-box 等服务（容器+系统服务）" \
-      "AI 智能体 CLI 工具 — 在终端使用 Claude Code、Codex、OpenCode 等命令行工具"
+      "AI 智能体 CLI 工具 — 在终端使用 Claude Code、Codex、OpenCode 等命令行工具" \
+      "VPS 迁移 — 整机打包/传递/解包（服务栈 + CLI 凭据 + 系统配置全覆盖）"
     [[ $INPUT_RESULT -eq -1 ]] && { clear; break; }
 
     case $INPUT_RESULT in
       0) service_stack_menu ;;
       1) ai_agent_menu ;;
+      2) migrate_menu ;;
     esac
   done
 }

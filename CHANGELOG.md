@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Changed
+- **备份进度显示**：`backup_create` 逐 scope 显示 `[i/N]` + spinner（tty）
+  或阶段行（非 tty / 定时任务），完成后汇总"X 成功 / Y 失败 / 总耗时 / 合计大小"。
+  单个 scope 失败会缩进打印其 stderr。可用 `BACKUP_PROGRESS=off` 关掉动画。
 - **Clash 静态 IP 子组架构精简**：原 `静态IP_ALL` + `静态IP_Partial` 双子组
   合并为单一 `静态IP` 组，节点前缀从 `[静态_A]` / `[静态_P]` 统一为 `[静态]`，
   每条静态资源由 2 个 sing-box user（A/P）减为 1 个，`route.rules` 注入目标
@@ -23,6 +26,37 @@
   中文说明，解释每条预设关键词为什么需要静态 IP。
 
 ### Added
+- **VPS 迁移子系统 v2**：`ai_stack/migrate_lib.sh` + `ai_stack/migrate.sh`，
+  从 AI 服务栈子菜单进入。迁移流程拆为三个独立步骤，每步单独进入菜单：
+  - **① 打包**（旧机）：多选 scope + 加密方式，输出 bundle 到本机；
+    支持 scope：全部现有备份 scope + `docker-images`（记录名单 / docker save 打包两种策略）
+    + `custom`（打包时交互录入任意路径，如 /root/.vimrc）
+  - **② 传递**：三种方式独立选择——推送到新机（rsync over SSH）/
+    新机从旧机拉取（rsync over SSH）/ 手动 scp 提示；上次打包的 bundle 自动预填
+  - **③ 解包恢复**（新机）：读取 `migrate-manifest.json v2`，
+    多选要恢复的 scope，每个 scope 单独选恢复策略（如 ai-pg：从dump恢复/跳过；
+    docker-images：docker pull 重拉/docker load/跳过；custom：原路径/指定前缀/跳过）
+  - `migrate-manifest.json v2`：python3 序列化，记录源主机信息、每个 scope 的
+    文件名/大小/描述/打包策略/可选解包策略列表；随 bundle 传递给新机驱动恢复流程
+  - 策略执行器 `mig_execute_strategy`（migrate_lib.sh）统一分派所有 scope×策略组合
+  - v1 bundle 兼容模式（无 migrate-manifest.json v2 时自动降级）
+  - 加密：none / openssl AES-256-CBC PBKDF2 / age 口令+密钥对；口令走 fd 不进 argv
+  - bundle 内外两层 sha256 校验 + 同名备份点改名保护
+- **docker-images scope**（`backup_lib.sh`）：`MIG_DOCKER_STRATEGY=record` 仅保存
+  镜像名单（默认），`save` 则 docker save 打包；恢复策略：pull / load / skip
+- **custom scope**（`backup_lib.sh`）：`MIG_CUSTOM_PATHS` 驱动，打包时
+  保留原始目录结构；恢复到原路径或指定前缀目录
+- **system-sec scope**（`backup_lib.sh`）：打包 `/etc/fail2ban/jail.d`
+  / `iptables rules.v4/.v6` / `ipset save`；恢复时落到 staging 不自动 apply
+- **system-tune scope**（`backup_lib.sh`）：打包 `/etc/sysctl.d/99-howe-*.conf`
+  / `/etc/default/zramswap` / `/etc/default/earlyoom` / root crontab
+- **host-inventory.json**：每次 backup_create 自动写入，记录 Docker 镜像清单 /
+  原生二进制版本 / systemd units / 未打包项计数 / 新机待办清单；解包后展示摘要
+- **SSH 遗留会话清理**：`mod_security.sh` → SSH 安全管理子菜单新增 3 项
+  （预览 / 交互清理 / 强制清理），关闭 `sshd: root@pts/*` 与 `sshd: root@notty`
+  残留而保留当前会话。当前会话通过父进程链定位 sshd 会话 PID（tty 号作辅助
+  匹配），双重保护避免自杀；listener（`sshd -D [listener]`）永远排除；
+  SIGTERM 失败则 SIGKILL 兜底。
 - **静态 IP 子菜单 `[q] 退出菜单` 快捷键**：策略 / 添加 / 删除 / 整体替换
   / 清空 五个子菜单全部支持 `q` 一路退出到 Clash 主菜单（用 `_STATIC_QUIT`
   标志协调），中途误进可一键撤离。

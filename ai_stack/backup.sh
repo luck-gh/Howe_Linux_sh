@@ -88,8 +88,6 @@ backup_action_create() {
   echo ""
   local _note
   read -erp "  备注（可空，回车跳过）：" _note
-  echo ""
-  log "开始备份..."
   local _dir
   _dir=$(backup_create "$_note" $BACKUP_PICKED_SCOPES)
   if [[ -n "$_dir" ]]; then

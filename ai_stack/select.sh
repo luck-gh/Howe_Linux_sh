@@ -221,20 +221,23 @@ select_services() {
 # 分布式：服务位置分配（VPS or 本地）
 # ═══════════════════════════════════════════════════════════════════
 assign_service_locations() {
-  if [[ "$DEPLOY_MODE" != "distributed" ]]; then
-    LOC_WEBUI="vps"; LOC_LITELLM="vps"; LOC_SUB2API="vps"; LOC_DIFY="vps"
-    return 0
-  fi
+  # sub2api 固定 VPS（不参与位置分配）；pg/redis 因此永远单实例在 VPS
+  LOC_SUB2API="vps"
 
   local _core=520
   # INST变量|LOC变量|显示名|内存MB|推荐位置
   local -a _T=(
     "INST_WEBUI|LOC_WEBUI|OpenWebUI|512|local"
     "INST_LITELLM|LOC_LITELLM|LiteLLM|512|local"
-    "INST_SUB2API|LOC_SUB2API|Sub2API|192|vps"
     "INST_DIFY|LOC_DIFY|Dify|4096|local"
   )
   local _t_cnt=${#_T[@]}
+
+  # 无任何可分配服务时直接跳过（避免菜单显示空表）
+  if ! $INST_WEBUI && ! $INST_LITELLM && ! $INST_DIFY; then
+    LOC_WEBUI="vps"; LOC_LITELLM="vps"; LOC_DIFY="vps"
+    return 0
+  fi
 
   declare -A _L
   for _e in "${_T[@]}"; do
@@ -243,8 +246,9 @@ assign_service_locations() {
   done
 
   while true; do
-    # 计算 VPS 内存
+    # 计算 VPS 内存（sub2api 固定 VPS，先计入）
     local _svc_used=0
+    $INST_SUB2API && _svc_used=$((_svc_used+192))
     for _e in "${_T[@]}"; do
       IFS='|' read -r _iv _lv _ _mem _ <<< "$_e"
       local _on="${!_iv:-false}"
@@ -268,6 +272,7 @@ assign_service_locations() {
 
     # 固定 VPS 服务
     $INST_NEWAPI  && echo -e "  ${DIM}[─] [VPS] New-API       256MB  固定在 VPS${N}"
+    $INST_SUB2API && echo -e "  ${DIM}[─] [VPS] Sub2API       192MB  固定在 VPS${N}"
     $INST_SINGBOX && echo -e "  ${DIM}[─] [VPS] sing-box       64MB  固定在 VPS${N}"
     $INST_CADDY   && echo -e "  ${DIM}[─] [VPS] Caddy          32MB  固定在 VPS${N}"
     echo ""
@@ -333,33 +338,77 @@ assign_service_locations() {
 
   LOC_WEBUI=${_L[LOC_WEBUI]}
   LOC_LITELLM=${_L[LOC_LITELLM]}
-  LOC_SUB2API=${_L[LOC_SUB2API]}
   LOC_DIFY=${_L[LOC_DIFY]}
   return 0
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# 由服务位置派生部署模式
+# 有可分配服务被装到本地 → distributed（装 frps）；否则 allinone
+# 双条件（安装 AND 本地）：服务没勾选安装时，LOC 残留 local 也不触发
+# ═══════════════════════════════════════════════════════════════════
+derive_deploy_mode() {
+  local _d=false
+  $INST_WEBUI   && [[ "$LOC_WEBUI"   == "local" ]] && _d=true
+  $INST_LITELLM && [[ "$LOC_LITELLM" == "local" ]] && _d=true
+  $INST_DIFY    && [[ "$LOC_DIFY"    == "local" ]] && _d=true
+  if $_d; then
+    DEPLOY_MODE="distributed"
+  else
+    DEPLOY_MODE="allinone"
+    LOCAL_OS=""            # 清掉旧 .env 可能带入的 stale 值
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# 本地机器系统选择（仅 distributed 时调用）
+# 返回 0=已选定 LOCAL_OS；返回 1=用户按 0，要返回位置分配
+# ═══════════════════════════════════════════════════════════════════
+choose_local_os() {
+  while true; do
+    clear
+    echo ""
+    echo -e "  ${W}本地机器系统：${N}"
+    echo ""
+    echo "    1. Linux    生成 install-local.sh + docker-compose + frpc.toml"
+    echo "    2. Windows  生成 docker-compose + frpc.toml + start.bat"
+    echo ""
+    echo "    0. 返回上一级"
+    echo ""
+    local _os_choice
+    read -erp "  选择：" _os_choice
+
+    case "$_os_choice" in
+      0) return 1 ;;
+      1) LOCAL_OS="linux";   return 0 ;;
+      2) LOCAL_OS="windows"; return 0 ;;
+    esac
+  done
 }
 
 # ═══════════════════════════════════════════════════════════════════
 # 配置收集主流程
 # ═══════════════════════════════════════════════════════════════════
 collect_config() {
-  # ── 阶段 1：模式选择 ──────────────────────────────────────
-  # choose_deploy_mode 返回 1 表示用户选了"退出脚本"
-  choose_deploy_mode || exit 0
+  # ── 阶段 1：服务选择（首屏）——按 0 = 返回上一级（服务栈菜单）────
+  select_services || return 1
 
-  # ── 阶段 2：服务选择（可返回模式选择）────────────────────────
-  while true; do
-    select_services && break
-    choose_deploy_mode || exit 0
-  done
-
-  # ── 阶段 3：位置分配（可返回服务选择）────────────────────────
+  # ── 阶段 2：位置分配（可返回服务选择）────────────────────────
+  # 位置页按 0 → 回服务选择；服务页再按 0 → 返回上一级
   while true; do
     assign_service_locations && break
-    # 返回上一级 → 重新选服务
-    while true; do
-      select_services && break 2
-      choose_deploy_mode || exit 0
-    done
+    select_services || return 1
+  done
+
+  # ── 阶段 3：由位置派生部署模式 ───────────────────────────────
+  derive_deploy_mode
+
+  # ── 阶段 4：仅 distributed 才问本地系统（0 = 返回位置分配）────
+  while [[ "$DEPLOY_MODE" == "distributed" ]]; do
+    choose_local_os && break
+    # 用户按 0 → 重新分配位置，再派生；若改回全 VPS 则循环条件转假自动跳出
+    assign_service_locations || true
+    derive_deploy_mode
   done
 
   # 域名配置（跟随 Caddy）
