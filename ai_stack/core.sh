@@ -19,6 +19,14 @@ step() {
   echo -e "\n${W}${C}── [${STEP}/${TOTAL_STEPS}] $* ──────────────────────────${N}"
 }
 
+# 带标题的分隔线。与 lib/colors.sh 里的同名函数保持一致实现。
+# 之所以在此重复定义而不 source colors.sh：见下方 utils.sh 引入处的说明，
+# colors.sh 会把本文件的致命 err() 覆盖成非致命版本。
+section() {
+  local title="$1"
+  echo -e "\n${W}${C}── $title ──────────────────────────────${N}"
+}
+
 ask() {
   local _v=$1 _p=$2 _d=${3:-}
   local __ask_i
@@ -37,9 +45,15 @@ askyn() {
 
 # ── 通用工具函数（input_choose / break_end 等）──────────────────
 _AI_STACK_DIR="${BASH_SOURCE[0]%/*}"
-# 拆分后 utils.sh / colors.sh 仍在 lib/，从 ai_stack/ 引入需要 ../lib
-# shellcheck source=../lib/colors.sh
-source "${_AI_STACK_DIR}/../lib/colors.sh" 2>/dev/null || true
+# 拆分后 utils.sh 仍在 lib/，从 ai_stack/ 引入需要 ../lib
+#
+# 注意：这里绝对不能 source lib/colors.sh。
+# colors.sh:17 的 err() 是 `return 1`（非致命），而本文件第 13 行的 err()
+# 是 `exit 1`（致命）。source 发生在第 13 行之后，会把 err() 覆盖成非致命
+# 版本，导致 ai_stack 内 22 处 `|| err "..."` 全部失去中断能力 —— 例如
+# install_singbox 下载失败后会继续 tar 解压不存在的文件、install 不存在的
+# 二进制，留下半成品且不报错。
+# colors.sh 里 ai_stack 唯一缺的只是 section()，在下面单独补齐即可。
 # shellcheck source=../lib/utils.sh
 source "${_AI_STACK_DIR}/../lib/utils.sh" 2>/dev/null || {
   # 兜底：utils.sh 不存在时提供最小实现
