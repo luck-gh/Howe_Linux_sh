@@ -12,12 +12,21 @@
   再落数据」。原先直接解压数据，新机没装 Docker 时 `ai-pg` 必然失败，用户
   还得自己从「ai-db 容器未运行」倒推根因。
   - ① Docker：bundle 含容器化 scope 且本机缺 Docker 时，说明后果并询问是否
-    安装（官方脚本，装最新版）；已装则只报版本差异不改动——官方脚本无版本
-    参数，硬降级风险大于收益
+    安装（官方脚本，装最新版）；已装且版本不同时给出选择：切到 bundle 版本
+    （apt 锁版本，会重启 daemon）或保持本机版本。刚装完 Docker 还没起容器时
+    也会问是否改装成 bundle 版本——此刻无容器重启风险，是最适合对齐的时机。
   - ② 原生二进制对账：读 `host-inventory.json` 的 `native_versions`，逐项
     判定已一致 / 版本不同 / 未安装，三种处置模式（按旧机版本安装切换 /
     仅补缺失项 / 全部跳过）
   - ③ 才执行数据恢复
+- **Docker 锁版本 `mig_install_docker_pinned`**：Docker CE 由官方 apt 源
+  分发，可精确锁版本（之前判断「官方脚本无版本参数所以锁不了」只对
+  get.docker.com 那条路成立，走 apt 是可以的）。新增四个相关函数：
+  `mig_docker_apt_managed`（判断是否 apt 管理）、`mig_docker_apt_pkgver`
+  （查询 apt 源中的完整包版本串）、`mig_docker_apt_versions`（列出可用版本）、
+  `mig_install_docker_pinned`（按指定版本安装/切换，会重启 daemon）。
+  版本串匹配用 `:版本-` 锚定以防误中（`grep -F 29.5.0` 会匹配 129.5.0 /
+  29.5.01）。
 - **锁版本安装器 `mig_install_singbox_pinned` / `mig_install_frps_pinned`**：
   现有 `install_singbox` 与 `install_frp_server` 都是「查 GitHub latest 后
   装」，且失败时调 `err()`（内部 `exit 1`）——在恢复流程里调用会直接杀掉整个

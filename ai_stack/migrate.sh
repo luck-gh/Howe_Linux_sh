@@ -459,8 +459,19 @@ except Exception: pass
       if $yn; then
         info "安装 Docker（可能需要几分钟）..."
         if curl -fsSL "${URL_DOCKER_OFFICIAL:-https://get.docker.com}" | bash -s -- --quiet; then
-          log "Docker 已安装：$(mig_local_tool_version docker)"
+          local _fresh; _fresh=$(mig_local_tool_version docker)
+          log "Docker 已安装：${_fresh}"
           systemctl enable --now docker >/dev/null 2>&1 || true
+          # 官方脚本装的是最新版，与 bundle 版本可能不同。此时容器还没起来，
+          # 切版本无重启风险，是最适合对齐的时机。
+          if [[ -n "$docker_want" && "$docker_want" != "$_fresh" ]]; then
+            echo ""
+            info "旧机用的是 ${docker_want}，刚装的是 ${_fresh}"
+            local ynv
+            askyn ynv "改装成 bundle 版本 ${docker_want}？（此刻无容器运行，无风险）" n
+            $ynv && { mig_install_docker_pinned "$docker_want" \
+                      || warn "改装失败，继续使用 ${_fresh}"; }
+          fi
         else
           warn "Docker 安装失败"
           local yn2; askyn yn2 "仍要继续恢复（容器相关 scope 会失败）？" n
@@ -471,9 +482,38 @@ except Exception: pass
         $yn3 || { info "已中止恢复"; return 1; }
       fi
     else
-      # 已装：只报差异，不动它。Docker 官方脚本无版本参数，硬降级风险大
+      # 已装：版本不同时给出选择，而非仅报差异。Docker CE 走官方 apt 源
+      # 可以精确锁版本（get.docker.com 那条路才没有版本参数）。
       if [[ -n "$docker_want" && "$docker_want" != "$docker_have" ]]; then
-        info "Docker 本机 ${docker_have}，旧机 ${docker_want}（版本差异通常无影响，不改动）"
+        echo ""
+        echo -e "  ${W}Docker 版本与旧机不一致${N}"
+        echo -e "    旧机（bundle）：${docker_want}"
+        echo -e "    本机          ：${docker_have}"
+        echo ""
+        echo -e "  ${DIM}多数情况版本差异不影响容器运行。若要完全复刻旧机环境，"
+        echo -e "  或旧机 compose 用了新版语法，可切到 bundle 版本。${N}"
+        echo ""
+        input_choose "如何处理 Docker 版本" \
+          "切到 bundle 版本 ${docker_want}（apt 锁版本，会重启 daemon）" \
+          "保持本机 ${docker_have}"
+        if (( INPUT_RESULT == 0 )); then
+          # 切版本会重启 daemon，运行中的容器随之重启，先让用户知情
+          local _running; _running=$(docker ps -q 2>/dev/null | wc -l)
+          local _goahead=true
+          if (( _running > 0 )); then
+            warn "当前有 ${_running} 个容器在运行，切换会重启 Docker daemon 并连带重启它们"
+            local ynd; askyn ynd "确认切换？" n
+            $ynd || _goahead=false
+          fi
+          if $_goahead; then
+            mig_install_docker_pinned "$docker_want" \
+              || warn "切换失败，继续使用本机 ${docker_have}"
+          else
+            info "保持本机 ${docker_have}"
+          fi
+        else
+          info "保持本机 ${docker_have}"
+        fi
       else
         log "Docker ${docker_have} 就绪"
       fi

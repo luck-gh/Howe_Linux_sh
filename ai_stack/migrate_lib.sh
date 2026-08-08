@@ -676,6 +676,81 @@ mig_install_frps_pinned() {
   log "frps 已装到 v${ver}"
 }
 
+# ── Docker 锁版本 ─────────────────────────────────────────────────
+# Docker CE 由官方 apt 源分发，可以精确锁版本 —— 之前判断「官方脚本无版本
+# 参数所以锁不了」只对 get.docker.com 那条路成立，走 apt 是可以的。
+#
+# 版本串格式差异：inventory 里记的是 `29.5.0`（docker --version 的裸版本），
+# apt 里是 `5:29.5.0-1~ubuntu.24.04~noble`（epoch + 发行版后缀）。
+# 匹配必须用 `:版本-` 锚定，否则 `grep -F 29.5.0` 会误中 129.5.0 / 29.5.01。
+
+# 判断 docker 是否由 apt 管理（脚本装的没有 apt 记录，无法锁版本）
+mig_docker_apt_managed() {
+  dpkg-query -W -f='${Status}' docker-ce 2>/dev/null | grep -q 'ok installed'
+}
+
+# 查询 apt 源中是否有指定裸版本，命中则输出完整包版本串
+# $1 = 裸版本（如 29.5.0）
+mig_docker_apt_pkgver() {
+  local want=$1
+  [[ -n "$want" ]] || return 1
+  apt-cache madison docker-ce 2>/dev/null \
+    | awk -F'|' '{gsub(/ /,"",$2); print $2}' \
+    | grep -F ":${want}-" | head -1
+}
+
+# 列出 apt 源中可用的 docker 裸版本（供用户参考）
+mig_docker_apt_versions() {
+  apt-cache madison docker-ce 2>/dev/null \
+    | awk -F'|' '{gsub(/ /,"",$2); print $2}' \
+    | sed -E 's/^[0-9]+://; s/-[0-9].*$//' | head -12
+}
+
+# 按指定版本安装/切换 Docker
+# $1 = 裸版本（如 29.5.0）
+# 注意：会重启 docker daemon，运行中的容器随之重启。调用方须先确认。
+mig_install_docker_pinned() {
+  local want=$1
+  [[ -n "$want" ]] || { warn "未指定 Docker 版本"; return 1; }
+
+  mig_docker_apt_managed || {
+    warn "本机 Docker 不是 apt 安装的（可能来自 get.docker.com 脚本）"
+    echo -e "  ${DIM}锁版本需先卸载再用官方 apt 源重装，此处不代为执行${N}" >&2
+    return 1
+  }
+
+  local pkgver; pkgver=$(mig_docker_apt_pkgver "$want")
+  if [[ -z "$pkgver" ]]; then
+    warn "apt 源中没有 docker-ce ${want}"
+    local -a avail=(); mapfile -t avail < <(mig_docker_apt_versions)
+    (( ${#avail[@]} > 0 )) && \
+      echo -e "  ${DIM}源中可用：${avail[*]}${N}" >&2
+    return 1
+  fi
+
+  info "切换 Docker 到 ${want}（包版本 ${pkgver}）..."
+  # docker-ce 与 docker-ce-cli 必须同版本，否则 apt 会解不开依赖。
+  # --allow-downgrades：降级时 apt 默认拒绝。
+  # 实测 dry-run 只有 Inst/Conf 没有 Remv，容器不会被删除。
+  local -a pkgs=("docker-ce=$pkgver" "docker-ce-cli=$pkgver")
+  # rootless-extras 若已装也要跟着走，否则版本不一致
+  dpkg-query -W -f='${Status}' docker-ce-rootless-extras 2>/dev/null \
+    | grep -q 'ok installed' && pkgs+=("docker-ce-rootless-extras=$pkgver")
+
+  if apt-get install -y -qq --allow-downgrades "${pkgs[@]}" >/dev/null 2>&1; then
+    systemctl restart docker >/dev/null 2>&1 || true
+    local now; now=$(mig_local_tool_version docker)
+    if [[ "$now" == "$want" ]]; then
+      log "Docker 已切到 ${now}"
+    else
+      warn "安装完成但版本显示为 ${now}（预期 ${want}）"
+    fi
+  else
+    warn "apt 安装失败，Docker 版本未变"
+    return 1
+  fi
+}
+
 # 读取本机某工具的当前版本（未安装则输出空）
 # $1 = caddy|sing-box|frps|docker
 mig_local_tool_version() {
