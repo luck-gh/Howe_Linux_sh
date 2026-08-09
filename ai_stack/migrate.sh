@@ -1136,31 +1136,35 @@ PY
   local yn; askyn yn "确认执行以上 ${#restore_plan[@]} 项？" n
   $yn || { info "已取消"; return 0; }
 
-  # 前置：先让运行环境（Docker / 原生二进制）就位，再落数据。
-  # 顺序颠倒的话，ai-pg 会因为 ai-db 容器不存在而失败。
+  # 前置：先让运行环境就位，再落数据。顺序颠倒的话 ai-pg 会因为 ai-db
+  # 容器不存在而失败。
+  #   ① Docker 本体   ② 原生二进制   ③ 镜像
   _mig_preflight_tools "$bk_dir" || return 0
 
-  # 逐项执行
+  # ③ 镜像版本对账。放在数据落位「之前」：
+  #   - 按 digest 拉镜像只需要 docker-images.lock.json 里的 ref + digest，
+  #     该文件自包含，不依赖 compose 文件，所以没有「必须先恢复 ai-config」
+  #     这个前提（早先的版本错误地加了这道门槛，导致只恢复数据时镜像不对账）
+  #   - 镜像先就位，数据落位后 compose up 一次就能起来，不用等第二轮
+  #   - docker-images scope 有自己的 pull/load 策略，避免重复处理
+  if [[ " ${restore_plan[*]} " != *" docker-images:"* ]]; then
+    echo ""
+    mig_reconcile_images "$bk_dir"
+  fi
+
+  # ④ 逐项落数据
   echo ""
   local pair
-  local restored_ai_config=0
   for pair in "${restore_plan[@]}"; do
     local sk="${pair%%:*}" strat="${pair##*:}"
     section "$sk → $strat"
-    if mig_execute_strategy "$sk" "$strat" "$bk_dir"; then
-      [[ "$sk" == "ai-config" ]] && restored_ai_config=1
-    else
-      warn "$sk 执行失败，继续"
-    fi
+    mig_execute_strategy "$sk" "$strat" "$bk_dir" || warn "$sk 执行失败，继续"
   done
 
-  # 镜像版本对账：恢复了 ai-config（compose 文件已就位）才有意义。
-  # docker-images scope 走自己的 pull/load 策略，这里不重复处理。
-  if (( restored_ai_config )) && [[ " ${restore_plan[*]} " != *" docker-images:"* ]]; then
-    echo ""
-    mig_reconcile_images "$bk_dir"
-    _mig_offer_compose_up
-  fi
+  # ⑤ 起容器。必须在数据落位之后——compose 文件此时才在盘上。
+  # 判据改为「盘上是否真有 compose 文件」而不是「本轮是否恢复了 ai-config」，
+  # 这样只恢复数据（compose 早就在）的场景也能正常起容器。
+  _mig_offer_compose_up
 
   echo ""
   log "恢复流程完成"
