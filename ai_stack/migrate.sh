@@ -852,6 +852,9 @@ PY
     [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; }
 
     local _in; read -erp "  选择: " _in
+    # 去掉可能存在的 \r（SSH 会话偶尔会产生）
+    _in="${_in//$'\r'/}"
+    [[ -z "$_in" ]] && break
     case "${_in,,}" in
       a)
         # 全部对齐：选第一个策略（通常是 install/upgrade/downgrade/pin）
