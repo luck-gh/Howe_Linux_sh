@@ -13,10 +13,6 @@
 #   none / openssl / age（口令 或 密钥对）
 # ═══════════════════════════════════════════════════════════════════
 
-# 加载统一对账函数
-[[ -f "$(dirname "${BASH_SOURCE[0]}")/migrate_unified.sh" ]] && \
-  source "$(dirname "${BASH_SOURCE[0]}")/migrate_unified.sh"
-
 # ── 通用交互工具 ─────────────────────────────────────────────────
 
 # 让用户选一个 cipher
@@ -427,10 +423,9 @@ except Exception: pass
 # 原先直接进第 ③ 步，所以新机没装 docker 时 ai-pg 必然失败，用户还得自己
 # 从「ai-db 容器未运行」这条信息倒推出根因。
 #
-# Docker 本体检查（从 _mig_preflight_tools 拆分出来）
 # $1 = 备份点目录（含 host-inventory.json）
-# 返回 0 = 可继续；1 = 用户选择中止
-_mig_preflight_docker() {
+# 返回 0 = 可继续恢复；1 = 用户选择中止
+_mig_preflight_tools() {
   local bp_dir=$1
   local inv="$bp_dir/host-inventory.json"
 
@@ -442,7 +437,7 @@ _mig_preflight_docker() {
      || -f "$bp_dir/ai-data.tar.gz" || -f "$bp_dir/docker-images.tar.gz" ]] \
     && needs_docker=1
 
-  # ── Docker 版本检查 ──
+  # ── ① Docker ──
   local docker_want=""
   [[ -f "$inv" ]] && command -v python3 >/dev/null 2>&1 && \
     docker_want=$(python3 -c "
@@ -524,13 +519,8 @@ except Exception: pass
       fi
     fi
   fi
-  return 0
-}
 
-# 仅对账原生二进制（当 docker-images scope 被选中时使用）
-_mig_reconcile_binaries_only() {
-  local bp_dir=$1
-  local inv="$bp_dir/host-inventory.json"
+  # ── ② 原生二进制版本对账 ──
   [[ -f "$inv" ]] || { info "备份点无环境清单，跳过二进制对账"; return 0; }
   command -v python3 >/dev/null 2>&1 || { info "无 python3，跳过二进制对账"; return 0; }
 
@@ -554,7 +544,7 @@ for k in ('caddy','sing_box','frps'):
     local k want; IFS='|' read -r k want <<< "$row"
     local name pinnable
     case "$k" in
-      caddy)    name="caddy";    pinnable=0 ;;
+      caddy)    name="caddy";    pinnable=0 ;;  # apt 装，无法干净锁版本
       sing_box) name="sing-box"; pinnable=1 ;;
       frps)     name="frps";     pinnable=1 ;;
       *) continue ;;
@@ -586,6 +576,7 @@ for k in ('caddy','sing_box','frps'):
       未安装)   col="$C"; need_action=1 ;;
     esac
     local pad=$(( 8 - ${#sc} * 2 )); (( pad < 1 )) && pad=1
+    # 备注段用 %b 而非 %s：DIM/N 存的是字面 \033[..m，%s 不会解释
     local note=""
     (( t_pin[i] == 0 )) && note="  ${DIM}(apt 管理，不锁版本)${N}"
     printf "  %-12s %-12s %-12s ${col}%s${N}%*s%b\n" \
@@ -627,377 +618,14 @@ for k in ('caddy','sing_box','frps'):
   return 0
 }
 
-# 统一对账：二进制 + 镜像，一张表一次交互
-# $1 = 备份点目录
-_mig_reconcile_all() {
-  local bp_dir=$1
-  local inv="$bp_dir/host-inventory.json"
-  local lock="$bp_dir/docker-images.lock.json"
-
-  # 前置检查
-  [[ -f "$inv" ]] || { info "备份点无环境清单，跳过版本对账"; return 0; }
-  command -v python3 >/dev/null 2>&1 || { info "无 python3，跳过版本对账"; return 0; }
-
-  section "版本对账（工具 + 镜像）"
-  echo -e "  ${DIM}对比旧机和本机的版本差异，可选择对齐或保持现状${N}"
-  echo ""
-
-  # ── 第一部分：读取二进制工具数据 ──
-  local -a bin_rows=()
-  mapfile -t bin_rows < <(python3 -c "
-import json,sys
-try: nv=json.load(open(sys.argv[1])).get('native_versions',{}) or {}
-except Exception: nv={}
-for k in ('caddy','sing_box','frps'):
-    v=nv.get(k) or ''
-    if v: print(f'{k}|{v}')
-" "$inv" 2>/dev/null)
-
-  # ── 第二部分：读取镜像数据 ──
-  local -a img_rows=()
-  if [[ -f "$lock" ]] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    mapfile -t img_rows < <(python3 - "$lock" <<'PY' 2>/dev/null
-import json, sys
-d = json.load(open(sys.argv[1]))
-for i in d.get("images", []):
-    print("|".join([
-        i.get("service", "") or i.get("container", ""),
-        i.get("ref", ""),
-        i.get("digest", ""),
-        i.get("tag", ""),
-        "1" if i.get("mutable_tag") else "0",
-    ]))
-PY
-    )
-  fi
-
-  # 如果两者都为空，直接返回
-  (( ${#bin_rows[@]} == 0 && ${#img_rows[@]} == 0 )) && { info "无版本信息可对账"; return 0; }
-
-  # ── 第三部分：构建统一数据结构 ──
-  # 每行：type|name|want_ver|have_ver|state|策略候选IDs|策略标签|当前选择索引
-  local -a all_type=() all_name=() all_want=() all_have=() all_state=() all_ids=() all_labels=() all_cur=()
-
-  # 处理二进制工具
-  for row in "${bin_rows[@]}"; do
-    local k want; IFS='|' read -r k want <<< "$row"
-    local name pinnable
-    case "$k" in
-      caddy)    name="caddy";    pinnable=0 ;;
-      sing_box) name="sing-box"; pinnable=1 ;;
-      frps)     name="frps";     pinnable=1 ;;
-      *) continue ;;
-    esac
-
-    local have; have=$(mig_local_tool_version "$name")
-    local state ids labels
-
-    if (( ! pinnable )); then
-      # Caddy：不可锁版本
-      if [[ -z "$have" ]]; then
-        state="未安装"
-        ids="install_latest skip"
-        labels="安装最新版（apt）"$'\x1f'"跳过"
-      else
-        state="不可锁版本"
-        ids="keep"
-        labels="保持 ${have}（apt管理）"
-      fi
-    else
-      # 可锁版本工具
-      if [[ -z "$have" ]]; then
-        state="未安装"
-        ids="install install_latest skip"
-        labels="安装 ${want}（推荐）"$'\x1f'"安装最新版"$'\x1f'"跳过"
-      elif [[ "$have" == "$want" ]]; then
-        state="已一致"
-        ids="keep install_latest"
-        labels="保持 ${have}"$'\x1f'"升级到最新版"
-      else
-        # 版本比较
-        local cmp; cmp=$(mig_version_compare "$have" "$want")
-        if (( cmp < 0 )); then
-          state="需要更新"
-          ids="install keep install_latest skip"
-          labels="更新到 ${want}（bundle版本）"$'\x1f'"保持 ${have}"$'\x1f'"更新到最新版"$'\x1f'"跳过"
-        else
-          state="需要回退"
-          ids="install keep install_latest skip"
-          labels="回退到 ${want}（bundle版本）"$'\x1f'"保持 ${have}"$'\x1f'"升级到最新版"$'\x1f'"跳过"
-        fi
-      fi
-    fi
-
-    all_type+=("工具")
-    all_name+=("$name")
-    all_want+=("$want")
-    all_have+=("${have:-—}")
-    all_state+=("$state")
-    all_ids+=("$ids")
-    all_labels+=("$labels")
-    all_cur+=(0)
-  done
-
-  # 处理镜像
-  for row in "${img_rows[@]}"; do
-    local svc ref dg tag mut
-    IFS='|' read -r svc ref dg tag mut <<< "$row"
-    [[ -n "$ref" ]] || continue
-
-    local local_dg; local_dg=$(_mig_img_local_digest "$ref")
-    local state ids labels
-
-    if [[ -z "$dg" ]]; then
-      state="无digest"
-      ids="pull_tag skip"
-      labels="按 tag 拉取（无法锁版本）"$'\x1f'"跳过"
-    elif [[ -n "$local_dg" && "${local_dg##*@}" == "${dg##*@}" ]]; then
-      state="已一致"
-      ids="keep pull_tag"
-      labels="保持现状"$'\x1f'"拉 tag 最新版"
-    elif [[ -n "$local_dg" ]]; then
-      state="版本不同"
-      ids="pin pull_tag keep"
-      labels="用 bundle 版本"$'\x1f'"拉 tag 最新版"$'\x1f'"保持本机"
-    elif _mig_img_has_digest "$dg"; then
-      state="缺tag"
-      ids="pin pull_tag"
-      labels="用 bundle 版本并打 tag"$'\x1f'"按 tag 重新拉取"
-    else
-      state="未安装"
-      ids="pin pull_tag skip"
-      labels="拉 bundle 版本"$'\x1f'"拉 tag 最新版"$'\x1f'"跳过"
-    fi
-
-    all_type+=("镜像")
-    all_name+=("$svc")
-
-    # 截短 digest 显示
-    local want_display="${ref}@${dg##*@sha256:}"
-    want_display="${want_display:0:40}"
-    all_want+=("$want_display")
-
-    local have_display=""
-    if [[ -n "$local_dg" ]]; then
-      have_display="${local_dg##*@sha256:}"
-      have_display="${have_display:0:12}"
-    fi
-    all_have+=("$have_display")
-
-    all_state+=("$state")
-    all_ids+=("$ids")
-    all_labels+=("$labels")
-    all_cur+=(0)
-
-    # 保存完整数据供执行时使用
-    all_ref+=("$ref")
-    all_dg+=("$dg")
-  done
-
-  (( ${#all_type[@]} == 0 )) && return 0
-
-  # ── 第四部分：交互式表格 ──
-  local _msg="" all_ref=() all_dg=()
-  # 重建 all_ref 和 all_dg（仅镜像行有值）
-  local z
-  for z in "${!all_type[@]}"; do
-    if [[ "${all_type[$z]}" == "镜像" ]]; then
-      # 从 img_rows 重新解析
-      local row="${img_rows[$((z - ${#bin_rows[@]}))]}"
-      local svc ref dg tag mut
-      IFS='|' read -r svc ref dg tag mut <<< "$row"
-      all_ref+=("$ref")
-      all_dg+=("$dg")
-    else
-      all_ref+=("")
-      all_dg+=("")
-    fi
-  done
-
-  while true; do
-    echo ""
-    printf "  %-4s %-6s %-14s %-16s %-12s %s\n" "" "类型" "名称" "旧机版本" "状态" "将执行"
-    echo -e "  ${DIM}────────────────────────────────────────────────────────────────────────────${N}"
-    local n=0
-    for z in "${!all_type[@]}"; do
-      n=$((n + 1))
-      local -a _ids=() _labs=()
-      read -ra _ids <<< "${all_ids[$z]}"
-      IFS=$'\x1f' read -ra _labs <<< "${all_labels[$z]}"
-      local cur=${all_cur[$z]}
-      local sc="${all_state[$z]}" scol="$N"
-      case "$sc" in
-        已一致)      scol="$G" ;;
-        需要更新|需要回退) scol="$Y" ;;
-        未安装)      scol="$C" ;;
-        版本不同)    scol="$Y" ;;
-        不可锁版本)  scol="$DIM" ;;
-        无digest|缺tag) scol="$Y" ;;
-      esac
-
-      # 中文字符宽度补偿
-      local pad=$(( 12 - ${#sc} * 2 )); (( pad < 1 )) && pad=1
-      local disp_want="${all_want[$z]}"
-      [[ "${all_type[$z]}" == "镜像" ]] && disp_want="@${disp_want##*@}" disp_want="${disp_want:0:12}"
-
-      printf "  %2d.  %-6s %-14s %-16s ${scol}%s${N}%*s %s\n" \
-        "$n" "${all_type[$z]}" "${all_name[$z]:0:14}" "${disp_want:0:16}" "$sc" "$pad" "" "${_labs[$cur]}"
-    done
-    echo ""
-    echo -e "  ${DIM}输入编号切换 | a=对齐 bundle | t=全部最新 | s=跳过全部 | 回车执行 | q 取消${N}"
-    [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; }
-
-    local _in; read -erp "  选择: " _in
-    [[ -z "$_in" ]] && break
-    case "${_in,,}" in
-      q|quit) info "已跳过版本对账"; return 0 ;;
-      a)
-        # 全部对齐：选第一个策略（通常是 install/upgrade/downgrade/pin）
-        local changed=0
-        for z in "${!all_type[@]}"; do
-          [[ "${all_state[$z]}" == "已一致" || "${all_state[$z]}" == "不可锁版本" ]] && continue
-          all_cur[$z]=0
-          changed=$((changed + 1))
-        done
-        _msg="已设为对齐 bundle：${changed} 项"
-        ;;
-      t)
-        # 全部最新版
-        local changed=0
-        for z in "${!all_type[@]}"; do
-          local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
-          local k
-          for k in "${!_ids[@]}"; do
-            if [[ "${_ids[$k]}" == "install_latest" || "${_ids[$k]}" == "pull_tag" ]]; then
-              all_cur[$z]=$k
-              changed=$((changed + 1))
-              break
-            fi
-          done
-        done
-        _msg="已设为安装/拉取最新版：${changed} 项"
-        ;;
-      s)
-        # 全部跳过
-        for z in "${!all_type[@]}"; do
-          local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
-          local k
-          for k in "${!_ids[@]}"; do
-            [[ "${_ids[$k]}" == "skip" || "${_ids[$k]}" == "keep" ]] && { all_cur[$z]=$k; break; }
-          done
-        done
-        _msg="已全部设为跳过/保持"
-        ;;
-      *)
-        if [[ "$_in" =~ ^[0-9]+$ ]] && (( _in >= 1 && _in <= ${#all_type[@]} )); then
-          z=$((_in - 1))
-          local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
-          all_cur[$z]=$(( (all_cur[z] + 1) % ${#_ids[@]} ))
-        else
-          _msg="无效输入：$_in"
-        fi
-        ;;
-    esac
-  done
-
-  # ── 第五部分：执行 ──
-  echo "[DEBUG] 开始执行版本对账操作" >&2
-  echo ""
-  local ok=0 fail=0 skipped=0
-  echo "[DEBUG] 数组长度: ${#all_type[@]}" >&2
-  for z in "${!all_type[@]}"; do
-    echo "[DEBUG] 处理第 $z 项: ${all_name[$z]}" >&2
-    local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
-    local act="${_ids[${all_cur[$z]}]}"
-    local type="${all_type[$z]}" name="${all_name[$z]}" want="${all_want[$z]}" have="${all_have[$z]}"
-    echo "[DEBUG]   类型=$type 名称=$name 动作=$act want=$want have=$have" >&2
-
-    case "$act" in
-      keep|skip)
-        echo "[DEBUG]   动作: 跳过" >&2
-        skipped=$((skipped + 1))
-        ;;
-      install_latest)
-        echo "[DEBUG]   动作: install_latest" >&2
-        if [[ "$type" == "工具" ]]; then
-          # 传递 "latest" 作为目标版本
-          _mig_install_native "$name" "latest" "$have" "${all_pinnable[$z]}" && ok=$((ok + 1)) || fail=$((fail + 1))
-        fi
-        ;;
-      install)
-        if [[ "$type" == "工具" ]]; then
-          _mig_install_native "$name" "$want" "$have" "${all_pinnable[$z]}" && ok=$((ok + 1)) || fail=$((fail + 1))
-        fi
-        ;;
-      pin)
-        # 镜像：按 digest 拉取并 retag
-        local ref="${all_ref[$z]}" dg="${all_dg[$z]}"
-        if _mig_img_has_digest "$dg"; then
-          info "[$name] 本地已有该版本，直接打 tag"
-        else
-          info "[$name] 拉取 bundle 版本"
-          docker pull "$dg" >/dev/null 2>&1 || { warn "  ✗ 拉取失败"; fail=$((fail + 1)); continue; }
-        fi
-        docker tag "$dg" "$ref" 2>/dev/null && { log "  ✓ $ref"; ok=$((ok + 1)); } || { warn "  ✗ retag 失败"; fail=$((fail + 1)); }
-        ;;
-      pull_tag)
-        # 镜像：拉取 tag 最新版
-        local ref="${all_ref[$z]}"
-        info "[$name] 拉取 $ref 最新版"
-        docker pull "$ref" >/dev/null 2>&1 && { log "  ✓"; ok=$((ok + 1)); } || { warn "  ✗ 失败"; fail=$((fail + 1)); }
-        ;;
-    esac
-  done
-
-  echo ""
-  echo -e "  ${W}版本对账完成${N}：${G}${ok} 成功${N} / ${R}${fail} 失败${N} / ${DIM}${skipped} 跳过${N}"
-  return 0
-}
-
-# 旧函数保留作为兼容（暂时不删，避免其他地方有调用）
-_mig_preflight_tools() {
-  local bp_dir=$1
-  _mig_preflight_docker "$bp_dir" || return 1
-  _mig_reconcile_binaries_only "$bp_dir" || return 0
-  return 0
-}
-
 # 安装/切换单个原生二进制
-# $1=工具名 $2=目标版本（或"latest"） $3=当前版本 $4=是否可锁版本(1/0)
+# $1=工具名 $2=目标版本 $3=当前版本 $4=是否可锁版本(1/0)
 _mig_install_native() {
   local name=$1 want=$2 have=$3 pinnable=$4
-  echo "[DEBUG] _mig_install_native: name=$name want=$want have=$have pinnable=$pinnable" >&2
 
   if (( ! pinnable )); then
-    echo "[DEBUG] 进入 pinnable=0 分支" >&2
     # caddy：apt 源装，锁版本需额外配 repo pinning，风险大于收益
-    if [[ "$want" == "latest" ]]; then
-      echo "[DEBUG] want=latest，开始安装 Caddy" >&2
-      info "[$name] 安装最新版（apt）..."
-
-      # 添加 Caddy 官方源（如果尚未添加）
-      if ! grep -q "caddy/stable" /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null; then
-        echo "[DEBUG] 开始添加 Caddy GPG 密钥" >&2
-        curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" \
-          | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null \
-          || { warn "  ✗ 添加 Caddy GPG 密钥失败"; echo "[DEBUG] GPG 密钥添加失败" >&2; return 1; }
-
-        echo "[DEBUG] 开始写入 Caddy 源配置" >&2
-        echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
-          > /etc/apt/sources.list.d/caddy-stable.list \
-          || { warn "  ✗ 添加 Caddy 源失败"; echo "[DEBUG] 源配置写入失败" >&2; return 1; }
-      else
-        echo "[DEBUG] Caddy 源已存在，跳过添加" >&2
-      fi
-
-      echo "[DEBUG] 开始 apt update" >&2
-      apt-get update -qq || { warn "  ✗ apt 更新失败"; echo "[DEBUG] apt update 失败" >&2; return 1; }
-      echo "[DEBUG] 开始 apt install caddy" >&2
-      apt-get install -y -qq caddy || { warn "  ✗ apt 安装失败"; echo "[DEBUG] apt install 失败" >&2; return 1; }
-      echo "[DEBUG] Caddy 安装成功" >&2
-      log "  ✓ caddy 已安装 ($(caddy version 2>/dev/null | head -1))"
-      return 0
-    elif [[ -z "$have" ]]; then
+    if [[ -z "$have" ]]; then
       # 不在此处调 install_caddy：它内部用 err()（exit 1），会杀掉恢复流程
       warn "[$name] 本机缺失。恢复完成后请到「AI 服务栈 → 安装」装 Caddy"
       info "  apt 源无法锁到旧机的 ${want}，装到的是当前最新版"
@@ -1005,26 +633,6 @@ _mig_install_native() {
       info "[$name] 本机 ${have} / 旧机 ${want}，apt 管理不锁版本，保持现状"
     fi
     return 0
-  fi
-
-  # 处理 "latest" 版本查询
-  if [[ "$want" == "latest" ]]; then
-    case "$name" in
-      sing-box)
-        info "[$name] 查询最新版本..."
-        want=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"v\K[^"]+') \
-          || { warn "  ✗ 无法查询最新版本"; return 1; }
-        info "  最新版本：v${want}"
-        ;;
-      frps)
-        info "[$name] 查询最新版本..."
-        want=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"v\K[^"]+') \
-          || { warn "  ✗ 无法查询最新版本"; return 1; }
-        info "  最新版本：v${want}"
-        ;;
-      *)
-        warn "[$name] 无最新版本查询实现"; return 1 ;;
-    esac
   fi
 
   case "$name" in
@@ -1530,16 +1138,18 @@ PY
 
   # 前置：先让运行环境就位，再落数据。顺序颠倒的话 ai-pg 会因为 ai-db
   # 容器不存在而失败。
-  #   ① Docker 本体检查（安装或版本切换）
-  _mig_preflight_docker "$bk_dir" || return 0
+  #   ① Docker 本体   ② 原生二进制   ③ 镜像
+  _mig_preflight_tools "$bk_dir" || return 0
 
-  #   ② 统一版本对账：原生二进制 + 镜像（docker-images scope 有自己的策略时跳过镜像部分）
+  # ③ 镜像版本对账。放在数据落位「之前」：
+  #   - 按 digest 拉镜像只需要 docker-images.lock.json 里的 ref + digest，
+  #     该文件自包含，不依赖 compose 文件，所以没有「必须先恢复 ai-config」
+  #     这个前提（早先的版本错误地加了这道门槛，导致只恢复数据时镜像不对账）
+  #   - 镜像先就位，数据落位后 compose up 一次就能起来，不用等第二轮
+  #   - docker-images scope 有自己的 pull/load 策略，避免重复处理
   if [[ " ${restore_plan[*]} " != *" docker-images:"* ]]; then
     echo ""
-    _mig_reconcile_all "$bk_dir" || return 0
-  else
-    # docker-images scope 已选中，只对账原生二进制
-    _mig_reconcile_binaries_only "$bk_dir" || return 0
+    mig_reconcile_images "$bk_dir"
   fi
 
   # ④ 逐项落数据
@@ -1555,9 +1165,6 @@ PY
   # 判据改为「盘上是否真有 compose 文件」而不是「本轮是否恢复了 ai-config」，
   # 这样只恢复数据（compose 早就在）的场景也能正常起容器。
   _mig_offer_compose_up
-
-  # 恢复后验证
-  _mig_verify_restore
 
   echo ""
   log "恢复流程完成"
@@ -1578,192 +1185,9 @@ _mig_offer_compose_up() {
     return 0
   }
   info "启动容器..."
-  ( cd "$base" && docker compose up -d ) || {
-    warn "启动失败，可手动排查：cd $base && docker compose up -d"
-    return 1
-  }
-
-  # 等待健康检查（最长60秒）
-  info "等待容器健康检查..."
-  local elapsed=0 max_wait=60
-  while (( elapsed < max_wait )); do
-    # 用 docker compose ps --format json 获取状态，Python 解析 Health 字段
-    local check_result
-    check_result=$(cd "$base" && docker compose ps --format json 2>/dev/null | python3 -c '
-import json, sys
-lines = sys.stdin.read().strip().split("\n")
-if not lines or not lines[0]: sys.exit(0)
-containers = [json.loads(line) for line in lines if line]
-total = len(containers)
-healthy = sum(1 for c in containers if c.get("Health") == "healthy" or c.get("State") == "running" and not c.get("Health"))
-unhealthy = [c.get("Service","?") for c in containers if c.get("Health") == "unhealthy"]
-exited = [c.get("Service","?") for c in containers if c.get("State") == "exited"]
-if unhealthy or exited:
-  print(f"unhealthy|{\" \".join(unhealthy + exited)}")
-elif healthy == total:
-  print("ok")
-else:
-  print("starting")
-' 2>/dev/null)
-
-    case "$check_result" in
-      ok)
-        echo ""
-        log "服务栈已启动并通过健康检查"
-        return 0
-        ;;
-      unhealthy\|*)
-        local failed="${check_result#unhealthy|}"
-        echo ""
-        warn "部分容器未通过健康检查: $failed"
-        echo ""
-        ( cd "$base" && docker compose ps )
-        echo ""
-        info "常见排查命令："
-        info "  docker compose logs --tail=50 $failed"
-        info "  docker compose restart $failed"
-        echo ""
-        local yn
-        askyn yn "容器可能仍在启动中，是否继续？" y
-        $yn && return 0 || return 1
-        ;;
-      starting)
-        echo -ne "  等待中... ${elapsed}s / ${max_wait}s\r"
-        sleep 3
-        (( elapsed += 3 ))
-        ;;
-      *)
-        # docker/python 不可用或其他错误，降级为直接返回
-        echo ""
-        log "服务栈已启动（无法检测健康状态）"
-        return 0
-        ;;
-    esac
-  done
-
-  # 超时
-  echo ""
-  warn "健康检查超时（${max_wait}s），部分容器可能仍在启动"
-  ( cd "$base" && docker compose ps )
-  echo ""
-  info "可稍后检查: cd $base && docker compose ps"
-  local yn
-  askyn yn "是否继续？" y
-  $yn && return 0 || return 1
-}
-
-# 恢复后验证：检查容器、服务、端口、配置
-_mig_verify_restore() {
-  echo ""
-  echo -e "${DIM}  ── 恢复后验证 ──${N}"
-  echo ""
-
-  local -a pass=() fail=() skip=()
-  local base="${BACKUP_AI_BASE:-/opt/ai-stack}"
-
-  # 1. Docker 容器健康状态
-  if [[ -f "$base/docker-compose.yml" ]] && command -v docker >/dev/null 2>&1; then
-    local compose_check
-    compose_check=$(cd "$base" && docker compose ps --format json 2>/dev/null | python3 -c '
-import json, sys
-lines = sys.stdin.read().strip().split("\n")
-if not lines or not lines[0]: print("skip"); sys.exit(0)
-containers = [json.loads(line) for line in lines if line]
-total = len(containers)
-running = sum(1 for c in containers if c.get("State") == "running")
-healthy = sum(1 for c in containers if c.get("Health") == "healthy" or (c.get("State") == "running" and not c.get("Health")))
-unhealthy = sum(1 for c in containers if c.get("Health") == "unhealthy")
-exited = sum(1 for c in containers if c.get("State") == "exited")
-if unhealthy > 0 or exited > 0:
-  print(f"fail|{running} 个运行中，{unhealthy} 个 unhealthy，{exited} 个已退出")
-elif healthy == total:
-  print(f"pass|{total} 个运行中，全部健康")
-else:
-  print(f"pass|{running}/{total} 个运行中")
-' 2>/dev/null)
-
-    case "$compose_check" in
-      pass\|*) pass+=("容器：${compose_check#pass|}") ;;
-      fail\|*) fail+=("容器：${compose_check#fail|}") ;;
-      *) skip+=("容器：无法检测状态") ;;
-    esac
-  else
-    skip+=("容器：compose 文件不存在或 docker 不可用")
-  fi
-
-  # 2. 原生服务状态（caddy / sing-box / frps）
-  for svc in caddy sing-box frps; do
-    if command -v "$svc" >/dev/null 2>&1 || systemctl list-unit-files "$svc.service" >/dev/null 2>&1; then
-      if systemctl is-active --quiet "$svc" 2>/dev/null; then
-        pass+=("$svc：运行中")
-      else
-        fail+=("$svc：已安装但未运行")
-      fi
-    fi
-  done
-
-  # 3. 端口监听（80 / 443）
-  if command -v ss >/dev/null 2>&1; then
-    local port_80 port_443
-    port_80=$(ss -tlnp 2>/dev/null | grep -E ':80\s' | wc -l)
-    port_443=$(ss -tlnp 2>/dev/null | grep -E ':443\s' | wc -l)
-    local listen_count=$((port_80 + port_443))
-    if (( listen_count >= 2 )); then
-      pass+=("端口：2/2 个监听中")
-    elif (( listen_count == 1 )); then
-      pass+=("端口：1/2 个监听中")
-    else
-      fail+=("端口：80/443 均未监听")
-    fi
-  else
-    skip+=("端口：ss 命令不可用")
-  fi
-
-  # 4. Caddyfile 语法
-  if [[ -f /etc/caddy/Caddyfile ]] && command -v caddy >/dev/null 2>&1; then
-    if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-      pass+=("Caddyfile：语法正确")
-    else
-      fail+=("Caddyfile：语法错误")
-    fi
-  fi
-
-  # 输出结果
-  if (( ${#pass[@]} > 0 )); then
-    echo -e "  ${G}✓ 通过（${#pass[@]} 项）${N}"
-    for item in "${pass[@]}"; do
-      echo -e "    ${G}✓${N} $item"
-    done
-    echo ""
-  fi
-
-  if (( ${#fail[@]} > 0 )); then
-    echo -e "  ${R}✗ 失败（${#fail[@]} 项）${N}"
-    for item in "${fail[@]}"; do
-      echo -e "    ${R}✗${N} $item"
-    done
-    echo ""
-  fi
-
-  if (( ${#skip[@]} > 0 )); then
-    echo -e "  ${DIM}⊘ 跳过（${#skip[@]} 项）${N}"
-    for item in "${skip[@]}"; do
-      echo -e "    ${DIM}⊘${N} $item"
-    done
-    echo ""
-  fi
-
-  # 总结
-  if (( ${#fail[@]} > 0 )); then
-    warn "部分检查未通过，请根据提示排查"
-    echo ""
-    info "常见排查命令："
-    info "  docker compose logs --tail=50    # 容器日志"
-    info "  systemctl status sing-box        # 服务状态"
-    info "  caddy validate --config /etc/caddy/Caddyfile  # Caddyfile 语法"
-  elif (( ${#pass[@]} > 0 )); then
-    log "所有检查通过"
-  fi
+  ( cd "$base" && docker compose up -d ) \
+    && log "服务栈已启动" \
+    || warn "启动失败，可手动排查：cd $base && docker compose up -d"
 }
 
 # v1 兜底：无 manifest v2 的旧 bundle
