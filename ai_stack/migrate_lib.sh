@@ -774,6 +774,48 @@ mig_local_tool_version() {
   esac
 }
 
+# ── 版本比较工具 ──────────────────────────────────────────────────
+# 比较两个语义化版本号
+# $1 = 版本 A，$2 = 版本 B
+# 返回：0 表示相等，<0 表示 A < B，>0 表示 A > B
+# 通过退出码传递：0=相等，1=A<B，2=A>B
+mig_version_compare() {
+  local a=$1 b=$2
+  [[ "$a" == "$b" ]] && return 0
+
+  # 去除 'v' 前缀
+  a=${a#v}; b=${b#v}
+
+  # 用 Python 做语义化版本比较
+  python3 -c "
+import sys
+from packaging import version
+try:
+    va = version.parse('$a')
+    vb = version.parse('$b')
+    if va < vb:
+        sys.exit(1)
+    elif va > vb:
+        sys.exit(2)
+    else:
+        sys.exit(0)
+except:
+    # 降级到字符串比较
+    if '$a' < '$b':
+        sys.exit(1)
+    elif '$a' > '$b':
+        sys.exit(2)
+    else:
+        sys.exit(0)
+" 2>/dev/null
+  local ret=$?
+  case $ret in
+    1) return 1 ;;  # A < B
+    2) return 2 ;;  # A > B
+    *) return 0 ;;  # A == B
+  esac
+}
+
 # ── 镜像版本对账 ──────────────────────────────────────────────────
 # 读 docker-images.lock.json，逐镜像对比新机现状，让用户决定版本取向。
 #
