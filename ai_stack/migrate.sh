@@ -977,7 +977,9 @@ _mig_install_native() {
       if ! grep -q "caddy/stable" /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null \
          || [[ ! -s /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
         curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" \
-          | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null \
+          mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+          curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" \
+          | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
           || { warn "  ✗ 添加 Caddy GPG 密钥失败"; return 1; }
         echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
           > /etc/apt/sources.list.d/caddy-stable.list \
