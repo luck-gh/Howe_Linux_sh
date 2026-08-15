@@ -630,6 +630,13 @@ for k in ('caddy','sing_box','frps'):
 # 统一对账：二进制 + 镜像，一张表一次交互
 # $1 = 备份点目录
 _mig_reconcile_all() {
+  # 临时调试日志文件
+  local debug_log="/tmp/migrate_debug_$(date +%s).log"
+  echo "=== 调试日志开始 $(date) ===" > "$debug_log"
+  exec 3>&2  # 保存原始 stderr
+  exec 2>>"$debug_log"  # 重定向 stderr 到日志文件
+  echo "[DEBUG] 日志文件: $debug_log" >&2
+
   local bp_dir=$1
   local inv="$bp_dir/host-inventory.json"
   local lock="$bp_dir/docker-images.lock.json"
@@ -964,6 +971,12 @@ PY
 
   echo ""
   echo -e "  ${W}版本对账完成${N}：${G}${ok} 成功${N} / ${R}${fail} 失败${N} / ${DIM}${skipped} 跳过${N}"
+
+  # 恢复 stderr 并输出日志文件路径
+  exec 2>&3
+  echo ""
+  echo -e "  ${DIM}调试日志已保存到: $debug_log${N}"
+
   return 0
 }
 
