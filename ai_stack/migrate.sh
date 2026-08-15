@@ -951,11 +951,6 @@ PY
   echo ""
   echo -e "  ${W}版本对账完成${N}：${G}${ok} 成功${N} / ${R}${fail} 失败${N} / ${DIM}${skipped} 跳过${N}"
 
-  # 恢复 stderr 并输出日志文件路径
-  exec 2>&3
-  echo ""
-  echo -e "  ${DIM}调试日志已保存到: $debug_log${N}"
-
   return 0
 }
 
