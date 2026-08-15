@@ -915,12 +915,12 @@ PY
       install_latest)
         if [[ "$type" == "工具" ]]; then
           # 传递 "latest" 作为目标版本
-          _mig_install_native "$name" "latest" "$have" 1 && ok=$((ok + 1)) || fail=$((fail + 1))
+          _mig_install_native "$name" "latest" "$have" "${all_pinnable[$z]}" && ok=$((ok + 1)) || fail=$((fail + 1))
         fi
         ;;
       install)
         if [[ "$type" == "工具" ]]; then
-          _mig_install_native "$name" "$want" "$have" 1 && ok=$((ok + 1)) || fail=$((fail + 1))
+          _mig_install_native "$name" "$want" "$have" "${all_pinnable[$z]}" && ok=$((ok + 1)) || fail=$((fail + 1))
         fi
         ;;
       pin)
