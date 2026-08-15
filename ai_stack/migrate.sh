@@ -697,7 +697,7 @@ PY
       if [[ -z "$have" ]]; then
         state="未安装"
         ids="install_latest skip"
-        labels="提示手动安装（apt最新版）"$'\x1f'"跳过"
+        labels="安装最新版（apt）"$'\x1f'"跳过"
       else
         state="不可锁版本"
         ids="keep"
@@ -707,23 +707,23 @@ PY
       # 可锁版本工具
       if [[ -z "$have" ]]; then
         state="未安装"
-        ids="install skip"
-        labels="安装 ${want}"$'\x1f'"跳过"
+        ids="install install_latest skip"
+        labels="安装 ${want}（推荐）"$'\x1f'"安装最新版"$'\x1f'"跳过"
       elif [[ "$have" == "$want" ]]; then
         state="已一致"
-        ids="keep upgrade"
+        ids="keep install_latest"
         labels="保持 ${have}"$'\x1f'"升级到最新版"
       else
         # 版本比较
         local cmp; cmp=$(mig_version_compare "$have" "$want")
         if (( cmp < 0 )); then
           state="需要更新"
-          ids="upgrade keep skip"
-          labels="更新到 ${want}"$'\x1f'"保持 ${have}"$'\x1f'"跳过"
+          ids="install keep install_latest skip"
+          labels="更新到 ${want}（bundle版本）"$'\x1f'"保持 ${have}"$'\x1f'"更新到最新版"$'\x1f'"跳过"
         else
           state="需要回退"
-          ids="downgrade keep skip"
-          labels="回退到 ${want}"$'\x1f'"保持 ${have}"$'\x1f'"跳过"
+          ids="install keep install_latest skip"
+          labels="回退到 ${want}（bundle版本）"$'\x1f'"保持 ${have}"$'\x1f'"升级到最新版"$'\x1f'"跳过"
         fi
       fi
     fi
@@ -844,7 +844,7 @@ PY
         "$n" "${all_type[$z]}" "${all_name[$z]:0:14}" "${disp_want:0:16}" "$sc" "$pad" "" "${_labs[$cur]}"
     done
     echo ""
-    echo -e "  ${DIM}输入编号切换 | a=全部对齐 bundle | s=跳过全部 | 回车执行 | q 取消${N}"
+    echo -e "  ${DIM}输入编号切换 | a=对齐 bundle | t=全部最新 | s=跳过全部 | 回车执行 | q 取消${N}"
     [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; }
 
     local _in; read -erp "  选择: " _in
@@ -860,6 +860,22 @@ PY
           changed=$((changed + 1))
         done
         _msg="已设为对齐 bundle：${changed} 项"
+        ;;
+      t)
+        # 全部最新版
+        local changed=0
+        for z in "${!all_type[@]}"; do
+          local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
+          local k
+          for k in "${!_ids[@]}"; do
+            if [[ "${_ids[$k]}" == "install_latest" || "${_ids[$k]}" == "pull_tag" ]]; then
+              all_cur[$z]=$k
+              changed=$((changed + 1))
+              break
+            fi
+          done
+        done
+        _msg="已设为安装/拉取最新版：${changed} 项"
         ;;
       s)
         # 全部跳过
@@ -897,10 +913,12 @@ PY
         skipped=$((skipped + 1))
         ;;
       install_latest)
-        warn "[$name] 本机缺失，恢复完成后请到「AI 服务栈 → 安装」装 Caddy"
-        info "  apt 源无法锁到旧机的 ${want}，装到的是当前最新版"
+        if [[ "$type" == "工具" ]]; then
+          # 传递 "latest" 作为目标版本
+          _mig_install_native "$name" "latest" "$have" 1 && ok=$((ok + 1)) || fail=$((fail + 1))
+        fi
         ;;
-      install|upgrade|downgrade)
+      install)
         if [[ "$type" == "工具" ]]; then
           _mig_install_native "$name" "$want" "$have" 1 && ok=$((ok + 1)) || fail=$((fail + 1))
         fi
@@ -939,13 +957,18 @@ _mig_preflight_tools() {
 }
 
 # 安装/切换单个原生二进制
-# $1=工具名 $2=目标版本 $3=当前版本 $4=是否可锁版本(1/0)
+# $1=工具名 $2=目标版本（或"latest"） $3=当前版本 $4=是否可锁版本(1/0)
 _mig_install_native() {
   local name=$1 want=$2 have=$3 pinnable=$4
 
   if (( ! pinnable )); then
     # caddy：apt 源装，锁版本需额外配 repo pinning，风险大于收益
-    if [[ -z "$have" ]]; then
+    if [[ "$want" == "latest" ]]; then
+      info "[$name] 安装最新版（apt）..."
+      apt-get update -qq && apt-get install -y caddy >/dev/null 2>&1 || { warn "  ✗ apt 安装失败"; return 1; }
+      log "  ✓ caddy 已安装"
+      return 0
+    elif [[ -z "$have" ]]; then
       # 不在此处调 install_caddy：它内部用 err()（exit 1），会杀掉恢复流程
       warn "[$name] 本机缺失。恢复完成后请到「AI 服务栈 → 安装」装 Caddy"
       info "  apt 源无法锁到旧机的 ${want}，装到的是当前最新版"
@@ -953,6 +976,26 @@ _mig_install_native() {
       info "[$name] 本机 ${have} / 旧机 ${want}，apt 管理不锁版本，保持现状"
     fi
     return 0
+  fi
+
+  # 处理 "latest" 版本查询
+  if [[ "$want" == "latest" ]]; then
+    case "$name" in
+      sing-box)
+        info "[$name] 查询最新版本..."
+        want=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"v\K[^"]+') \
+          || { warn "  ✗ 无法查询最新版本"; return 1; }
+        info "  最新版本：v${want}"
+        ;;
+      frps)
+        info "[$name] 查询最新版本..."
+        want=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"v\K[^"]+') \
+          || { warn "  ✗ 无法查询最新版本"; return 1; }
+        info "  最新版本：v${want}"
+        ;;
+      *)
+        warn "[$name] 无最新版本查询实现"; return 1 ;;
+    esac
   fi
 
   case "$name" in
