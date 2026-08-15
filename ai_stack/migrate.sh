@@ -960,25 +960,35 @@ _mig_preflight_tools() {
 # $1=工具名 $2=目标版本（或"latest"） $3=当前版本 $4=是否可锁版本(1/0)
 _mig_install_native() {
   local name=$1 want=$2 have=$3 pinnable=$4
+  echo "[DEBUG] _mig_install_native: name=$name want=$want have=$have pinnable=$pinnable" >&2
 
   if (( ! pinnable )); then
+    echo "[DEBUG] 进入 pinnable=0 分支" >&2
     # caddy：apt 源装，锁版本需额外配 repo pinning，风险大于收益
     if [[ "$want" == "latest" ]]; then
+      echo "[DEBUG] want=latest，开始安装 Caddy" >&2
       info "[$name] 安装最新版（apt）..."
 
       # 添加 Caddy 官方源（如果尚未添加）
       if ! grep -q "caddy/stable" /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null; then
+        echo "[DEBUG] 开始添加 Caddy GPG 密钥" >&2
         curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" \
           | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null \
-          || { warn "  ✗ 添加 Caddy GPG 密钥失败"; return 1; }
+          || { warn "  ✗ 添加 Caddy GPG 密钥失败"; echo "[DEBUG] GPG 密钥添加失败" >&2; return 1; }
 
+        echo "[DEBUG] 开始写入 Caddy 源配置" >&2
         echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
           > /etc/apt/sources.list.d/caddy-stable.list \
-          || { warn "  ✗ 添加 Caddy 源失败"; return 1; }
+          || { warn "  ✗ 添加 Caddy 源失败"; echo "[DEBUG] 源配置写入失败" >&2; return 1; }
+      else
+        echo "[DEBUG] Caddy 源已存在，跳过添加" >&2
       fi
 
-      apt-get update -qq || { warn "  ✗ apt 更新失败"; return 1; }
-      apt-get install -y -qq caddy || { warn "  ✗ apt 安装失败"; return 1; }
+      echo "[DEBUG] 开始 apt update" >&2
+      apt-get update -qq || { warn "  ✗ apt 更新失败"; echo "[DEBUG] apt update 失败" >&2; return 1; }
+      echo "[DEBUG] 开始 apt install caddy" >&2
+      apt-get install -y -qq caddy || { warn "  ✗ apt 安装失败"; echo "[DEBUG] apt install 失败" >&2; return 1; }
+      echo "[DEBUG] Caddy 安装成功" >&2
       log "  ✓ caddy 已安装 ($(caddy version 2>/dev/null | head -1))"
       return 0
     elif [[ -z "$have" ]]; then
