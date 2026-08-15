@@ -965,8 +965,21 @@ _mig_install_native() {
     # caddy：apt 源装，锁版本需额外配 repo pinning，风险大于收益
     if [[ "$want" == "latest" ]]; then
       info "[$name] 安装最新版（apt）..."
-      apt-get update -qq && apt-get install -y caddy >/dev/null 2>&1 || { warn "  ✗ apt 安装失败"; return 1; }
-      log "  ✓ caddy 已安装"
+
+      # 添加 Caddy 官方源（如果尚未添加）
+      if ! grep -q "caddy/stable" /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null; then
+        curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" \
+          | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null \
+          || { warn "  ✗ 添加 Caddy GPG 密钥失败"; return 1; }
+
+        echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
+          > /etc/apt/sources.list.d/caddy-stable.list \
+          || { warn "  ✗ 添加 Caddy 源失败"; return 1; }
+      fi
+
+      apt-get update -qq || { warn "  ✗ apt 更新失败"; return 1; }
+      apt-get install -y -qq caddy || { warn "  ✗ apt 安装失败"; return 1; }
+      log "  ✓ caddy 已安装 ($(caddy version 2>/dev/null | head -1))"
       return 0
     elif [[ -z "$have" ]]; then
       # 不在此处调 install_caddy：它内部用 err()（exit 1），会杀掉恢复流程
