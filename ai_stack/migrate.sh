@@ -683,7 +683,7 @@ PY
 
   # ── 第三部分：构建统一数据结构 ──
   # 每行：type|name|want_ver|have_ver|state|策略候选IDs|策略标签|当前选择索引
-  local -a all_type=() all_name=() all_want=() all_have=() all_state=() all_ids=() all_labels=() all_cur=()
+  local -a all_type=() all_name=() all_want=() all_have=() all_state=() all_ids=() all_labels=() all_cur=() all_pinnable=() all_ref=() all_dg=()
 
   # 处理二进制工具
   for row in "${bin_rows[@]}"; do
@@ -743,6 +743,9 @@ PY
     all_ids+=("$ids")
     all_labels+=("$labels")
     all_cur+=(0)
+    all_pinnable+=("$pinnable")
+    all_ref+=("")
+    all_dg+=("")
   done
 
   # 处理镜像
@@ -795,6 +798,7 @@ PY
     all_ids+=("$ids")
     all_labels+=("$labels")
     all_cur+=(0)
+    all_pinnable+=(0)
 
     # 保存完整数据供执行时使用
     all_ref+=("$ref")
