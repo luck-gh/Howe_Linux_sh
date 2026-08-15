@@ -630,13 +630,6 @@ for k in ('caddy','sing_box','frps'):
 # 统一对账：二进制 + 镜像，一张表一次交互
 # $1 = 备份点目录
 _mig_reconcile_all() {
-  # 临时调试日志文件
-  local debug_log="/tmp/migrate_debug_$(date +%s).log"
-  echo "=== 调试日志开始 $(date) ===" > "$debug_log"
-  exec 3>&2  # 保存原始 stderr
-  exec 2>>"$debug_log"  # 重定向 stderr 到日志文件
-  echo "[DEBUG] 日志文件: $debug_log" >&2
-
   local bp_dir=$1
   local inv="$bp_dir/host-inventory.json"
   local lock="$bp_dir/docker-images.lock.json"
@@ -859,13 +852,8 @@ PY
     [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; }
 
     local _in; read -erp "  选择: " _in
-    echo "[DEBUG] 用户输入: '$_in' (长度: ${#_in})" >&2
-    [[ -z "$_in" ]] && { echo "[DEBUG] 检测到空输入，准备执行" >&2; break; }
-    echo "[DEBUG] 输入非空，进入 case 分支" >&2
     case "${_in,,}" in
-      q|quit) echo "[DEBUG] 用户选择退出" >&2; info "已跳过版本对账"; return 0 ;;
       a)
-        echo "[DEBUG] 执行 a - 对齐 bundle" >&2
         # 全部对齐：选第一个策略（通常是 install/upgrade/downgrade/pin）
         local changed=0
         for z in "${!all_type[@]}"; do
@@ -874,10 +862,8 @@ PY
           changed=$((changed + 1))
         done
         _msg="已设为对齐 bundle：${changed} 项"
-        echo "[DEBUG] a 执行完成，changed=$changed" >&2
         ;;
       t)
-        echo "[DEBUG] 执行 t - 全部最新版" >&2
         # 全部最新版
         local changed=0
         for z in "${!all_type[@]}"; do
@@ -892,10 +878,8 @@ PY
           done
         done
         _msg="已设为安装/拉取最新版：${changed} 项"
-        echo "[DEBUG] t 执行完成，changed=$changed" >&2
         ;;
       s)
-        echo "[DEBUG] 执行 s - 全部跳过" >&2
         # 全部跳过
         for z in "${!all_type[@]}"; do
           local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
@@ -905,44 +889,32 @@ PY
           done
         done
         _msg="已全部设为跳过/保持"
-        echo "[DEBUG] s 执行完成" >&2
         ;;
       *)
-        echo "[DEBUG] 进入数字输入处理" >&2
         if [[ "$_in" =~ ^[0-9]+$ ]] && (( _in >= 1 && _in <= ${#all_type[@]} )); then
-          echo "[DEBUG] 有效数字: $_in" >&2
           z=$((_in - 1))
           local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
           all_cur[$z]=$(( (all_cur[z] + 1) % ${#_ids[@]} ))
-          echo "[DEBUG] 切换 $z 项到索引 ${all_cur[$z]}" >&2
         else
-          echo "[DEBUG] 无效输入: $_in" >&2
           _msg="无效输入：$_in"
         fi
         ;;
     esac
-    echo "[DEBUG] case 结束，准备下一次循环" >&2
   done
 
   # ── 第五部分：执行 ──
-  echo "[DEBUG] 开始执行版本对账操作" >&2
   echo ""
   local ok=0 fail=0 skipped=0
-  echo "[DEBUG] 数组长度: ${#all_type[@]}" >&2
   for z in "${!all_type[@]}"; do
-    echo "[DEBUG] 处理第 $z 项: ${all_name[$z]}" >&2
     local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
     local act="${_ids[${all_cur[$z]}]}"
     local type="${all_type[$z]}" name="${all_name[$z]}" want="${all_want[$z]}" have="${all_have[$z]}"
-    echo "[DEBUG]   类型=$type 名称=$name 动作=$act want=$want have=$have" >&2
 
     case "$act" in
       keep|skip)
-        echo "[DEBUG]   动作: 跳过" >&2
         skipped=$((skipped + 1))
         ;;
       install_latest)
-        echo "[DEBUG]   动作: install_latest" >&2
         if [[ "$type" == "工具" ]]; then
           # 传递 "latest" 作为目标版本
           _mig_install_native "$name" "latest" "$have" "${all_pinnable[$z]}" && ok=$((ok + 1)) || fail=$((fail + 1))
@@ -996,36 +968,26 @@ _mig_preflight_tools() {
 # $1=工具名 $2=目标版本（或"latest"） $3=当前版本 $4=是否可锁版本(1/0)
 _mig_install_native() {
   local name=$1 want=$2 have=$3 pinnable=$4
-  echo "[DEBUG] _mig_install_native: name=$name want=$want have=$have pinnable=$pinnable" >&2
 
   if (( ! pinnable )); then
-    echo "[DEBUG] 进入 pinnable=0 分支" >&2
     # caddy：apt 源装，锁版本需额外配 repo pinning，风险大于收益
     if [[ "$want" == "latest" ]]; then
-      echo "[DEBUG] want=latest，开始安装 Caddy" >&2
       info "[$name] 安装最新版（apt）..."
 
-      # 添加 Caddy 官方源（如果尚未添加，或密钥文件不存在）
+      # 源文件或密钥文件缺失时重新添加（只有源文件存在而密钥文件缺失会导致
+      # apt update 报 NO_PUBKEY 然后失败）
       if ! grep -q "caddy/stable" /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null \
          || [[ ! -s /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
-        echo "[DEBUG] 添加/更新 Caddy GPG 密钥和源" >&2
         curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" \
           | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null \
-          || { warn "  ✗ 添加 Caddy GPG 密钥失败"; echo "[DEBUG] GPG 密钥添加失败" >&2; return 1; }
-
-        echo "[DEBUG] 开始写入 Caddy 源配置" >&2
+          || { warn "  ✗ 添加 Caddy GPG 密钥失败"; return 1; }
         echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
           > /etc/apt/sources.list.d/caddy-stable.list \
-          || { warn "  ✗ 添加 Caddy 源失败"; echo "[DEBUG] 源配置写入失败" >&2; return 1; }
-      else
-        echo "[DEBUG] Caddy 源已存在，跳过添加" >&2
+          || { warn "  ✗ 添加 Caddy 源失败"; return 1; }
       fi
 
-      echo "[DEBUG] 开始 apt update" >&2
-      apt-get update -qq || { warn "  ✗ apt 更新失败"; echo "[DEBUG] apt update 失败" >&2; return 1; }
-      echo "[DEBUG] 开始 apt install caddy" >&2
-      apt-get install -y -qq caddy || { warn "  ✗ apt 安装失败"; echo "[DEBUG] apt install 失败" >&2; return 1; }
-      echo "[DEBUG] Caddy 安装成功" >&2
+      apt-get update -qq || { warn "  ✗ apt 更新失败"; return 1; }
+      apt-get install -y -qq caddy || { warn "  ✗ apt 安装失败"; return 1; }
       log "  ✓ caddy 已安装 ($(caddy version 2>/dev/null | head -1))"
       return 0
     elif [[ -z "$have" ]]; then
