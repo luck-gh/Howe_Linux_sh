@@ -1005,9 +1005,10 @@ _mig_install_native() {
       echo "[DEBUG] want=latest，开始安装 Caddy" >&2
       info "[$name] 安装最新版（apt）..."
 
-      # 添加 Caddy 官方源（如果尚未添加）
-      if ! grep -q "caddy/stable" /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null; then
-        echo "[DEBUG] 开始添加 Caddy GPG 密钥" >&2
+      # 添加 Caddy 官方源（如果尚未添加，或密钥文件不存在）
+      if ! grep -q "caddy/stable" /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null \
+         || [[ ! -s /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
+        echo "[DEBUG] 添加/更新 Caddy GPG 密钥和源" >&2
         curl -fsSL "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" \
           | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null \
           || { warn "  ✗ 添加 Caddy GPG 密钥失败"; echo "[DEBUG] GPG 密钥添加失败" >&2; return 1; }
