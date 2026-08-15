@@ -848,10 +848,13 @@ PY
     [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; }
 
     local _in; read -erp "  选择: " _in
-    [[ -z "$_in" ]] && break
+    echo "[DEBUG] 用户输入: '$_in' (长度: ${#_in})" >&2
+    [[ -z "$_in" ]] && { echo "[DEBUG] 检测到空输入，准备执行" >&2; break; }
+    echo "[DEBUG] 输入非空，进入 case 分支" >&2
     case "${_in,,}" in
-      q|quit) info "已跳过版本对账"; return 0 ;;
+      q|quit) echo "[DEBUG] 用户选择退出" >&2; info "已跳过版本对账"; return 0 ;;
       a)
+        echo "[DEBUG] 执行 a - 对齐 bundle" >&2
         # 全部对齐：选第一个策略（通常是 install/upgrade/downgrade/pin）
         local changed=0
         for z in "${!all_type[@]}"; do
@@ -860,8 +863,10 @@ PY
           changed=$((changed + 1))
         done
         _msg="已设为对齐 bundle：${changed} 项"
+        echo "[DEBUG] a 执行完成，changed=$changed" >&2
         ;;
       t)
+        echo "[DEBUG] 执行 t - 全部最新版" >&2
         # 全部最新版
         local changed=0
         for z in "${!all_type[@]}"; do
@@ -876,8 +881,10 @@ PY
           done
         done
         _msg="已设为安装/拉取最新版：${changed} 项"
+        echo "[DEBUG] t 执行完成，changed=$changed" >&2
         ;;
       s)
+        echo "[DEBUG] 执行 s - 全部跳过" >&2
         # 全部跳过
         for z in "${!all_type[@]}"; do
           local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
@@ -887,17 +894,23 @@ PY
           done
         done
         _msg="已全部设为跳过/保持"
+        echo "[DEBUG] s 执行完成" >&2
         ;;
       *)
+        echo "[DEBUG] 进入数字输入处理" >&2
         if [[ "$_in" =~ ^[0-9]+$ ]] && (( _in >= 1 && _in <= ${#all_type[@]} )); then
+          echo "[DEBUG] 有效数字: $_in" >&2
           z=$((_in - 1))
           local -a _ids=(); read -ra _ids <<< "${all_ids[$z]}"
           all_cur[$z]=$(( (all_cur[z] + 1) % ${#_ids[@]} ))
+          echo "[DEBUG] 切换 $z 项到索引 ${all_cur[$z]}" >&2
         else
+          echo "[DEBUG] 无效输入: $_in" >&2
           _msg="无效输入：$_in"
         fi
         ;;
     esac
+    echo "[DEBUG] case 结束，准备下一次循环" >&2
   done
 
   # ── 第五部分：执行 ──
