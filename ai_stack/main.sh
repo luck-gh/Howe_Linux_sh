@@ -32,6 +32,7 @@ service_stack_menu() {
       "安装 / 重新生成配置" \
       "升级 / 回滚单服务（程序版本：镜像 / 二进制）" \
       "备份 / 恢复（数据 / 配置文件）" \
+      "日志删除（释放磁盘空间）" \
       "配置查询与修改" \
       "服务管理" \
       "卸载"
@@ -41,9 +42,10 @@ service_stack_menu() {
       0) install_or_update ;;
       1) upgrade_rollback_menu ;;
       2) backup_menu ;;
-      3) show_config ;;
-      4) manage_services ;;
-      5) uninstall_stack ;;
+      3) log_clean_menu ;;
+      4) show_config ;;
+      5) manage_services ;;
+      6) uninstall_stack ;;
     esac
   done
 }
@@ -307,12 +309,230 @@ install_ai_agents() {
     [[ "${SEL[$i]}" != "true" ]] && continue
     IFS='|' read -r _name _ <<< "${AGENTS[$i]}"
     echo -e "${W}${C}── 安装 ${_name} ──────────────────────────────────${N}"
+    local _inst_var
+    case $i in
+      0) _inst_var=$AGENT_CLAUDE_CODE ;; 1) _inst_var=$AGENT_CODEX ;;
+      2) _inst_var=$AGENT_OPENCODE ;;    3) _inst_var=$AGENT_OPENCLAW ;;
+    esac
+    if $_inst_var; then
+      info "${_name} 已安装，跳过。升级或切换版本请用「更新 / 指定版本」"
+      echo ""
+      continue
+    fi
     install_single_agent "$_name"
     echo ""
   done
 
   echo ""
   log "安装流程完成"
+  read -erp "  按回车继续..." _
+}
+
+# ── AI 智能体更新 / 指定版本 ─────────────────────────────────────
+# 命令|显示名|npm 包名
+AGENT_PKGS=(
+  "claude|Claude Code|@anthropic-ai/claude-code"
+  "codex|OpenAI Codex|@openai/codex"
+  "opencode|OpenCode|opencode-ai"
+  "openclaw|OpenClaw|openclaw"
+)
+
+_agent_cur_ver() {
+  "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?' | head -1
+}
+
+# 安装方式：claude 区分官方安装器（native）和 npm；其它工具各自的升级命令能自识别
+_agent_install_method() {
+  local _cmd="$1" _pkg="$2" _real
+  _real=$(readlink -f "$(command -v "$_cmd")" 2>/dev/null)
+  case "$_real" in
+    */.local/share/claude/versions/*) echo "native"; return ;;
+    */.opencode/*)                    echo "script"; return ;;
+  esac
+  command -v npm &>/dev/null && npm ls -g "$_pkg" --depth=0 &>/dev/null && { echo "npm"; return; }
+  echo "unknown"
+}
+
+# 最近 N 个正式版（排除 alpha/beta/平台包等预发布），新的在前
+_agent_recent_versions() {
+  local _pkg="$1" _n="${2:-10}"
+  command -v npm &>/dev/null || return 0
+  timeout 30 npm view "$_pkg" versions --json 2>/dev/null \
+    | tr -d '[]", ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n "$_n" | sort -rV
+}
+
+_agent_dist_tag() {
+  command -v npm &>/dev/null || return 0
+  timeout 30 npm view "$1" "dist-tags.$2" 2>/dev/null
+}
+
+# 执行更新：_target 为 latest / stable / 具体版本号
+_agent_run_update() {
+  local _cmd="$1" _pkg="$2" _method="$3" _target="$4"
+  case "$_cmd" in
+    claude)
+      if [[ "$_method" == "native" ]]; then
+        if [[ "$_target" == "latest" ]]; then
+          claude update
+        else
+          # --force：回退到旧版本或重装同版本时需要
+          claude install "$_target" --force
+        fi
+      else
+        npm install -g "${_pkg}@${_target}"
+      fi
+      ;;
+    opencode)
+      if [[ "$_target" == "latest" ]]; then
+        opencode upgrade
+      else
+        opencode upgrade "v${_target#v}"
+      fi
+      ;;
+    openclaw)
+      # openclaw update 会顺带做 doctor 检查并重启 Gateway；失败再退回 npm
+      if [[ "$_target" == "latest" ]]; then
+        openclaw update --yes || npm install -g "${_pkg}@latest"
+      else
+        openclaw update --tag "$_target" --yes || npm install -g "${_pkg}@${_target}"
+      fi
+      ;;
+    *)
+      npm install -g "${_pkg}@${_target}"
+      ;;
+  esac
+}
+
+# 官方安装器装的 Claude Code 会后台自动更新，回退后需关掉，否则会被自动升回最新版
+_claude_autoupdate_lock() {
+  local _f="$HOME/.claude/settings.json" _tmp
+  command -v jq &>/dev/null || { warn "未安装 jq，请手动在 ${_f} 的 env 中加入 \"DISABLE_AUTOUPDATER\": \"1\""; return 1; }
+  mkdir -p "$(dirname "$_f")"
+  [[ -s "$_f" ]] || echo '{}' > "$_f"
+  _tmp=$(mktemp)
+  if jq '.env = ((.env // {}) + {"DISABLE_AUTOUPDATER": "1"})' "$_f" > "$_tmp"; then
+    cat "$_tmp" > "$_f"
+    log "已关闭 Claude Code 自动更新（${_f} → env.DISABLE_AUTOUPDATER=1）"
+  else
+    warn "${_f} 不是合法 JSON，未修改"
+  fi
+  rm -f "$_tmp"
+}
+
+_claude_autoupdate_unlock() {
+  local _f="$HOME/.claude/settings.json" _tmp
+  [[ -s "$_f" ]] && command -v jq &>/dev/null || return 0
+  jq -e '.env.DISABLE_AUTOUPDATER' "$_f" &>/dev/null || return 0
+  _tmp=$(mktemp)
+  if jq 'del(.env.DISABLE_AUTOUPDATER)' "$_f" > "$_tmp"; then
+    cat "$_tmp" > "$_f"
+    log "已恢复 Claude Code 自动更新"
+  fi
+  rm -f "$_tmp"
+}
+
+update_ai_agents() {
+  detect_ai_agents
+
+  local -a _U=() _labels=()
+  local _e _cmd _name _pkg
+  for _e in "${AGENT_PKGS[@]}"; do
+    IFS='|' read -r _cmd _name _pkg <<< "$_e"
+    command -v "$_cmd" &>/dev/null || continue
+    _U+=("$_e")
+    _labels+=("${_name}（当前 $(_agent_cur_ver "$_cmd")）")
+  done
+
+  if [[ ${#_U[@]} -eq 0 ]]; then
+    warn "未检测到已安装的 AI 智能体工具，请先安装"
+    echo ""
+    read -erp "  按回车返回..." _
+    return 0
+  fi
+
+  print_header "AI 智能体 CLI 工具 — 更新 / 指定版本"
+  input_choose "选择要更新的工具" "${_labels[@]}"
+  [[ $INPUT_RESULT -eq -1 ]] && return 0
+  IFS='|' read -r _cmd _name _pkg <<< "${_U[$INPUT_RESULT]}"
+
+  local _cur _method
+  _cur=$(_agent_cur_ver "$_cmd")
+  _method=$(_agent_install_method "$_cmd" "$_pkg")
+
+  print_header "${_name} — 更新 / 指定版本"
+  echo -e "  当前版本：${G}${_cur:-未知}${N}"
+  echo -e "  安装方式：${_method}  ${DIM}($(command -v "$_cmd"))${N}"
+  if [[ "$_method" == "unknown" ]]; then
+    warn "无法识别安装方式，将按 npm 全局包处理"
+    _method="npm"
+  fi
+  echo ""
+  info "查询可用版本..."
+
+  local _latest="" _stable=""
+  _latest=$(_agent_dist_tag "$_pkg" latest)
+  [[ "$_cmd" == "claude" ]] && _stable=$(_agent_dist_tag "$_pkg" stable)
+  local -a _vers=()
+  mapfile -t _vers < <(_agent_recent_versions "$_pkg" 10)
+
+  # 选项与目标一一对应
+  local -a _opts=() _targets=()
+  _opts+=("最新版 latest${_latest:+（${_latest}）}"); _targets+=("latest")
+  if [[ -n "$_stable" ]]; then
+    _opts+=("稳定版 stable（${_stable}）"); _targets+=("stable")
+  fi
+  local _v _mark
+  for _v in "${_vers[@]}"; do
+    [[ -z "$_v" ]] && continue
+    _mark=""; [[ "$_v" == "$_cur" ]] && _mark="  ← 当前"
+    _opts+=("${_v}${_mark}"); _targets+=("$_v")
+  done
+  _opts+=("手动输入版本号（可回退到更早的版本）"); _targets+=("__manual__")
+  [[ ${#_vers[@]} -eq 0 ]] && warn "未能从 npm 获取版本列表，可选最新版或手动输入"
+
+  input_choose "选择目标版本" "${_opts[@]}"
+  [[ $INPUT_RESULT -eq -1 ]] && return 0
+  local _target="${_targets[$INPUT_RESULT]}"
+
+  if [[ "$_target" == "__manual__" ]]; then
+    ask _target "输入版本号（如 ${_vers[0]:-1.0.0}）"
+    _target="${_target#v}"
+    if [[ ! "$_target" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+      warn "版本号格式不正确：${_target}"
+      read -erp "  按回车返回..." _
+      return 0
+    fi
+    if command -v npm &>/dev/null && [[ -z "$(timeout 30 npm view "${_pkg}@${_target}" version 2>/dev/null)" ]]; then
+      warn "npm 上不存在 ${_pkg}@${_target}"
+      read -erp "  按回车返回..." _
+      return 0
+    fi
+  fi
+
+  echo ""
+  local _go
+  askyn _go "确认将 ${_name} 从 ${_cur:-未知} 切换到 ${_target}？" "y"
+  $_go || return 0
+
+  echo ""
+  if _agent_run_update "$_cmd" "$_pkg" "$_method" "$_target"; then
+    hash -r 2>/dev/null
+    log "${_name}：${_cur:-未知} → $(_agent_cur_ver "$_cmd")"
+    if [[ "$_cmd" == "claude" && "$_method" == "native" ]]; then
+      if [[ "$_target" == "latest" ]]; then
+        _claude_autoupdate_unlock
+      else
+        echo ""
+        warn "官方安装器版本会后台自动更新，不关闭的话会被自动升回最新版"
+        local _lock
+        askyn _lock "关闭 Claude Code 自动更新，固定在当前版本？" "y"
+        $_lock && _claude_autoupdate_lock
+      fi
+    fi
+  else
+    warn "${_name} 更新失败，请查看上面的输出"
+  fi
+  echo ""
   read -erp "  按回车继续..." _
 }
 
@@ -476,13 +696,14 @@ ai_agent_menu() {
     fi
     echo ""
 
-    input_choose "智能体工具操作" "安装 / 更新" "卸载" "状态查看"
+    input_choose "智能体工具操作" "安装" "更新 / 指定版本（可回退）" "卸载" "状态查看"
     [[ $INPUT_RESULT -eq -1 ]] && break
 
     case $INPUT_RESULT in
       0) install_ai_agents ;;
-      1) uninstall_ai_agents ;;
-      2) show_ai_agents_status ;;
+      1) update_ai_agents ;;
+      2) uninstall_ai_agents ;;
+      3) show_ai_agents_status ;;
     esac
   done
 }

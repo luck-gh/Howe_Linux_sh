@@ -57,6 +57,8 @@ source "${_AI_STACK_ENTRY_DIR}/migrate_lib.sh"
 source "${_AI_STACK_ENTRY_DIR}/migrate.sh"
 # shellcheck source=view.sh
 source "${_AI_STACK_ENTRY_DIR}/view.sh"
+# shellcheck source=logclean.sh
+source "${_AI_STACK_ENTRY_DIR}/logclean.sh"
 # shellcheck source=main.sh
 source "${_AI_STACK_ENTRY_DIR}/main.sh"
 

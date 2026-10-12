@@ -23,13 +23,14 @@
 | `migrate_lib.sh` | ~580 | VPS 迁移底层库。`mig_pack_bundle`/`mig_unpack_bundle`（加密+sha256双层）；`mig_write_manifest_v2`/`mig_read_manifest_scopes`（per-scope策略元数据）；`mig_execute_strategy`（scope×strategy分派）；`mig_rsync_push`/`mig_rsync_pull`；口令走 fd 不进 argv，`MIG_TEST_PASSPHRASE` 测试钩子。 |
 | `migrate.sh` | ~730 | VPS 迁移菜单：三段独立流程——① 打包（多选scope+加密）② 传递（推送/拉取/手动scp三选一）③ 解包恢复（manifest v2驱动多选scope+per-scope策略，v1兼容降级）。`migrate_show_guide` 首次进入展示指引。 |
 | `view.sh` | ~1480 | `show_secrets` / `show_db_connection` / `show_config`（已安装栈的运行状态 + 可改项）/ 服务管理（启动/停止/重启）/ 升级回滚菜单（含进入时检查上游版本）。 |
-| `main.sh` | ~540 | `service_stack_menu`（AI 服务栈子菜单：安装 / 配置 / 卸载 / 刷新 / 查看密钥 / 服务管理 / 订阅 ...）/ `ai_agent_menu`（智能体 CLI 工具：Claude Code / Codex / OpenCode / OpenClaw 安装管理）/ `main`（顶级两选一）。 |
+| `logclean.sh` | ~180 | `log_clean_menu`（服务栈菜单「日志删除」）：多选清空 sing-box 日志 / 所有容器日志 / journal 压到 100M / 删除未使用镜像（跳过升级回滚历史引用的镜像，依赖 `view.sh`）。 |
+| `main.sh` | ~760 | `service_stack_menu`（AI 服务栈子菜单：安装 / 配置 / 卸载 / 刷新 / 查看密钥 / 服务管理 / 订阅 ...）/ `ai_agent_menu`（智能体 CLI 工具：Claude Code / Codex / OpenCode / OpenClaw 安装 / 更新到指定版本（可回退）/ 卸载）/ `main`（顶级两选一）。 |
 
 ## source 顺序约束（务必保持这个顺序）
 
 ```
 core → detect → select → base → clash → compose → caddy → services
-     → local_pkg → lifecycle → backup_lib → backup → migrate_lib → migrate → view → main
+     → local_pkg → lifecycle → backup_lib → backup → migrate_lib → migrate → view → logclean → main
 ```
 
 约束来源：

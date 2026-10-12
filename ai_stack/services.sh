@@ -164,13 +164,14 @@ write_singbox_config() {
     [{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"}] + $user_rules
   ')
   # 用 jq 拼出完整 config（避免手拼 JSON 出错），再写盘
+  # 日志用 warn：info 级别每条连接记一行，日志会涨到 GB 级
   local _cfg_json
   _cfg_json=$(jq -n \
     --argjson inbounds  "$_inbounds_json" \
     --argjson outbounds "$_outbounds_json" \
     --argjson rules     "$_route_rules_json" \
     '{
-      log: { level: "info", timestamp: true, output: "/var/log/sing-box.log" },
+      log: { level: "warn", timestamp: true, output: "/var/log/sing-box.log" },
       dns: {
         servers: [
           { tag: "cf",  type: "tls", server: "1.1.1.1" },
