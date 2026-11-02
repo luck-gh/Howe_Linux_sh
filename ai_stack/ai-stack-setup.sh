@@ -28,39 +28,39 @@ _AI_STACK_ENTRY_DIR=$(cd "$_AI_STACK_ENTRY_DIR" && pwd)
 # 按依赖顺序加载（顺序很重要：core 提供 log/ask/_AI_STACK_DIR，
 # 后续模块依赖前面已定义的函数和全局变量）
 # shellcheck source=core.sh
-source "${_AI_STACK_ENTRY_DIR}/core.sh"
+source "${_AI_STACK_ENTRY_DIR}/core.sh" || exit 1
 # shellcheck source=detect.sh
-source "${_AI_STACK_ENTRY_DIR}/detect.sh"
+source "${_AI_STACK_ENTRY_DIR}/detect.sh" || exit 1
 # shellcheck source=select.sh
-source "${_AI_STACK_ENTRY_DIR}/select.sh"
+source "${_AI_STACK_ENTRY_DIR}/select.sh" || exit 1
 # shellcheck source=base.sh
-source "${_AI_STACK_ENTRY_DIR}/base.sh"
+source "${_AI_STACK_ENTRY_DIR}/base.sh" || exit 1
 # shellcheck source=clash.sh
-source "${_AI_STACK_ENTRY_DIR}/clash.sh"
+source "${_AI_STACK_ENTRY_DIR}/clash.sh" || exit 1
 # shellcheck source=compose.sh
-source "${_AI_STACK_ENTRY_DIR}/compose.sh"
+source "${_AI_STACK_ENTRY_DIR}/compose.sh" || exit 1
 # shellcheck source=caddy.sh
-source "${_AI_STACK_ENTRY_DIR}/caddy.sh"
+source "${_AI_STACK_ENTRY_DIR}/caddy.sh" || exit 1
 # shellcheck source=services.sh
-source "${_AI_STACK_ENTRY_DIR}/services.sh"
+source "${_AI_STACK_ENTRY_DIR}/services.sh" || exit 1
 # shellcheck source=local_pkg.sh
-source "${_AI_STACK_ENTRY_DIR}/local_pkg.sh"
+source "${_AI_STACK_ENTRY_DIR}/local_pkg.sh" || exit 1
 # shellcheck source=lifecycle.sh
-source "${_AI_STACK_ENTRY_DIR}/lifecycle.sh"
+source "${_AI_STACK_ENTRY_DIR}/lifecycle.sh" || exit 1
 # shellcheck source=backup_lib.sh
-source "${_AI_STACK_ENTRY_DIR}/backup_lib.sh"
+source "${_AI_STACK_ENTRY_DIR}/backup_lib.sh" || exit 1
 # shellcheck source=backup.sh
-source "${_AI_STACK_ENTRY_DIR}/backup.sh"
+source "${_AI_STACK_ENTRY_DIR}/backup.sh" || exit 1
 # shellcheck source=migrate_lib.sh
-source "${_AI_STACK_ENTRY_DIR}/migrate_lib.sh"
+source "${_AI_STACK_ENTRY_DIR}/migrate_lib.sh" || exit 1
 # shellcheck source=migrate.sh
-source "${_AI_STACK_ENTRY_DIR}/migrate.sh"
+source "${_AI_STACK_ENTRY_DIR}/migrate.sh" || exit 1
 # shellcheck source=view.sh
-source "${_AI_STACK_ENTRY_DIR}/view.sh"
+source "${_AI_STACK_ENTRY_DIR}/view.sh" || exit 1
 # shellcheck source=logclean.sh
-source "${_AI_STACK_ENTRY_DIR}/logclean.sh"
+source "${_AI_STACK_ENTRY_DIR}/logclean.sh" || exit 1
 # shellcheck source=main.sh
-source "${_AI_STACK_ENTRY_DIR}/main.sh"
+source "${_AI_STACK_ENTRY_DIR}/main.sh" || exit 1
 
 # BASH_SOURCE 守卫：独立运行时调用 main，被 source 时不执行
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

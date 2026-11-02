@@ -476,6 +476,11 @@ _svc_image_id() {
   docker inspect --format '{{.Image}}' "$1" 2>/dev/null
 }
 
+_compose_image_ref() {
+  (cd "$BASE_DIR" && docker compose config --format json) | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["services"][sys.argv[1]]["image"])' "$1"
+}
+
 _docker_history_references_image() {
   local _want="$1" _f _ts _ref _id
   for _f in "$(_UPGRADE_DIR)"/history/*.log; do
@@ -507,7 +512,7 @@ _prune_unreferenced_dangling_images() {
 
 # 记录一代 image 历史；超过保留代数则截断（保留最近 N 行）
 _record_image_history() {
-  local _svc="$1" _ref="$2" _id="$3"
+  local _svc="$1" _ref="$2" _id="$3" _protected="${4:-}"
   local _f; _f=$(_HISTORY_FILE "$_svc")
   mkdir -p "$(dirname "$_f")"
   printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_ref" "$_id" >> "$_f"
@@ -518,7 +523,7 @@ _record_image_history() {
     tail -n "$_keep_lines" "$_f" > "${_f}.tmp" && mv "${_f}.tmp" "$_f"
     local _old_id
     for _old_id in "${_old_ids[@]}"; do
-      _prune_docker_image_if_unreferenced "$_old_id"
+      [[ "$_old_id" == "$_protected" ]] || _prune_docker_image_if_unreferenced "$_old_id"
     done
   fi
 }
@@ -531,8 +536,8 @@ _dump_db_if_needed() {
   local _db; _db=$(_svc_pg_db "$_svc")
   [[ -z "$_db" ]] && return 0
   docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq 'ai-db' || {
-    warn "ai-db 容器未运行，跳过 ${_db} 数据库备份"
-    return 0
+    warn "ai-db 容器未运行, 无法完成 ${_db} 升级前备份"
+    return 1
   }
   local _dir; _dir=$(_DB_BACKUP_DIR)
   mkdir -p "$_dir"
@@ -573,9 +578,10 @@ upgrade_single_service() {
     return 1
   fi
 
-  local _cur_ref _cur_id
-  _cur_ref=$(_svc_image_ref "$_svc")
-  _cur_id=$(_svc_image_id "$_svc")
+  local _cur_ref _cur_id _desired_ref
+  _cur_ref=$(_svc_image_ref "$_svc") || return 1
+  _cur_id=$(_svc_image_id "$_svc") || return 1
+  _desired_ref=$(_compose_image_ref "$_svc") || return 1
 
   echo ""
   echo -e "  ${W}升级 ${_name}${N}"
@@ -603,22 +609,22 @@ upgrade_single_service() {
 
   # 拉完后 ref 仍指向同一个 image ID，说明远端没有更新版本——跳过重建
   local _post_pull_id
-  _post_pull_id=$(docker image inspect "$_cur_ref" --format '{{.Id}}' 2>/dev/null)
+  _post_pull_id=$(docker image inspect "$_desired_ref" --format '{{.Id}}') || return 1
   if [[ -n "$_post_pull_id" && "$_post_pull_id" == "$_cur_id" ]]; then
     info "镜像已是最新（${_cur_id:0:19}），跳过容器重建"
     return 0
   fi
 
   # 远端确有新镜像后再备份，避免无升级也产生回滚文件和数据备份。
-  _upgrade_pre_backup_hook "$_svc" docker
+  _upgrade_pre_backup_hook "$_svc" docker || return 1
   if [[ -n "$_db" ]]; then
-    _dump_db_if_needed "$_svc" || warn "数据库备份失败，仍可继续，但回滚将无法恢复 DB"
+    _dump_db_if_needed "$_svc" || { warn "数据库备份失败, 已停止升级"; return 1; }
   fi
   _record_image_history "$_svc" "$_cur_ref" "$_cur_id"
 
   # 4) up -d 重建（--no-deps 防止重建依赖容器，例如 ai-db）
   step "docker compose up -d --no-deps ${_svc}"
-  if ! (cd "$BASE_DIR" && docker compose up -d --no-deps "$_svc"); then
+  if ! (cd "$BASE_DIR" && docker compose up -d --no-deps --pull never --wait --wait-timeout 60 "$_svc"); then
     warn "容器启动失败，准备回滚提示"
     echo ""
     echo -e "  ${R}启动失败${N}，可执行回滚："
@@ -627,17 +633,6 @@ upgrade_single_service() {
       echo -e "    DB 恢复    : gunzip -c ${LAST_DB_BACKUP} | docker exec -i ai-db psql -U ai ${_db}"
     return 1
   fi
-
-  # 5) 等就绪
-  info "等待容器就绪（最多 60s）..."
-  local _waited=0
-  while (( _waited < 60 )); do
-    local _status
-    _status=$(docker inspect --format '{{.State.Status}}' "$_svc" 2>/dev/null || echo "")
-    [[ "$_status" == "running" ]] && break
-    sleep 3
-    _waited=$((_waited+3))
-  done
 
   local _new_id
   _new_id=$(_svc_image_id "$_svc")
@@ -716,9 +711,11 @@ rollback_single_service() {
   fi
 
   # 取当前 image，作为"回滚的回滚"锚点
-  local _cur_ref _cur_id
-  _cur_ref=$(_svc_image_ref "$_svc")
-  _cur_id=$(_svc_image_id "$_svc")
+  local _cur_ref _cur_id _desired_ref
+  _cur_ref=$(_svc_image_ref "$_svc") || return 1
+  _cur_id=$(_svc_image_id "$_svc") || return 1
+  _desired_ref=$(_compose_image_ref "$_svc") || return 1
+  [[ "$_desired_ref" != *@sha256:* ]] || { warn "Compose 使用不可变 digest, 请先明确修改镜像引用再回滚"; return 1; }
 
   echo ""
   echo -e "  将回滚到：${C}${_ref}${N}  ${DIM}(${_id:0:19})${N}"
@@ -764,44 +761,34 @@ rollback_single_service() {
   $_go || { info "已取消"; return 0; }
 
   # 把当前 image 也写一笔到历史，便于"回滚的回滚"
-  _record_image_history "$_svc" "$_cur_ref" "$_cur_id"
+  _record_image_history "$_svc" "$_cur_ref" "$_cur_id" "$_id" || return 1
 
   # 关键：不动 docker-compose.yml。
   # 用 docker tag 让当前 ref 重新指向旧 image ID。
   # compose up -d --force-recreate 重建容器即可加载到新 ref 指向的镜像。
   # 下次"升级镜像"会执行 docker compose pull，自然把 ref 拉回最新。
-  if ! docker tag "$_id" "$_cur_ref"; then
+  if ! docker tag "$_id" "$_desired_ref"; then
     warn "docker tag 失败"
     return 1
   fi
 
-  step "docker compose up -d --no-deps --force-recreate ${_svc}"
-  if ! (cd "$BASE_DIR" && docker compose up -d --no-deps --force-recreate "$_svc"); then
-    warn "容器重建失败"
-    return 1
-  fi
-
-  # DB 恢复
   if $_restore_db; then
-    step "恢复数据库 ${_db} ← ${_backup}"
-    # 停服务，避免连接占用
-    (cd "$BASE_DIR" && docker compose stop "$_svc") >/dev/null 2>&1
-    if docker exec ai-db psql -U ai -d postgres -c \
-      "DROP DATABASE IF EXISTS ${_db}; CREATE DATABASE ${_db} OWNER ai;" >/dev/null 2>&1; then
-      if gunzip -c "$_backup" | docker exec -i ai-db psql -U ai -d "$_db" >/dev/null 2>&1; then
-        log "数据库恢复完成"
-      else
-        warn "数据库恢复失败，请手动检查"
-      fi
-    else
-      warn "无法重建库 ${_db}，跳过恢复"
-    fi
-    (cd "$BASE_DIR" && docker compose up -d --no-deps "$_svc") >/dev/null 2>&1
+    gzip -t "$_backup" || { warn "数据库备份损坏, 已停止回滚"; return 1; }
+    (cd "$BASE_DIR" && docker compose stop "$_svc") || return 1
+    _bk_pg_recreate "$_db" || return 1
+    gunzip -c "$_backup" | docker exec -i ai-db psql -U ai -d "$_db" -v ON_ERROR_STOP=1 || {
+      warn "数据库恢复失败, 业务保持停止, 请排查后重试"
+      return 1
+    }
+  fi
+  if ! (cd "$BASE_DIR" && docker compose up -d --no-deps --pull never --force-recreate --wait --wait-timeout 60 "$_svc"); then
+    warn "回滚后服务未通过健康检查"
+    return 1
   fi
 
   echo ""
   log "${_name} 已回滚到 ${_ref}（${_id:0:19}）"
-  echo -e "  ${DIM}本地 ref ${_cur_ref} 已重指向旧 image；下次执行升级会重新 pull 拉回最新版${N}"
+  echo -e "  ${DIM}本地 ref ${_desired_ref} 已重指向旧 image；下次执行升级会重新 pull 拉回最新版${N}"
   echo ""
   echo -e "  ${W}最近日志${N}"
   docker logs --tail 30 "$_svc" 2>&1 | sed 's/^/    /'
@@ -1102,14 +1089,16 @@ upgrade_all_services() {
         echo ""
         info "全部升级前自动备份：${_scopes[*]}"
         local _dir
-        _dir=$(backup_create "全部升级前自动备份" "${_scopes[@]}")
-        if [[ -n "$_dir" ]]; then
+        if _dir=$(backup_create "全部升级前自动备份" "${_scopes[@]}") && \
+           python3 "$BACKUP_LIB_DIR/backup_archive.py" verify "$_dir" --complete; then
           log "已备份 → $(basename "$_dir")"
           local _keep; _keep=$(backup_conf_get KEEP "$BACKUP_KEEP_DEFAULT")
           backup_apply_retention "$_keep" >/dev/null 2>&1
           _BATCH_UPGRADE_BACKUP_DONE=1
         else
-          warn "集中备份失败，将由各服务自行尝试备份"
+          warn "集中备份失败或不完整, 已停止全部升级"
+          unset _BATCH_UPGRADE_BACKUP_DONE
+          return 1
         fi
       else
         info "默认备份范围中没有匹配本次待升级服务的项目，跳过集中备份"
@@ -1147,6 +1136,7 @@ upgrade_all_services() {
   fi
   echo ""
   read -erp "  按回车返回..." _
+  (( _fail == 0 ))
 }
 
 upgrade_rollback_menu() {
@@ -1434,13 +1424,14 @@ _upgrade_pre_backup_hook() {
   echo ""
   info "升级前自动备份：${_scopes[*]} （服务：$_svc）"
   local _dir
-  _dir=$(backup_create "升级前自动备份：${_svc}" "${_scopes[@]}")
-  if [[ -n "$_dir" ]]; then
+  _dir=$(backup_create "升级前自动备份：${_svc}" "${_scopes[@]}") || return 1
+  if python3 "$BACKUP_LIB_DIR/backup_archive.py" verify "$_dir" --complete; then
     log "已备份 → $(basename "$_dir")"
     local _keep; _keep=$(backup_conf_get KEEP "$BACKUP_KEEP_DEFAULT")
     backup_apply_retention "$_keep" >/dev/null 2>&1
   else
-    warn "自动备份失败，但继续升级"
+    warn "自动备份不完整, 已停止升级"
+    return 1
   fi
 }
 
@@ -1489,7 +1480,7 @@ _upgrade_singbox() {
     *) warn "不支持的架构：$(uname -m)"; return 1 ;;
   esac
 
-  _upgrade_pre_backup_hook "sing-box" systemd
+  _upgrade_pre_backup_hook "sing-box" systemd || return 1
 
   # 备份旧二进制
   local _bdir; _bdir=$(_BIN_BACKUP_DIR)
@@ -1537,9 +1528,11 @@ _upgrade_singbox() {
     else
       warn "服务未起来，可执行回滚（菜单 → 升级 / 回滚 → sing-box → 回滚版本）"
       systemctl status sing-box --no-pager 2>&1 | tail -20 | sed 's/^/    /'
+      return 1
     fi
   else
     warn "restart 失败"
+    return 1
   fi
 }
 
@@ -1609,9 +1602,11 @@ _rollback_singbox() {
     else
       warn "服务未起来"
       systemctl status sing-box --no-pager 2>&1 | tail -20 | sed 's/^/    /'
+      return 1
     fi
   else
     warn "restart 失败"
+    return 1
   fi
 }
 
@@ -1649,7 +1644,7 @@ _upgrade_caddy() {
   fi
   $_go || { info "已取消"; return 0; }
 
-  _upgrade_pre_backup_hook "caddy" systemd
+  _upgrade_pre_backup_hook "caddy" systemd || return 1
 
   # 写历史栈（升级前版本号）
   local _f; _f=$(_HISTORY_FILE "caddy")
@@ -1677,6 +1672,7 @@ _upgrade_caddy() {
   else
     warn "服务未起来"
     systemctl status caddy --no-pager 2>&1 | tail -20 | sed 's/^/    /'
+    return 1
   fi
 }
 
@@ -1758,6 +1754,7 @@ _rollback_caddy() {
   else
     warn "服务未起来"
     systemctl status caddy --no-pager 2>&1 | tail -20 | sed 's/^/    /'
+    return 1
   fi
 }
 

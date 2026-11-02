@@ -18,24 +18,30 @@ HOWE_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$HOWE_DIR" == "${BASH_SOURCE[0]}" ]] && HOWE_DIR="."
 HOWE_DIR=$(cd "$HOWE_DIR" && pwd)
 
+# 入口必须来自完整仓库, 单独下载入口文件无法加载其模块.
+[[ -f "$HOWE_DIR/lib/colors.sh" ]] || {
+  printf '缺少脚本模块, 请先 git clone https://github.com/luck-gh/Howe_Linux_sh.git 再运行 howe.sh\n' >&2
+  exit 1
+}
+
 # 加载 lib
-source "${HOWE_DIR}/lib/colors.sh"
-source "${HOWE_DIR}/lib/urls.sh"
-source "${HOWE_DIR}/lib/public_ip.sh"
-source "${HOWE_DIR}/lib/utils.sh"
-source "${HOWE_DIR}/lib/detect.sh"
-source "${HOWE_DIR}/lib/nettest.sh"
-source "${HOWE_DIR}/lib/menu.sh"
+source "${HOWE_DIR}/lib/colors.sh" || exit 1
+source "${HOWE_DIR}/lib/urls.sh" || exit 1
+source "${HOWE_DIR}/lib/public_ip.sh" || exit 1
+source "${HOWE_DIR}/lib/utils.sh" || exit 1
+source "${HOWE_DIR}/lib/detect.sh" || exit 1
+source "${HOWE_DIR}/lib/nettest.sh" || exit 1
+source "${HOWE_DIR}/lib/menu.sh" || exit 1
 
 # 加载 modules
-source "${HOWE_DIR}/modules/mod_system.sh"
-source "${HOWE_DIR}/modules/mod_memmgr.sh"
-source "${HOWE_DIR}/modules/mod_security.sh"
-source "${HOWE_DIR}/modules/mod_network.sh"
-source "${HOWE_DIR}/modules/mod_docker.sh"
-source "${HOWE_DIR}/modules/mod_ai_stack.sh"
-source "${HOWE_DIR}/modules/mod_complex_tools.sh"
-source "${HOWE_DIR}/modules/mod_test.sh"
+source "${HOWE_DIR}/modules/mod_system.sh" || exit 1
+source "${HOWE_DIR}/modules/mod_memmgr.sh" || exit 1
+source "${HOWE_DIR}/modules/mod_security.sh" || exit 1
+source "${HOWE_DIR}/modules/mod_network.sh" || exit 1
+source "${HOWE_DIR}/modules/mod_docker.sh" || exit 1
+source "${HOWE_DIR}/modules/mod_ai_stack.sh" || exit 1
+source "${HOWE_DIR}/modules/mod_complex_tools.sh" || exit 1
+source "${HOWE_DIR}/modules/mod_test.sh" || exit 1
 
 # ── 主菜单 ───────────────────────────────────────────────────────
 main() {
@@ -87,7 +93,7 @@ main() {
     echo "  0. 退出"
     echo ""
     local choice
-    read -erp "  请输入选择：" choice
+    read -erp "  请输入选择：" choice || return 0
 
     case "$choice" in
       1) mod_system_main ;;

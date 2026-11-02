@@ -10,7 +10,7 @@ install_deps() {
   apt-get update -qq || err "apt-get update 失败"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     curl wget jq unzip openssl ca-certificates gnupg ufw \
-    dnsutils lsb-release apt-transport-https git || err "系统依赖安装失败"
+    dnsutils lsb-release apt-transport-https git python3 python3-yaml || err "系统依赖安装失败"
 
   if ! command -v docker &>/dev/null; then
     log "安装 Docker..."

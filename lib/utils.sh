@@ -7,7 +7,7 @@
 ask() {
   local _v=$1 _p=$2 _d=${3:-}
   local __ask_i
-  read -erp "$(echo -e "  ${W}${_p}${N}${_d:+ [${_d}]}: ")" __ask_i
+  read -erp "$(echo -e "  ${W}${_p}${N}${_d:+ [${_d}]}: ")" __ask_i || { printf -v "$_v" '%s' ''; return 1; }
   printf -v "$_v" '%s' "${__ask_i:-$_d}"
 }
 
@@ -16,7 +16,7 @@ askyn() {
   local _v=$1 _p=$2 _d=${3:-y}
   local _h; [[ "$_d" == "y" ]] && _h="Y/n" || _h="y/N"
   local __ask_i
-  read -erp "$(echo -e "  ${W}${_p}${N} [${_h}]: ")" __ask_i
+  read -erp "$(echo -e "  ${W}${_p}${N} [${_h}]: ")" __ask_i || { printf -v "$_v" false; return 1; }
   __ask_i=${__ask_i:-$_d}
   [[ "${__ask_i,,}" == "y" ]] && printf -v "$_v" true || printf -v "$_v" false
 }
@@ -113,7 +113,7 @@ input_choose() {
   echo ""
 
   local _input
-  read -erp "  选择：" _input
+  read -erp "  选择：" _input || { INPUT_RESULT=-1; return 0; }
 
   case "${_input,,}" in
     q|quit|exit)
@@ -161,7 +161,7 @@ input_multi() {
     echo ""
 
     local _input
-    read -erp "  选择：" _input
+    read -erp "  选择：" _input || { INPUT_RESULTS=(); return 1; }
 
     if [[ -z "$_input" ]]; then
       break
@@ -196,7 +196,7 @@ askyn_input() {
   local _h; [[ "$_d" == "y" ]] && _h="Y/n" || _h="y/N"
   local _i
   echo ""
-  read -erp "  ${_p} [${_h}]: " _i
+  read -erp "  ${_p} [${_h}]: " _i || { INPUT_RESULT=false; return 1; }
   _i="${_i:-$_d}"
   [[ "${_i,,}" == "y" ]] && INPUT_RESULT=true || INPUT_RESULT=false
 }

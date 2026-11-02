@@ -27,26 +27,14 @@ section() {
   echo -e "\n${W}${C}── $title ──────────────────────────────${N}"
 }
 
-ask() {
-  local _v=$1 _p=$2 _d=${3:-}
-  local __ask_i
-  read -erp "$(echo -e "  ${W}${_p}${N}${_d:+ [${_d}]}: ")" __ask_i
-  printf -v "$_v" '%s' "${__ask_i:-$_d}"
-}
 
-askyn() {
-  local _v=$1 _p=$2 _d=${3:-y}
-  local _h; [[ "$_d" == "y" ]] && _h="Y/n" || _h="y/N"
-  local __ask_i
-  read -erp "$(echo -e "  ${W}${_p}${N} [${_h}]: ")" __ask_i
-  __ask_i=${__ask_i:-$_d}
-  [[ "${__ask_i,,}" == "y" ]] && printf -v "$_v" true || printf -v "$_v" false
-}
+
+
 
 # ── 通用工具函数（input_choose / break_end 等）──────────────────
 _AI_STACK_DIR="${BASH_SOURCE[0]%/*}"
-source "${_AI_STACK_DIR}/../lib/urls.sh"
-source "${_AI_STACK_DIR}/../lib/public_ip.sh"
+source "${_AI_STACK_DIR}/../lib/urls.sh" || return 1
+source "${_AI_STACK_DIR}/../lib/public_ip.sh" || return 1
 # 拆分后 utils.sh 仍在 lib/，从 ai_stack/ 引入需要 ../lib
 #
 # 注意：这里绝对不能 source lib/colors.sh。
@@ -57,35 +45,7 @@ source "${_AI_STACK_DIR}/../lib/public_ip.sh"
 # 二进制，留下半成品且不报错。
 # colors.sh 里 ai_stack 唯一缺的只是 section()，在下面单独补齐即可。
 # shellcheck source=../lib/utils.sh
-source "${_AI_STACK_DIR}/../lib/utils.sh" 2>/dev/null || {
-  # 兜底：utils.sh 不存在时提供最小实现
-  INPUT_RESULT=-1
-  input_choose() {
-    local _prompt="$1"; shift
-    local -a _opts=("$@")
-    local _cnt=${#_opts[@]}
-    echo ""
-    echo -e "  ${W}${_prompt}${N}"
-    echo -e "  ${DIM}────────────────────────────────${N}"
-    for (( i=0; i<_cnt; i++ )); do echo "    $((i+1)). ${_opts[$i]}"; done
-    echo ""
-    echo -e "  ${DIM}输入编号（1-${_cnt}），输入 0 / Enter 返回，输入 q / quit 退出${N}"
-    echo ""
-    local _input
-    read -erp "  选择：" _input
-    case "${_input,,}" in
-      q|quit|exit) echo ""; exit 0 ;;
-    esac
-    if [[ -z "$_input" ]] || [[ "$_input" == "0" ]]; then
-      INPUT_RESULT=-1
-    elif [[ "$_input" =~ ^[0-9]+$ ]] && (( _input >= 1 && _input <= _cnt )); then
-      INPUT_RESULT=$((_input - 1))
-    else
-      INPUT_RESULT=-1
-    fi
-  }
-  break_end() { echo ""; echo "按任意键继续..."; read -erp "" _; clear; }
-}
+source "${_AI_STACK_DIR}/../lib/utils.sh" || return 1
 
 # ── 通用 UI 工具 ─────────────────────────────────────────────────
 

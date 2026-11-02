@@ -105,17 +105,6 @@ _mig_encrypt() {
     none)
       cat
       ;;
-    age)
-      # age -p 从 tty 读，不适合非交互；改用 --passphrase 从 stdin?
-      # age 官方无 --pass-fd，实践：用 age-plugin 或改走 openssl。
-      # 折中：age 场景走对称口令时借助 expect 麻烦，这里改用 age 的
-      # scrypt recipient（-R -）不适用；因此 age 场景要求用户装 age 且
-      # 使用 -p（交互）——由调用侧 detach tty；此处为一致 API，把口令
-      # 写入 stdin 的做法在 age 上不通用。
-      # 简化：age 模式必须走密钥文件（-r / -i），口令模式回退 openssl。
-      err "age 口令模式请改用 openssl 或密钥文件（见 _mig_encrypt_age_keyfile）" >&2
-      return 1
-      ;;
     openssl)
       openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
         -pass "fd:${pass_fd}"
@@ -185,14 +174,15 @@ JSON
 # $3 = 输出目录（默认 migrate_root）
 # $4 = age recipient 文件（仅 age-keyfile 用）
 # 成功：echo <bundle 完整路径>；失败：返回非 0
-mig_pack_bundle() {
+mig_pack_bundle() (
   local backup_ts=$1 cipher=$2 out_dir=${3:-} recipient=${4:-}
+  local -a selected=("${@:5}")
   local bkroot; bkroot=$(backup_root)
   local src_dir="$bkroot/$backup_ts"
   [[ -d "$src_dir" ]] || { err "备份点不存在：$backup_ts" >&2; return 1; }
 
   out_dir=${out_dir:-$(migrate_root)}
-  mkdir -p "$out_dir" && chmod 0700 "$out_dir" 2>/dev/null
+  mkdir -p "$out_dir" && chmod 0700 "$out_dir" || return 1
 
   local bundle_ts host ext
   bundle_ts=$(date +%Y%m%d-%H%M%S)
@@ -205,15 +195,19 @@ mig_pack_bundle() {
     *) err "未知 cipher: $cipher" >&2; return 1 ;;
   esac
 
-  local out="$out_dir/migrate-${host}-${bundle_ts}.${ext}"
+  local out; out=$(mktemp "$out_dir/migrate-${host}-${bundle_ts}.XXXXXX.${ext}") || return 1
 
   # 临时目录：拷贝 backup point 内容 + 写 migration.json
   local tmp; tmp=$(mktemp -d /tmp/howe-mig-pack.XXXXXX) || return 1
   # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" RETURN
+  trap 'status=$?; rm -rf -- "$tmp"; if (( status != 0 )); then rm -f -- "$out" "$out.sha256"; fi' EXIT
 
-  cp -a "$src_dir"/. "$tmp/"
-  _mig_write_manifest "$tmp" "$cipher" "$backup_ts"
+  cp -a "$src_dir"/. "$tmp/" || return 1
+  if (( ${#selected[@]} > 0 )); then
+    python3 "$BACKUP_LIB_DIR/backup_archive.py" select "$tmp" "${selected[@]}" || return 1
+  fi
+  _mig_write_manifest "$tmp" "$cipher" "$backup_ts" || return 1
+  python3 "$BACKUP_LIB_DIR/backup_archive.py" migration-ts "$tmp" >/dev/null || return 1
 
   # 打包 + 加密（流式，避免落中间明文）
   case "$cipher" in
@@ -251,9 +245,9 @@ mig_pack_bundle() {
 
   chmod 0600 "$out"
   # 外层 sha256（供传输后校验）
-  ( cd "$(dirname "$out")" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
+  ( cd "$(dirname "$out")" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" ) || return 1
   echo "$out"
-}
+)
 
 # ── 解包：把 bundle 还原为 backup point ────────────────────────────
 
@@ -261,90 +255,42 @@ mig_pack_bundle() {
 # $2 = cipher（none|openssl|age-pass|age-keyfile）
 # $3 = age identity 文件（仅 age-keyfile 用）
 # 成功：echo <还原后的 backup point 目录>；失败非 0
-mig_unpack_bundle() {
+mig_unpack_bundle() (
   local bundle=$1 cipher=$2 identity=${3:-}
-  [[ -f "$bundle" ]] || { err "bundle 不存在：$bundle" >&2; return 1; }
-
-  # 外层 sha256 校验（若存在）
-  if [[ -f "$bundle.sha256" ]]; then
-    ( cd "$(dirname "$bundle")" && sha256sum -c "$(basename "$bundle").sha256" >/dev/null 2>&1 ) \
-      || { err "bundle sha256 校验失败" >&2; return 1; }
-    info "bundle 完整性校验通过" >&2
-  else
-    warn "未找到 $(basename "$bundle").sha256，跳过外层校验" >&2
-  fi
-
+  _bk_verify "$bundle" || { warn "迁移包摘要校验失败" >&2; return 1; }
   local tmp; tmp=$(mktemp -d /tmp/howe-mig-unpack.XXXXXX) || return 1
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" RETURN
-
+  trap 'rm -rf -- "$tmp"' EXIT
+  mkdir "$tmp/payload"
   case "$cipher" in
-    none)
-      tar xf "$bundle" -C "$tmp" || { err "解包失败" >&2; return 1; }
-      ;;
+    none) _bk_extract "$bundle" "$tmp/payload" || return 1 ;;
     openssl)
       local pass; pass=$(mig_prompt_passphrase_open) || return 1
-      if _mig_decrypt openssl 3 3< <(printf '%s' "$pass") < "$bundle" \
-          | tar xf - -C "$tmp"; then
-        :
-      else
-        err "解密/解包失败（口令错误或包已损坏）" >&2
-        return 1
-      fi
+      _mig_decrypt openssl 3 3< <(printf '%s' "$pass") < "$bundle" > "$tmp/plain.tar" || return 1
       unset pass
+      _bk_extract "$tmp/plain.tar" "$tmp/payload" || return 1
       ;;
-    age-pass)
-      mig_has_age || { err "age 未安装" >&2; return 1; }
-      _mig_decrypt_age_passphrase < "$bundle" | tar xf - -C "$tmp" || {
-        err "age 解密/解包失败" >&2; return 1
-      }
+    age-pass|age-keyfile)
+      mig_has_age || { warn "age 未安装" >&2; return 1; }
+      if [[ "$cipher" == age-pass ]]; then
+        _mig_decrypt_age_passphrase < "$bundle" > "$tmp/plain.tar" || return 1
+      else
+        [[ -f "$identity" ]] || return 1
+        _mig_decrypt_age_identity "$identity" < "$bundle" > "$tmp/plain.tar" || return 1
+      fi
+      _bk_extract "$tmp/plain.tar" "$tmp/payload" || return 1
       ;;
-    age-keyfile)
-      mig_has_age || { err "age 未安装" >&2; return 1; }
-      [[ -f "$identity" ]] || { err "identity 文件不存在：$identity" >&2; return 1; }
-      _mig_decrypt_age_identity "$identity" < "$bundle" | tar xf - -C "$tmp" || {
-        err "age 解密/解包失败" >&2; return 1
-      }
-      ;;
-    *)
-      err "未知 cipher: $cipher" >&2; return 1
-      ;;
+    *) warn "未知加密格式: $cipher" >&2; return 1 ;;
   esac
-
-  # 校验 migration.json 存在
-  [[ -f "$tmp/migration.json" ]] || { err "包内缺少 migration.json" >&2; return 1; }
-  [[ -f "$tmp/manifest.json"  ]] || { err "包内缺少 manifest.json" >&2; return 1; }
-
-  # 解出 backup_ts 并放到本机 backup_root/<ts>/
-  local backup_ts
-  backup_ts=$(grep -oE '"backup_ts":\s*"[^"]+"' "$tmp/migration.json" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
-  [[ -n "$backup_ts" ]] || { err "无法解析 backup_ts" >&2; return 1; }
-
-  local bkroot; bkroot=$(backup_root)
-  mkdir -p "$bkroot" && chmod 0700 "$bkroot" 2>/dev/null
-
-  # 冲突处理：目标点已存在则改名保存原状
-  local dst="$bkroot/$backup_ts"
-  if [[ -e "$dst" ]]; then
-    local sfx; sfx=$(date +%s)
-    mv "$dst" "${dst}.pre-migrate.${sfx}"
-    warn "已存在同名备份点，原目录已改名保存" >&2
-  fi
-  mv "$tmp" "$dst" || { err "落地失败" >&2; return 1; }
-  chmod 0700 "$dst"
-  # 从 trap 中释放（已改名到目标位置）
-  trap - RETURN
-
-  # 用 backup_lib 的 verify 校验每个 scope 完整
-  local bad
-  bad=$(backup_verify "$backup_ts") || true
-  if [[ -n "$bad" ]]; then
-    warn "以下 scope 校验失败：$bad" >&2
-    return 2
-  fi
-
-  echo "$backup_ts"
-}
+  local ts root destination
+  ts=$(python3 "$BACKUP_LIB_DIR/backup_archive.py" migration-ts "$tmp/payload") || return 1
+  root=$(backup_root)
+  mkdir -p "$root" && chmod 0700 "$root" || return 1
+  destination="$root/$ts"
+  [[ ! -e "$destination" ]] || { warn "同名备份点已存在, 请先明确处理它, 不自动覆盖" >&2; return 1; }
+  mv "$tmp/payload" "$destination" || return 1
+  chmod 0700 "$destination" || return 1
+  printf '%s\n' "$ts"
+)
 
 # ── 传输层 ────────────────────────────────────────────────────────
 # 均通过 rsync -e ssh；不在参数里嵌任何口令；SSH 认证走用户既有的
@@ -391,7 +337,7 @@ mig_ssh_check() {
 
   # 失败才回显 ssh 原始错误，避免成功路径打印无关警告
   [[ -n "$emsg" ]] && sed 's/^/  /' <<< "$emsg" >&2
-  err "SSH 无法连通 ${remote}:${port}" >&2
+  warn "SSH 无法连通 ${remote}:${port}" >&2
   case "$emsg" in
     *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION HAS CHANGED"*)
       # known_hosts 里 22 端口存裸主机名，非标端口存 [host]:port
@@ -431,10 +377,10 @@ mig_rsync_push() {
   local -a opts; read -ra opts <<< "$sshopts"
   # 建远端目录 + 同步 bundle 与 sha256
   ssh -p "$port" "${opts[@]}" "$remote" \
-      "mkdir -p '$remote_dir' && chmod 0700 '$remote_dir'" || {
+      "mkdir -p -- $(printf '%q' "$remote_dir") && chmod 0700 -- $(printf '%q' "$remote_dir")" || {
     err "无法在 $remote:$remote_dir 创建目录（检查路径权限）" >&2; return 1
   }
-  rsync -e "ssh -p $port $sshopts" -av --partial --progress \
+  rsync -e "ssh -p $port $sshopts" -av --protect-args --partial --progress \
         "$local_path" "$local_path.sha256" \
         "$remote:$remote_dir/" || {
     err "rsync 推送失败" >&2; return 1
@@ -453,7 +399,7 @@ mig_rsync_pull() {
   local_dir=${local_dir:-$(migrate_root)}
   mkdir -p "$local_dir" && chmod 0700 "$local_dir"
   local sshopts; sshopts=$(mig_ssh_opts)
-  rsync -e "ssh -p $port $sshopts" -av --partial --progress \
+  rsync -e "ssh -p $port $sshopts" -av --protect-args --partial --progress \
         "$remote:$remote_path" "$remote:$remote_path.sha256" \
         "$local_dir/" >&2 || {
     err "rsync 拉取失败" >&2; return 1
@@ -501,7 +447,7 @@ _mig_scope_strategies() {
     ai-pg)
       echo '[{"id":"restore","label":"从dump恢复（覆盖现有数据）"},{"id":"skip","label":"跳过"}]'
       ;;
-    ai-data|ai-config|clash|singbox|caddy|ai-cli|kiro|nrouter)
+    ai-data|ai-config|clash|singbox|caddy|frps|ai-cli|kiro|nrouter)
       echo '[{"id":"restore","label":"从备份恢复"},{"id":"skip","label":"跳过"}]'
       ;;
     system-sec)
@@ -546,11 +492,11 @@ mig_write_manifest_v2() {
       pack_strat=$(cat "$dir/pack-strategy" 2>/dev/null || echo "record")
     # 解包 pack-strategy 从 docker-images.tar.gz 内部读取
     if [[ "$sk" == "docker-images" ]]; then
-      pack_strat=$(tar xzf "$f" -O ./pack-strategy 2>/dev/null | head -1 || echo "record")
+      pack_strat=$(tar xzf "$f" -O ./pack-strategy) || return 1
     fi
     local custom_paths=""
     if [[ "$sk" == "custom" ]]; then
-      custom_paths=$(tar xzf "$f" -O ./.custom-paths 2>/dev/null | head -50 | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip().splitlines()))" 2>/dev/null || echo "[]")
+      custom_paths=$(tar xzf "$f" -O ./.custom-paths | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().splitlines()))") || return 1
     fi
     local strategies; strategies=$(_mig_scope_strategies "$sk" "$pack_strat")
     scope_data+="${sep}{\"scope\":\"${sk}\",\"file\":\"${sk}.tar.gz\",\"size\":${size},\"description\":\"${desc}\",\"pack_strategy\":\"${pack_strat}\",\"custom_paths\":${custom_paths:-[]},\"unpack_strategies\":${strategies}}"
@@ -631,14 +577,14 @@ _mig_arch_for() {
 
 # 按指定版本安装 sing-box
 # $1 = 版本号（不带 v 前缀，如 1.13.16）
-mig_install_singbox_pinned() {
+mig_install_singbox_pinned() (
   local ver=$1
   [[ -n "$ver" ]] || { warn "未指定 sing-box 版本"; return 1; }
   local arch; arch=$(_mig_arch_for singbox) || return 1
 
   local tmp; tmp=$(mktemp -d /tmp/howe-mig-sb.XXXXXX) || return 1
   # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" RETURN
+  trap "rm -rf '$tmp'" EXIT
 
   local url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}.tar.gz"
   info "下载 sing-box v${ver}（${arch}）..."
@@ -650,18 +596,18 @@ mig_install_singbox_pinned() {
   install -m 755 "$bin" "${SINGBOX_BIN:-/usr/local/bin/sing-box}" \
     || { warn "安装失败（权限或路径问题）"; return 1; }
   log "sing-box 已装到 v${ver}"
-}
+)
 
 # 按指定版本安装 frps
 # $1 = 版本号（不带 v 前缀，如 0.68.1）
-mig_install_frps_pinned() {
+mig_install_frps_pinned() (
   local ver=$1
   [[ -n "$ver" ]] || { warn "未指定 frps 版本"; return 1; }
   local arch; arch=$(_mig_arch_for frps) || return 1
 
   local tmp; tmp=$(mktemp -d /tmp/howe-mig-frp.XXXXXX) || return 1
   # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" RETURN
+  trap "rm -rf '$tmp'" EXIT
 
   local dir="frp_${ver}_linux_${arch}"
   local url="https://github.com/fatedier/frp/releases/download/v${ver}/${dir}.tar.gz"
@@ -674,7 +620,7 @@ mig_install_frps_pinned() {
   install -m 755 "$bin" /usr/local/bin/frps \
     || { warn "安装失败（权限或路径问题）"; return 1; }
   log "frps 已装到 v${ver}"
-}
+)
 
 # ── Docker 锁版本 ─────────────────────────────────────────────────
 # Docker CE 由官方 apt 源分发，可以精确锁版本 —— 之前判断「官方脚本无版本
@@ -774,48 +720,6 @@ mig_local_tool_version() {
   esac
 }
 
-# ── 版本比较工具 ──────────────────────────────────────────────────
-# 比较两个语义化版本号
-# $1 = 版本 A，$2 = 版本 B
-# 返回：0 表示相等，<0 表示 A < B，>0 表示 A > B
-# 通过退出码传递：0=相等，1=A<B，2=A>B
-mig_version_compare() {
-  local a=$1 b=$2
-  [[ "$a" == "$b" ]] && return 0
-
-  # 去除 'v' 前缀
-  a=${a#v}; b=${b#v}
-
-  # 用 Python 做语义化版本比较
-  python3 -c "
-import sys
-from packaging import version
-try:
-    va = version.parse('$a')
-    vb = version.parse('$b')
-    if va < vb:
-        sys.exit(1)
-    elif va > vb:
-        sys.exit(2)
-    else:
-        sys.exit(0)
-except:
-    # 降级到字符串比较
-    if '$a' < '$b':
-        sys.exit(1)
-    elif '$a' > '$b':
-        sys.exit(2)
-    else:
-        sys.exit(0)
-" 2>/dev/null
-  local ret=$?
-  case $ret in
-    1) return 1 ;;  # A < B
-    2) return 2 ;;  # A > B
-    *) return 0 ;;  # A == B
-  esac
-}
-
 # ── 镜像版本对账 ──────────────────────────────────────────────────
 # 读 docker-images.lock.json，逐镜像对比新机现状，让用户决定版本取向。
 #
@@ -859,7 +763,8 @@ mig_reconcile_images() {
 
   # 读锁文件：每行 service|ref|digest|tag|mutable|created
   local -a rows=()
-  mapfile -t rows < <(python3 - "$lock" <<'PY' 2>/dev/null
+  local image_text
+  image_text=$(python3 - "$lock" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 for i in d.get("images", []):
@@ -872,7 +777,8 @@ for i in d.get("images", []):
         (i.get("created", "") or "")[:10],
     ]))
 PY
-  )
+  ) || return 1
+  [[ -z "$image_text" ]] || mapfile -t rows <<< "$image_text"
   (( ${#rows[@]} == 0 )) && { info "镜像锁内无记录，跳过"; return 0; }
 
   section "镜像版本对账"
@@ -950,7 +856,7 @@ PY
     echo -e "  ${DIM}输入编号切换该项 | a=全部用 bundle 版本 | t=全部拉最新 | 回车执行 | q 跳过${N}"
     [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; }
 
-    local _in; read -erp "  选择: " _in
+    local _in; read -erp "  选择: " _in || return 1
     [[ -z "$_in" ]] && break
     case "${_in,,}" in
       q|quit) info "已跳过镜像对账"; return 0 ;;
@@ -1046,7 +952,7 @@ PY
 
   echo ""
   echo -e "  ${W}镜像对账完成${N}：${G}${ok} 成功${N} / ${R}${fail} 失败${N} / ${DIM}${skipped} 保持不变${N}"
-  return 0
+  (( fail == 0 ))
 }
 
 # ── 策略执行器 ────────────────────────────────────────────────────
@@ -1064,6 +970,7 @@ mig_execute_strategy() {
     clash:restore)     _bk_rs_clash "$arc" ;;
     singbox:restore)   _bk_rs_singbox "$arc" ;;
     caddy:restore)     _bk_rs_caddy "$arc" ;;
+    frps:restore)      _bk_rs_frps "$arc" ;;
     ai-cli:restore)    _bk_rs_ai_cli "$arc" ;;
     kiro:restore)      _bk_rs_kiro "$arc" ;;
     nrouter:restore)   _bk_rs_nrouter "$arc" ;;
@@ -1081,9 +988,8 @@ mig_execute_strategy() {
     *:skip)
       info "跳过 $scope" ;;
     *)
-      warn "未知策略 $scope:$strategy，尝试默认恢复" >&2
-      local fn="_bk_rs_${scope//-/_}"
-      declare -F "$fn" >/dev/null 2>&1 && "$fn" "$arc" || return 1
+      warn "未知策略 $scope:$strategy, 已停止恢复" >&2
+      return 1
       ;;
   esac
 }

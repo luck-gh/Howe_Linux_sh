@@ -19,9 +19,10 @@
 #   manifest.json
 # ═══════════════════════════════════════════════════════════════════
 
+BACKUP_LIB_DIR="${BASH_SOURCE[0]%/*}"
 BACKUP_ROOT_DEFAULT=/var/backups/howe
 BACKUP_KEEP_DEFAULT=7
-BACKUP_DEFAULT_SCOPES_DEFAULT="ai-pg,ai-data,ai-config,clash,singbox,caddy,kiro,system-sec,system-tune"
+BACKUP_DEFAULT_SCOPES_DEFAULT="ai-pg,ai-data,ai-config,clash,singbox,caddy,frps,kiro,system-sec,system-tune"
 BACKUP_AUTO_BEFORE_UPGRADE_DEFAULT=true
 BACKUP_TIMER_ENABLED_DEFAULT=false
 BACKUP_TIMER_SCHEDULE_DEFAULT=daily
@@ -65,6 +66,7 @@ BACKUP_SCOPES=(
   "clash|Clash 多订阅子系统（订阅库 / nft 状态）|_bk_has_clash"
   "singbox|sing-box 配置（/etc/sing-box）|_bk_has_singbox"
   "caddy|Caddy 配置与证书（/etc/caddy + /var/lib/caddy）|_bk_has_caddy"
+  "frps|frp 服务端配置与启动单元|_bk_has_frps"
   "ai-cli|AI CLI 配置（claude / codex / opencode / openclaw）|_bk_has_ai_cli"
   "kiro|kiro-rs 配置（config.json / credentials.json）|_bk_has_kiro"
   "nrouter|9router 数据目录（/opt/ai-stack/9router/data）|_bk_has_nrouter"
@@ -81,6 +83,7 @@ _bk_has_ai_config() { [[ -f "$BACKUP_AI_BASE/docker-compose.yml" ]] || [[ -f "$B
 _bk_has_clash()     { [[ -f "$BACKUP_AI_BASE/clash/subs.yaml" ]]; }
 _bk_has_singbox()   { [[ -d /etc/sing-box ]]; }
 _bk_has_caddy()     { [[ -f /etc/caddy/Caddyfile ]] || [[ -d /etc/caddy ]]; }
+_bk_has_frps()      { [[ -f /etc/frp/frps.toml ]]; }
 _bk_has_ai_cli()    { local d; for d in ~/.claude ~/.codex ~/.opencode ~/.openclaw; do [[ -d "$d" ]] && return 0; done; return 1; }
 _bk_has_kiro()      { [[ -d "$BACKUP_AI_BASE/kiro-rs/config" ]]; }
 _bk_has_nrouter()   { [[ -d "$BACKUP_AI_BASE/9router/data" ]]; }
@@ -190,9 +193,18 @@ _bk_seal() {
 
 # 校验 sha256
 _bk_verify() {
-  local f=$1
-  [[ -f "$f.sha256" ]] || return 1
-  ( cd "$(dirname "$f")" && sha256sum -c "$(basename "$f").sha256" >/dev/null 2>&1 )
+  python3 "$BACKUP_LIB_DIR/backup_archive.py" verify-archive "$1"
+}
+
+_bk_extract() {
+  python3 "$BACKUP_LIB_DIR/backup_archive.py" extract "$1" "$2"
+}
+
+_bk_pg_recreate() {
+  local db=${1//\"/\"\"}
+  docker exec ai-db psql -U ai -d postgres -v ON_ERROR_STOP=1 \
+    -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE);" \
+    -c "CREATE DATABASE \"$db\" OWNER ai;"
 }
 
 # 列出所有可用 scope key（按检测函数过滤）
@@ -228,12 +240,11 @@ _bk_tar() {
   local errf; errf=$(mktemp /tmp/howe-bk-tar.XXXXXX)
   tar czf "$out" "$@" 2>"$errf"
   local rc=$?
-  if (( rc >= 2 )); then
+  if (( rc != 0 )); then
     warn "tar 失败（退出码 $rc）：$(head -3 "$errf" | tr '\n' ' ')" >&2
     rm -f "$errf"
     return 1
   fi
-  (( rc == 1 )) && info "  tar 提示（不影响归档）：$(head -1 "$errf")" >&2
   rm -f "$errf"
   return 0
 }
@@ -242,10 +253,10 @@ _bk_tar() {
 # 输出 .tar.gz 到 $1（备份点目录），返回 0 成功 / 非 0 失败
 # 失败时不留半成品。
 
-_bk_do_ai_pg() {
+_bk_do_ai_pg() (
   local out=$1/ai-pg.tar.gz
   local tmp; tmp=$(mktemp -d /tmp/howe-bk-pg.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
+  trap "rm -rf '$tmp'" EXIT
 
   docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ai-db$' || { warn "ai-db 容器未运行，跳过 ai-pg"; return 1; }
 
@@ -260,7 +271,7 @@ _bk_do_ai_pg() {
 
   ( cd "$tmp" && tar czf "$out" ./*.dump ) || return 1
   _bk_seal "$out"
-}
+)
 
 _bk_do_ai_data() {
   local out=$1/ai-data.tar.gz
@@ -282,6 +293,7 @@ _bk_do_ai_config() {
   local -a inc=()
   [[ -f "$BACKUP_AI_BASE/docker-compose.yml" ]] && inc+=("docker-compose.yml")
   [[ -f "$BACKUP_AI_BASE/.env" ]]               && inc+=(".env")
+  [[ -f "$BACKUP_AI_BASE/ai-db/init-multi-db.sh" ]] && inc+=("ai-db/init-multi-db.sh")
   [[ ${#inc[@]} -eq 0 ]] && { warn "AI 服务栈顶层配置不存在"; return 1; }
   ( cd "$BACKUP_AI_BASE" && _bk_tar "$out" "${inc[@]}" ) || return 1
   _bk_seal "$out"
@@ -300,9 +312,21 @@ _bk_do_clash() {
 _bk_do_singbox() {
   local out=$1/singbox.tar.gz
   [[ -d /etc/sing-box ]] || return 1
-  ( cd /etc && _bk_tar "$out" sing-box ) || return 1
+  local -a files=(sing-box)
+  [[ -f /etc/systemd/system/sing-box.service ]] && files+=(systemd/system/sing-box.service)
+  ( cd /etc && _bk_tar "$out" "${files[@]}" ) || return 1
   _bk_seal "$out"
 }
+
+_bk_do_frps() {
+  local out=$1/frps.tar.gz
+  local -a files=(frp)
+  [[ -f /etc/systemd/system/frps.service ]] && files+=(systemd/system/frps.service)
+  (cd /etc && _bk_tar "$out" "${files[@]}") || return 1
+  _bk_seal "$out"
+}
+
+_bk_rs_frps() { _bk_extract "$1" /etc; }
 
 _bk_do_caddy() {
   local out=$1/caddy.tar.gz
@@ -330,73 +354,62 @@ _bk_do_ai_cli() {
 # 输入 $1 = .tar.gz 文件路径
 # 调用前必须 _bk_verify 通过
 
-_bk_rs_ai_pg() {
+_bk_rs_ai_pg() (
   local arc=$1
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ai-db$' \
-    || { warn "ai-db 容器未运行，无法恢复 ai-pg"; return 1; }
-
-  local tmp; tmp=$(mktemp -d /tmp/howe-rs-pg.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
-
-  tar xzf "$arc" -C "$tmp" || { warn "解包 ai-pg 失败"; return 1; }
-
-  # 停掉所有连库的容器，避免 DROP 时被持有
-  local -a using=()
-  local svc
+  docker ps --format '{{.Names}}' | grep -Fxq ai-db \
+    || { warn "ai-db 容器未运行, 无法恢复 ai-pg"; return 1; }
+  local tmp; tmp=$(mktemp -d /tmp/howe-rs-pg.XXXXXX) || return 1
+  trap 'rm -rf -- "$tmp"' EXIT
+  _bk_extract "$arc" "$tmp" || return 1
+  shopt -s nullglob
+  local -a dumps=("$tmp"/*.dump) using=()
+  (( ${#dumps[@]} > 0 )) || { warn "数据库归档中没有 dump"; return 1; }
+  local svc f db
   for svc in sub2api new-api; do
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${svc}$" && using+=("$svc")
+    docker ps --format '{{.Names}}' | grep -Fxq "$svc" && using+=("$svc")
   done
-  if [[ ${#using[@]} -gt 0 ]]; then
-    info "暂停容器：${using[*]}"
-    ( cd "$BACKUP_AI_BASE" && docker compose stop "${using[@]}" >/dev/null 2>&1 )
+  if (( ${#using[@]} > 0 )); then
+    (cd "$BACKUP_AI_BASE" && docker compose stop "${using[@]}") || return 1
   fi
-
-  local f db
-  for f in "$tmp"/*.dump; do
-    [[ -f "$f" ]] || continue
+  for f in "${dumps[@]}"; do
     db=$(basename "$f" .dump)
-    info "恢复数据库 $db"
-    docker cp "$f" ai-db:/tmp/restore.dump >/dev/null \
-      || { warn "复制 dump 到容器失败"; return 1; }
-    docker exec ai-db psql -U ai -d postgres -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE);" >/dev/null 2>&1 \
-      || docker exec ai-db psql -U ai -d postgres -c "DROP DATABASE IF EXISTS \"$db\";" >/dev/null 2>&1
-    docker exec ai-db psql -U ai -d postgres -c "CREATE DATABASE \"$db\" OWNER ai;" >/dev/null \
-      || { warn "创建数据库 $db 失败"; return 1; }
-    docker exec ai-db pg_restore -U ai -d "$db" /tmp/restore.dump >/dev/null 2>&1 \
-      || { warn "pg_restore $db 失败"; return 1; }
-    docker exec ai-db rm -f /tmp/restore.dump >/dev/null 2>&1
+    docker cp "$f" ai-db:/tmp/howe-restore.dump || return 1
+    _bk_pg_recreate "$db" || return 1
+    if ! docker exec ai-db pg_restore -U ai -d "$db" --exit-on-error --single-transaction /tmp/howe-restore.dump; then
+      warn "数据库 $db 恢复失败; 业务容器保持停止, 请排查后重试"
+      return 1
+    fi
+    docker exec ai-db rm -f /tmp/howe-restore.dump || return 1
   done
-
-  if [[ ${#using[@]} -gt 0 ]]; then
-    info "重启容器：${using[*]}"
-    ( cd "$BACKUP_AI_BASE" && docker compose start "${using[@]}" >/dev/null 2>&1 )
+  if (( ${#using[@]} > 0 )); then
+    (cd "$BACKUP_AI_BASE" && docker compose start --wait --wait-timeout 60 "${using[@]}") || return 1
   fi
-}
+)
 
 _bk_rs_ai_data() {
   [[ -d "$BACKUP_AI_BASE" ]] || mkdir -p "$BACKUP_AI_BASE"
-  tar xzf "$1" -C "$BACKUP_AI_BASE"
+  _bk_extract "$1" "$BACKUP_AI_BASE"
 }
 
 _bk_rs_ai_config() {
   [[ -d "$BACKUP_AI_BASE" ]] || mkdir -p "$BACKUP_AI_BASE"
-  tar xzf "$1" -C "$BACKUP_AI_BASE"
+  _bk_extract "$1" "$BACKUP_AI_BASE"
 }
 
 _bk_rs_clash() {
   [[ -d "$BACKUP_AI_BASE" ]] || mkdir -p "$BACKUP_AI_BASE"
-  tar xzf "$1" -C "$BACKUP_AI_BASE"
+  _bk_extract "$1" "$BACKUP_AI_BASE"
 }
 
-_bk_rs_singbox() { tar xzf "$1" -C /etc; }
+_bk_rs_singbox() { _bk_extract "$1" /etc; }
 _bk_rs_caddy() {
-  tar xzf "$1" -C /
+  _bk_extract "$1" / || return 1
   # 归还 caddy 用户所有权（跨机 uid/gid 可能不同）
   if id caddy >/dev/null 2>&1 && [[ -d /var/lib/caddy ]]; then
     chown -R caddy:caddy /var/lib/caddy 2>/dev/null || true
   fi
 }
-_bk_rs_ai_cli()  { tar xzf "$1" -C "$HOME"; }
+_bk_rs_ai_cli()  { _bk_extract "$1" "$HOME"; }
 
 _bk_do_kiro() {
   local out=$1/kiro.tar.gz
@@ -407,7 +420,7 @@ _bk_do_kiro() {
 
 _bk_rs_kiro() {
   [[ -d "$BACKUP_AI_BASE/kiro-rs" ]] || mkdir -p "$BACKUP_AI_BASE/kiro-rs"
-  tar xzf "$1" -C "$BACKUP_AI_BASE"
+  _bk_extract "$1" "$BACKUP_AI_BASE"
 }
 
 _bk_do_nrouter() {
@@ -419,16 +432,16 @@ _bk_do_nrouter() {
 
 _bk_rs_nrouter() {
   [[ -d "$BACKUP_AI_BASE/9router" ]] || mkdir -p "$BACKUP_AI_BASE/9router"
-  tar xzf "$1" -C "$BACKUP_AI_BASE"
+  _bk_extract "$1" "$BACKUP_AI_BASE"
 }
 
 # ── system-sec：主机层安全配置 ────────────────────────────────────
 # 打包：fail2ban 配置 + iptables 规则文件 + ipset 名单导出
 # 不打包运行时 iptables/ipset 内存状态（新机上要 restore 后 iptables-restore）
-_bk_do_system_sec() {
+_bk_do_system_sec() (
   local out=$1/system-sec.tar.gz
   local tmp; tmp=$(mktemp -d /tmp/howe-bk-sec.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
+  trap "rm -rf '$tmp'" EXIT
 
   local -a inc=()
   if [[ -d /etc/fail2ban ]]; then
@@ -456,49 +469,21 @@ _bk_do_system_sec() {
 
   ( cd "$tmp" && tar czf "$out" . ) || return 1
   _bk_seal "$out"
-}
+)
 
 # 恢复：写文件到位；iptables/ipset 需要用户确认后手动 apply（避免锁住 SSH）
 _bk_rs_system_sec() {
-  local arc=$1
-  local tmp; tmp=$(mktemp -d /tmp/howe-rs-sec.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
-  tar xzf "$arc" -C "$tmp" || return 1
-
-  # fail2ban：直接落到 /etc
-  if [[ -d "$tmp/fail2ban" ]]; then
-    mkdir -p /etc/fail2ban
-    ( cd "$tmp" && tar cf - fail2ban ) | ( cd /etc && tar xf - )
-    log "已恢复 /etc/fail2ban（需要 systemctl restart fail2ban 生效）"
-  fi
-  # iptables 规则文件：落回 /etc/iptables
-  if [[ -d "$tmp/iptables" ]]; then
-    mkdir -p /etc/iptables
-    cp -a "$tmp/iptables/." /etc/iptables/
-    log "已恢复 /etc/iptables 规则文件"
-  fi
-  # 运行时规则和 ipset：只放到目录里，不 apply（避免锁 SSH）
-  local staging=/root/howe-migrate-restore
-  mkdir -p "$staging"
-  local staged=0
-  for f in iptables.rules.v4 iptables.rules.v6 ipset.save; do
-    [[ -f "$tmp/$f" ]] && cp "$tmp/$f" "$staging/" && staged=1
-  done
-  if (( staged )); then
-    warn "以下规则已放入 $staging，未自动 apply（防止误封 SSH）："
-    ls -1 "$staging" | sed 's/^/    /'
-    echo "    请在确认好后手动执行："
-    echo "      iptables-restore < $staging/iptables.rules.v4"
-    echo "      ip6tables-restore < $staging/iptables.rules.v6"
-    echo "      ipset restore < $staging/ipset.save"
-  fi
+  local staging=/root/howe-migrate-restore/system-sec
+  mkdir -p "$staging" || return 1
+  _bk_extract "$1" "$staging" || return 1
+  log "主机安全配置已放入 $staging; 未覆盖 /etc, 未应用防火墙规则"
 }
 
 # ── system-tune：主机层内核/调度配置 ───────────────────────────────
-_bk_do_system_tune() {
+_bk_do_system_tune() (
   local out=$1/system-tune.tar.gz
   local tmp; tmp=$(mktemp -d /tmp/howe-bk-tune.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
+  trap "rm -rf '$tmp'" EXIT
 
   local -a inc=()
   # 项目专属 sysctl 配置（99-howe-*.conf）
@@ -517,13 +502,13 @@ _bk_do_system_tune() {
 
   ( cd "$tmp" && tar czf "$out" . ) || return 1
   _bk_seal "$out"
-}
+)
 
-_bk_rs_system_tune() {
+_bk_rs_system_tune() (
   local arc=$1
   local tmp; tmp=$(mktemp -d /tmp/howe-rs-tune.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
-  tar xzf "$arc" -C "$tmp" || return 1
+  trap "rm -rf '$tmp'" EXIT
+  _bk_extract "$arc" "$tmp" || return 1
 
   if [[ -d "$tmp/sysctl.d" ]]; then
     cp "$tmp/sysctl.d/"*.conf /etc/sysctl.d/ 2>/dev/null || true
@@ -543,15 +528,15 @@ _bk_rs_system_tune() {
     warn "旧机 root crontab 已放入 /root/howe-migrate-restore/root.crontab（未自动 apply）"
     echo "    对比后可执行： crontab /root/howe-migrate-restore/root.crontab"
   fi
-}
+)
 
 # ── docker-images scope ───────────────────────────────────────────
 # MIG_DOCKER_STRATEGY = "record"（默认，仅记录镜像名）或 "save"（docker save 打包）
-_bk_do_docker_images() {
+_bk_do_docker_images() (
   local out=$1/docker-images.tar.gz
   local strategy="${MIG_DOCKER_STRATEGY:-record}"
   local tmp; tmp=$(mktemp -d /tmp/howe-bk-docker.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
+  trap "rm -rf '$tmp'" EXIT
 
   # 始终记录运行中镜像名单（解包时 pull 用）
   docker ps --format '{{.Image}}' 2>/dev/null | sort -u > "$tmp/running-images.list"
@@ -564,21 +549,21 @@ _bk_do_docker_images() {
     if (( ${#imgs[@]} > 0 )); then
       info "docker save ${#imgs[@]} 个镜像，可能需要较长时间..." >&2
       docker save "${imgs[@]}" 2>/dev/null | gzip > "$tmp/docker-images.tar.gz" \
-        || { warn "docker save 失败，降级为 record 模式" >&2; echo "record" > "$tmp/pack-strategy"; }
+        || { warn "docker save 失败, 已停止打包" >&2; return 1; }
     fi
   fi
 
   ( cd "$tmp" && tar czf "$out" . ) || return 1
   _bk_seal "$out"
-}
+)
 
 # $1 = tar.gz $2 = strategy (pull|load|skip)
-_bk_rs_docker_images() {
+_bk_rs_docker_images() (
   local arc=$1 strategy="${2:-pull}"
   [[ "$strategy" == "skip" ]] && { info "跳过 docker 镜像"; return 0; }
   local tmp; tmp=$(mktemp -d /tmp/howe-rs-docker.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
-  tar xzf "$arc" -C "$tmp" || return 1
+  trap "rm -rf '$tmp'" EXIT
+  _bk_extract "$arc" "$tmp" || return 1
 
   case "$strategy" in
     pull)
@@ -593,6 +578,7 @@ _bk_rs_docker_images() {
         fi
       done < "$tmp/running-images.list"
       log "docker pull 完成：成功 $ok，失败 $failed"
+      (( failed == 0 )) || return 1
       ;;
     load)
       [[ -f "$tmp/docker-images.tar.gz" ]] || {
@@ -602,50 +588,46 @@ _bk_rs_docker_images() {
       docker load < "$tmp/docker-images.tar.gz" && log "docker load 完成" || return 1
       ;;
   esac
-}
+)
 
 # ── custom scope ──────────────────────────────────────────────────
-# MIG_CUSTOM_PATHS = 换行或空格分隔的路径列表
-_bk_do_custom() {
+# MIG_CUSTOM_PATHS = 换行分隔的完整路径列表, 路径可包含空格
+_bk_do_custom() (
   local out=$1/custom.tar.gz
+  local tmp; tmp=$(mktemp -d /tmp/howe-bk-custom.XXXXXX) || return 1
+  trap 'rm -rf -- "$tmp"' EXIT
   local -a paths=()
-  # 支持换行与空格分隔
-  while IFS= read -r p; do
-    [[ -n "$p" ]] && paths+=("$p")
-  done <<< "$(tr ' ' '\n' <<< "${MIG_CUSTOM_PATHS:-}")"
-  [[ ${#paths[@]} -eq 0 ]] && { warn "无自定义路径"; return 1; }
-
-  local tmp; tmp=$(mktemp -d /tmp/howe-bk-custom.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
+  local input p rel
+  while IFS= read -r input; do
+    [[ -n "$input" ]] || continue
+    p=$(realpath -e -- "$input") || return 1
+    if [[ "$p" == / || "$out" == "$p/"* || "$tmp" == "$p/"* ]]; then
+      warn "自定义路径不能包含当前备份或临时目录: $p" >&2
+      return 1
+    fi
+    paths+=("$p")
+  done <<< "${MIG_CUSTOM_PATHS:-}"
+  (( ${#paths[@]} > 0 )) || { warn "未指定自定义路径"; return 1; }
   printf '%s\n' "${paths[@]}" > "$tmp/.custom-paths"
-
-  local found=0
   for p in "${paths[@]}"; do
-    [[ -e "$p" ]] || { warn "路径不存在，跳过：$p" >&2; continue; }
-    local rel="${p#/}"
-    mkdir -p "$tmp/$(dirname "$rel")"
-    cp -a "$p" "$tmp/$rel" 2>/dev/null && found=$((found+1)) || warn "复制失败：$p" >&2
+    rel=${p#/}
+    mkdir -p "$tmp/$(dirname "$rel")" || return 1
+    cp -aT -- "$p" "$tmp/$rel" || return 1
   done
-  (( found == 0 )) && { warn "自定义路径均不存在"; return 1; }
-
-  ( cd "$tmp" && tar czf "$out" . ) || return 1
+  (cd "$tmp" && tar czf "$out" .) || return 1
   _bk_seal "$out"
-}
+)
 
 # $1 = tar.gz  $2 = 恢复目标根目录（默认 /）
-_bk_rs_custom() {
-  local arc=$1 target="${2:-/}"
-  local tmp; tmp=$(mktemp -d /tmp/howe-rs-custom.XXXXXX)
-  trap "rm -rf '$tmp'" RETURN
-  tar xzf "$arc" -C "$tmp" || return 1
-  # 按原目录结构恢复，排除元数据文件
-  ( cd "$tmp" && find . -mindepth 1 -not -name '.custom-paths' | \
-    tar cf - --files-from=- ) | tar xf - -C "$target" 2>/dev/null
+_bk_rs_custom() (
+  local arc=$1 target=${2:-/}
+  local tmp; tmp=$(mktemp -d /tmp/howe-rs-custom.XXXXXX) || return 1
+  trap 'rm -rf -- "$tmp"' EXIT
+  _bk_extract "$arc" "$tmp" || return 1
+  mkdir -p "$target" || return 1
+  (cd "$tmp" && tar cf - --exclude='./.custom-paths' .) | _bk_extract - "$target" || return 1
   log "自定义路径已恢复到 $target"
-  [[ -f "$tmp/.custom-paths" ]] && {
-    echo "  包含路径："; sed 's/^/    /' "$tmp/.custom-paths"
-  }
-}
+)
 # 记录本次备份产生环境的关键状态，供新机迁移解包时对齐：
 #   - 已安装但未打包的组件（Docker 镜像 / 二进制 / systemd unit）
 #   - 已打包但需要重启才生效的服务
@@ -699,8 +681,8 @@ _bk_write_inventory() {
   )
   (( ssh_keys > 0 ))   && todos+=("导入 SSH authorized_keys（旧机 ${ssh_keys} 条，未打包）")
   (( cron_lines > 0 )) && todos+=("重建 root crontab（旧机 ${cron_lines} 条，system-tune scope 已打包）")
-  (( f2b_jails > 0 ))  && todos+=("重启 fail2ban（system-sec 已恢复配置）")
-  (( ipt_rules > 0 ))  && todos+=("重启 iptables 或 iptables-restore（system-sec 已恢复规则）")
+  (( f2b_jails > 0 ))  && todos+=("对比 system-sec 暂存配置后按目标机情况配置 fail2ban")
+  (( ipt_rules > 0 ))  && todos+=("对比 system-sec 暂存规则后按目标机情况配置防火墙")
 
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$out" \
@@ -741,18 +723,8 @@ with open(out, 'w', encoding='utf-8') as f:
     json.dump(d, f, ensure_ascii=False, indent=2)
 PY
   else
-    # 无 python3 时写简化版（纯 ASCII，足够新机读取）
-    {
-      echo '{'
-      echo "  \"host\": \"$host\","
-      echo "  \"os\": \"$os_pretty\","
-      echo "  \"kernel\": \"$kernel\","
-      echo "  \"arch\": \"$arch\","
-      echo "  \"cpu_count\": $cpu,"
-      echo "  \"mem_kb\": $mem_kb,"
-      echo "  \"note\": \"python3 unavailable, simplified inventory\""
-      echo '}'
-    } > "$out"
+    warn "缺少 python3, 无法生成环境清单" >&2
+    return 1
   fi
 }
 
@@ -768,7 +740,7 @@ PY
 # 再 retag 回原 tag —— retag 是零成本别名（同一 image ID），且 compose
 # 默认 pull_policy=missing，本地已有该 tag 就不会再去拉 latest，从而在
 # 不改写用户 docker-compose.yml 的前提下锁死版本。
-_bk_write_image_lock() {
+_bk_write_image_lock() (
   local dir=$1
   local out=$dir/docker-images.lock.json
   command -v docker >/dev/null 2>&1 || return 0
@@ -776,7 +748,7 @@ _bk_write_image_lock() {
 
   local tsv; tsv=$(mktemp /tmp/howe-imglock.XXXXXX)
   # shellcheck disable=SC2064
-  trap "rm -f '$tsv'" RETURN
+  trap "rm -f '$tsv'" EXIT
 
   local cid
   while read -r cid; do
@@ -856,7 +828,7 @@ print(f"  镜像版本锁：{len(images)} 个镜像"
       + (f"，{unp} 个无 digest 无法锁定" if unp else ""))
 PY
   fi
-}
+)
 
 # ── 顶层调度 ─────────────────────────────────────────────────────
 
@@ -871,8 +843,9 @@ backup_create() {
   [[ ${#scopes[@]} -eq 0 ]] && { warn "未指定备份 scope"; return 1; }
 
   local ts; ts=$(_bk_ts)
-  local dir=$BACKUP_ROOT/$ts
-  mkdir -p "$dir" || { warn "创建备份目录失败：$dir"; return 1; }
+  mkdir -p "$BACKUP_ROOT" || return 1
+  local dir; dir=$(mktemp -d "$BACKUP_ROOT/${ts}.XXXXXX") || return 1
+  ts=$(basename "$dir")
   # 备份内含敏感数据（PG dump / JWT / 订阅 token），仅 root 可读
   chmod 0700 "$BACKUP_ROOT" 2>/dev/null
   chmod 0700 "$dir" 2>/dev/null
@@ -897,6 +870,7 @@ backup_create() {
       ok+=("$sk")
     else
       fail+=("$sk")
+      rm -f -- "$dir/$sk.tar.gz" "$dir/$sk.tar.gz.sha256"
     fi
   done
   t_end=$(date +%s%N)
@@ -912,20 +886,17 @@ backup_create() {
   echo "" >&2
 
   # 写主机清单（新机迁移时对照用）
-  _bk_write_inventory "$dir" >&2 || true
+  _bk_write_inventory "$dir" >&2 || return 1
   # 写镜像版本锁：与是否勾选 docker-images scope 无关，恢复 ai-config 后
   # 需要它把 :latest 之类可变 tag 还原到旧机当时的实际版本
-  _bk_write_image_lock "$dir" >&2 || true
+  _bk_write_image_lock "$dir" >&2 || return 1
 
-  # 写 manifest（note 通过 python json.dumps 安全转义；缺 python 时退化为基础转义）
+  # 写 manifest, note 通过 Python JSON 序列化.
   local host kernel created_iso note_json
   host=$(hostname)
   kernel=$(uname -r)
   created_iso=$(date -Iseconds)
-  if command -v python3 >/dev/null 2>&1; then
-    note_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$note" 2>/dev/null)
-  fi
-  [[ -z "$note_json" ]] && note_json="\"${note//\\/\\\\}\"" && note_json="${note_json//\"/\\\"}" && note_json="\"${note_json#\"}" && note_json="${note_json%\"}\""
+  note_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$note") || return 1
   # JSON 数组拼接（避免空数组输出 [""]）
   local ok_json fail_json
   ok_json="["
@@ -953,6 +924,7 @@ backup_create() {
   fi
 
   echo "$dir"
+  (( ${#fail[@]} == 0 )) || return 2
   return 0
 }
 
@@ -1001,44 +973,26 @@ backup_point_scopes() {
 # 校验备份点完整性
 # 返回 0=全部通过；输出失败的 scope
 backup_verify() {
-  BACKUP_ROOT=$(backup_root)
-  local ts=$1
-  local d=$BACKUP_ROOT/$ts
-  [[ -d "$d" ]] || return 1
-  local f bad=0
-  for f in "$d"/*.tar.gz; do
-    [[ -f "$f" ]] || continue
-    if ! _bk_verify "$f"; then
-      echo "$(basename "$f" .tar.gz)"
-      bad=1
-    fi
-  done
-  return $bad
+  python3 "$BACKUP_LIB_DIR/backup_archive.py" verify "$(backup_root)/$1"
 }
 
 # 从备份点恢复指定 scope
 # $1 = timestamp
 # $2..$N = scope keys
 backup_restore() {
-  BACKUP_ROOT=$(backup_root)
   local ts=$1; shift
-  local d=$BACKUP_ROOT/$ts
-  [[ -d "$d" ]] || { warn "备份点不存在：$ts"; return 1; }
-
+  local dir; dir="$(backup_root)/$ts"
+  backup_verify "$ts" || return 1
   local sk fn arc
   for sk in "$@"; do
-    arc=$d/$sk.tar.gz
-    [[ -f "$arc" ]] || { warn "$sk 未在该备份点中"; continue; }
-    if ! _bk_verify "$arc"; then
-      warn "$sk 校验失败，跳过"
-      continue
+    arc="$dir/$sk.tar.gz"
+    [[ -f "$arc" ]] || { warn "$sk 未在该备份点中"; return 1; }
+    fn="_bk_rs_${sk//-/_}"
+    if ! declare -F "$fn" >/dev/null || ! "$fn" "$arc"; then
+      warn "恢复失败: $sk; 已停止后续恢复"
+      return 1
     fi
-    fn=_bk_rs_${sk//-/_}
-    if declare -F "$fn" >/dev/null 2>&1 && "$fn" "$arc"; then
-      log "已恢复：$sk"
-    else
-      warn "恢复失败：$sk"
-    fi
+    log "已恢复: $sk"
   done
 }
 

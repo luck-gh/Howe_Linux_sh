@@ -201,7 +201,7 @@ backup_action_restore() {
   echo ""
   info "校验备份点 $_ts ..."
   local _bad
-  _bad=$(backup_verify "$_ts")
+  _bad=$(backup_verify "$_ts") || { warn "备份校验失败, 已停止恢复"; return 1; }
   if [[ -n "$_bad" ]]; then
     warn "以下 scope 校验失败，将无法恢复：$_bad"
   else
@@ -256,7 +256,7 @@ backup_action_restore() {
     [[ "$_confirm" != "yes" ]] && { _msg="已取消"; continue; }
 
     echo ""
-    backup_restore "$_ts" $_picked
+    backup_restore "$_ts" $_picked || return 1
     echo ""
     read -erp "  按回车返回..." _
     return 0

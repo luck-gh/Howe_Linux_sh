@@ -158,7 +158,7 @@ INITDB
       - ./ai-db/init-multi-db.sh:/docker-entrypoint-initdb.d/init-multi-db.sh:ro
     networks: [ai-stack]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ai"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ai"]
       interval: 10s
       retries: 5
 SVC
@@ -397,7 +397,7 @@ KIROCFG
       - ./kiro-rs/config:/app/config
     networks: [ai-stack]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8990/ || exit 1"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-T", "3", "http://127.0.0.1:8990/admin"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -418,7 +418,7 @@ SVC
       - ./9router/data:/app/data
     networks: [ai-stack]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:20128/ || exit 1"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-T", "3", "http://127.0.0.1:20128/"]
       interval: 30s
       timeout: 5s
       retries: 3

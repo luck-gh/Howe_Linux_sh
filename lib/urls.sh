@@ -43,7 +43,7 @@ URL_NODEQUALITY="https://run.NodeQuality.com"
 # ecs-fusion — spiritysdx 融合怪 ECS 测评
 # 维护者: spiritLHLS (GitHub 2.8k+ stars)
 # 安全: ● 注意 [EXEC] — GitHub 托管，本地副本 lib/scripts/ecs.sh
-URL_ECS_FUSION="https://raw.githubusercontent.com/spiritLHLS/ecs/raw/main/ecs.sh"
+URL_ECS_FUSION="https://raw.githubusercontent.com/oneclickvirt/ecs/master/goecs.sh"
 
 
 # ┌─────────────────────────────────────────────────────────────────┐

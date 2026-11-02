@@ -50,7 +50,7 @@ howe_menu_single() {
     menu_lines_saved=$ml
 
     # 读取按键
-    IFS= read -rsn1 _hkey
+    IFS= read -rsn1 _hkey || { HOWE_MENU_BACK=true; HOWE_MENU_RESULT=-1; HOWE_MENU_RESULTS=""; return 1; }
     if [[ "$_hkey" == $'\e' ]]; then
       IFS= read -rsn1 -t 0.1 _hkey 2>/dev/null
       [[ "$_hkey" == '[' ]] && IFS= read -rsn1 _hkey
@@ -141,7 +141,7 @@ howe_menu_multi() {
     _draw
 
     # 读取按键
-    IFS= read -rsn1 _hkey
+    IFS= read -rsn1 _hkey || { HOWE_MENU_BACK=true; HOWE_MENU_RESULT=-1; HOWE_MENU_RESULTS=""; return 1; }
 
     if [[ "$_hkey" == $'\e' ]]; then
       IFS= read -rsn1 -t 0.1 _hkey 2>/dev/null
@@ -242,7 +242,7 @@ howe_menu_multi_data() {
     printf "  ${DIM}↑↓ 移动  空格切换  a 全选/取消  回车确认${N}\n"; ml=$((ml+1))
     menu_lines_saved=$ml
 
-    IFS= read -rsn1 _hkey
+    IFS= read -rsn1 _hkey || { HOWE_MENU_BACK=true; HOWE_MENU_RESULT=-1; HOWE_MENU_RESULTS=""; return 1; }
     if [[ "$_hkey" == $'\e' ]]; then
       IFS= read -rsn1 -t 0.1 _hkey 2>/dev/null
       [[ "$_hkey" == '[' ]] && IFS= read -rsn1 _hkey

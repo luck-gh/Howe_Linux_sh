@@ -18,10 +18,11 @@
 | `services.sh` | ~370 | `install_singbox`（含 anytls 多 inbound 渲染 + nft 表 + reload 钩子 `reload_clash_subscription` / `setup_clash_nft` / `write_singbox_config`，config 用 jq 拼装并注入静态 IP outbounds + `user→outbound` 路由）/ `install_frp_server` / `configure_firewall` / `start_services` / `health_check` / `setup_dify` / `sync_newapi_logo`。 |
 | `local_pkg.sh` | ~340 | `generate_local_package` — 生成分布式架构里跑在本地机器上的安装包（Linux `install-local.sh` / Windows `start.bat` / docker-compose / frpc.toml），含大段 HEREDOC。 |
 | `lifecycle.sh` | ~400 | `print_clash_link` / `print_summary` / `confirm_installation` / `install_or_update`（主安装流水线）/ `uninstall_stack`（多选卸载）。 |
-| `backup_lib.sh` | ~900 | 备份/恢复底层库。scope 共13个（9原有 + system-sec / system-tune / docker-images / custom）。`docker-images`：`MIG_DOCKER_STRATEGY=record/save`；`custom`：`MIG_CUSTOM_PATHS` 驱动，保留原目录结构。每次 `backup_create` 末尾自动写 `host-inventory.json`（OS/镜像/二进制/待办清单）。 |
+| `backup_lib.sh` | ~1100 | 备份/恢复底层库, 共 14 个 scope, 包括 frps. `docker-images`: record/save; `custom`: 换行分隔完整路径. 备份写环境清单与镜像锁, 部分失败返回非零. |
+| `backup_archive.py` | ~160 | 备份点/manifest v2/摘要校验与标准库 tar 安全解压, 拒绝路径越界及不完整备份, 保留数字 UID/GID. 依赖 Python 3.10.12+. |
 | `backup.sh` | ~540 | 备份子菜单与编排：`_backup_menu`（创建 / 列出 / 恢复 / 删除 / 计划任务）/ `do_backup` / `do_restore`，调用 `backup_lib.sh` 的低层函数。 |
 | `migrate_lib.sh` | ~580 | VPS 迁移底层库。`mig_pack_bundle`/`mig_unpack_bundle`（加密+sha256双层）；`mig_write_manifest_v2`/`mig_read_manifest_scopes`（per-scope策略元数据）；`mig_execute_strategy`（scope×strategy分派）；`mig_rsync_push`/`mig_rsync_pull`；口令走 fd 不进 argv，`MIG_TEST_PASSPHRASE` 测试钩子。 |
-| `migrate.sh` | ~730 | VPS 迁移菜单：三段独立流程——① 打包（多选scope+加密）② 传递（推送/拉取/手动scp三选一）③ 解包恢复（manifest v2驱动多选scope+per-scope策略，v1兼容降级）。`migrate_show_guide` 首次进入展示指引。 |
+| `migrate.sh` | ~1850 | VPS 迁移菜单: 打包、传递、恢复. 仅接受 manifest v2; 配置先落位, 数据库启动就绪后导入, 再激活服务与验收. 失败向上传递, 取消启动返回 2. |
 | `view.sh` | ~1480 | `show_secrets` / `show_db_connection` / `show_config`（已安装栈的运行状态 + 可改项）/ 服务管理（启动/停止/重启）/ 升级回滚菜单（含进入时检查上游版本）。 |
 | `logclean.sh` | ~180 | `log_clean_menu`（服务栈菜单「日志删除」）：多选清空 sing-box 日志 / 所有容器日志 / journal 压到 100M / 删除未使用镜像（跳过升级回滚历史引用的镜像，依赖 `view.sh`）。 |
 | `main.sh` | ~760 | `service_stack_menu`（AI 服务栈子菜单：安装 / 配置 / 卸载 / 刷新 / 查看密钥 / 服务管理 / 订阅 ...）/ `ai_agent_menu`（智能体 CLI 工具：Claude Code / Codex / OpenCode / OpenClaw 安装 / 更新到指定版本（可回退）/ 卸载）/ `main`（顶级两选一）。 |

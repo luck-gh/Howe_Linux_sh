@@ -13,9 +13,6 @@
 #   none / openssl / age（口令 或 密钥对）
 # ═══════════════════════════════════════════════════════════════════
 
-# 加载统一对账函数
-[[ -f "$(dirname "${BASH_SOURCE[0]}")/migrate_unified.sh" ]] && \
-  source "$(dirname "${BASH_SOURCE[0]}")/migrate_unified.sh"
 
 # ── 通用交互工具 ─────────────────────────────────────────────────
 
@@ -169,7 +166,7 @@ _mig_scope_multiselect() {
   )
   local -a CAT_SCOPES=(
     "ai-pg ai-data ai-config clash nrouter kiro"
-    "singbox caddy"
+    "singbox caddy frps"
     "docker-images"
     "system-sec system-tune"
     "ai-cli custom"
@@ -227,7 +224,7 @@ _mig_scope_multiselect() {
     echo ""
     [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; echo ""; }
 
-    local _input; read -erp "  选择: " _input
+    local _input; read -erp "  选择: " _input || return 1
     [[ -z "$_input" ]] && break
     case "${_input,,}" in
       q|quit|exit) reset_terminal 2>/dev/null; exit 0 ;;
@@ -273,7 +270,7 @@ _mig_scope_multiselect() {
     echo -e "  ${W}输入自定义路径（每行一个，空行结束）：${N}"
     local -a cpaths=()
     while true; do
-      local p=""; read -erp "  路径（留空结束）: " p
+      local p=""; read -erp "  路径（留空结束）: " p || return 1
       [[ -z "$p" ]] && break
       [[ -e "$p" ]] && { cpaths+=("$p"); log "已加入：$p"; } || warn "不存在：$p"
     done
@@ -320,13 +317,11 @@ _mig_resync_manifest() {
   [[ -f "$mf" ]] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
   python3 - "$mf" "$bp_dir" <<'PY' 2>/dev/null
-import json, os, sys
+import json, os, sys, glob
 mf, d = sys.argv[1], sys.argv[2]
-try:
-    m = json.load(open(mf))
-except Exception:
-    sys.exit(0)
+m = json.load(open(mf))
 known = set(m.get("scopes_ok", [])) | set(m.get("scopes_fail", []))
+known |= {os.path.basename(p)[:-len('.tar.gz.sha256')] for p in glob.glob(os.path.join(d, '*.tar.gz.sha256'))}
 ok, fail = [], []
 for s in sorted(known):
     arc = os.path.join(d, f"{s}.tar.gz")
@@ -352,11 +347,12 @@ _mig_gate_failed_scopes() {
 
   while true; do
     local -a failed=()
-    mapfile -t failed < <(python3 -c "
+    local failed_text
+    failed_text=$(python3 -c "
 import json,sys
-try: print('\n'.join(json.load(open(sys.argv[1])).get('scopes_fail',[])))
-except Exception: pass
-" "$mf" 2>/dev/null)
+print('\n'.join(json.load(open(sys.argv[1]))['scopes_fail']))
+" "$mf") || return 1
+    [[ -z "$failed_text" ]] || mapfile -t failed <<< "$failed_text"
     # 过滤空行
     local -a f2=(); local x
     for x in "${failed[@]}"; do [[ -n "$x" ]] && f2+=("$x"); done
@@ -444,12 +440,12 @@ _mig_preflight_docker() {
 
   # ── Docker 版本检查 ──
   local docker_want=""
-  [[ -f "$inv" ]] && command -v python3 >/dev/null 2>&1 && \
+  if [[ -f "$inv" ]]; then
     docker_want=$(python3 -c "
 import json,sys
-try: print(json.load(open(sys.argv[1])).get('docker_version','') or '')
-except Exception: pass
-" "$inv" 2>/dev/null)
+print(json.load(open(sys.argv[1])).get('docker_version','') or '')
+" "$inv") || return 1
+  fi
 
   local docker_have; docker_have=$(mig_local_tool_version docker)
 
@@ -536,14 +532,15 @@ _mig_reconcile_binaries_only() {
 
   # 读 native_versions：每行 key|want
   local -a rows=()
-  mapfile -t rows < <(python3 -c "
+  local native_text
+  native_text=$(python3 -c "
 import json,sys
-try: nv=json.load(open(sys.argv[1])).get('native_versions',{}) or {}
-except Exception: nv={}
+nv=json.load(open(sys.argv[1]))['native_versions']
 for k in ('caddy','sing_box','frps'):
     v=nv.get(k) or ''
     if v: print(f'{k}|{v}')
-" "$inv" 2>/dev/null)
+" "$inv") || return 1
+  [[ -z "$native_text" ]] || mapfile -t rows <<< "$native_text"
 
   (( ${#rows[@]} == 0 )) && { info "旧机无原生二进制记录，跳过"; return 0; }
 
@@ -578,6 +575,7 @@ for k in ('caddy','sing_box','frps'):
   printf "  %-12s %-12s %-12s %s\n" "工具" "旧机版本" "本机版本" "状态"
   echo -e "  ${DIM}────────────────────────────────────────────────────────${N}"
   local i need_action=0
+  local install_fail=0
   for i in "${!t_name[@]}"; do
     local sc="${t_state[$i]}" col="$N"
     case "$sc" in
@@ -621,10 +619,12 @@ for k in ('caddy','sing_box','frps'):
       info "[$name] 保持本机 ${have}"
       continue
     }
-    _mig_install_native "$name" "$want" "$have" "$pinnable" \
-      || warn "[$name] 处理失败，可稍后手动安装"
+    if ! _mig_install_native "$name" "$want" "$have" "$pinnable"; then
+      warn "[$name] 处理失败, 已停止恢复"
+      install_fail=$((install_fail + 1))
+    fi
   done
-  return 0
+  (( install_fail == 0 ))
 }
 
 # 统一对账：二进制 + 镜像，一张表一次交互
@@ -644,19 +644,20 @@ _mig_reconcile_all() {
 
   # ── 第一部分：读取二进制工具数据 ──
   local -a bin_rows=()
-  mapfile -t bin_rows < <(python3 -c "
+  local native_text image_text
+  native_text=$(python3 -c "
 import json,sys
-try: nv=json.load(open(sys.argv[1])).get('native_versions',{}) or {}
-except Exception: nv={}
+nv=json.load(open(sys.argv[1]))['native_versions']
 for k in ('caddy','sing_box','frps'):
     v=nv.get(k) or ''
     if v: print(f'{k}|{v}')
-" "$inv" 2>/dev/null)
+" "$inv") || return 1
+  [[ -z "$native_text" ]] || mapfile -t bin_rows <<< "$native_text"
 
   # ── 第二部分：读取镜像数据 ──
   local -a img_rows=()
   if [[ -f "$lock" ]] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    mapfile -t img_rows < <(python3 - "$lock" <<'PY' 2>/dev/null
+    image_text=$(python3 - "$lock" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 for i in d.get("images", []):
@@ -668,7 +669,8 @@ for i in d.get("images", []):
         "1" if i.get("mutable_tag") else "0",
     ]))
 PY
-    )
+    ) || return 1
+    [[ -z "$image_text" ]] || mapfile -t img_rows <<< "$image_text"
   fi
 
   # 如果两者都为空，直接返回
@@ -714,17 +716,9 @@ PY
         ids="keep install_latest"
         labels="保持 ${have}"$'\x1f'"升级到最新版"
       else
-        # 版本比较
-        local cmp; cmp=$(mig_version_compare "$have" "$want")
-        if (( cmp < 0 )); then
-          state="需要更新"
-          ids="install keep install_latest skip"
-          labels="更新到 ${want}（bundle版本）"$'\x1f'"保持 ${have}"$'\x1f'"更新到最新版"$'\x1f'"跳过"
-        else
-          state="需要回退"
-          ids="install keep install_latest skip"
-          labels="回退到 ${want}（bundle版本）"$'\x1f'"保持 ${have}"$'\x1f'"升级到最新版"$'\x1f'"跳过"
-        fi
+        state="版本不同"
+        ids="install keep install_latest skip"
+        labels="对齐到 ${want}（bundle版本）"$'\x1f'"保持 ${have}"$'\x1f'"安装最新版"$'\x1f'"跳过"
       fi
     fi
 
@@ -851,7 +845,7 @@ PY
     echo -e "  ${DIM}输入编号切换 | a=对齐 bundle | t=全部最新 | s=跳过全部 | 回车执行 | q 取消${N}"
     [[ -n "$_msg" ]] && { echo -e "  ${Y}$_msg${N}"; _msg=""; }
 
-    local _in; read -erp "  选择: " _in
+    local _in; read -erp "  选择: " _in || return 1
     # 去掉可能存在的 \r（SSH 会话偶尔会产生）
     _in="${_in//$'\r'/}"
     [[ -z "$_in" ]] && break
@@ -951,16 +945,9 @@ PY
   echo ""
   echo -e "  ${W}版本对账完成${N}：${G}${ok} 成功${N} / ${R}${fail} 失败${N} / ${DIM}${skipped} 跳过${N}"
 
-  return 0
+  (( fail == 0 ))
 }
 
-# 旧函数保留作为兼容（暂时不删，避免其他地方有调用）
-_mig_preflight_tools() {
-  local bp_dir=$1
-  _mig_preflight_docker "$bp_dir" || return 1
-  _mig_reconcile_binaries_only "$bp_dir" || return 0
-  return 0
-}
 
 # 安装/切换单个原生二进制
 # $1=工具名 $2=目标版本（或"latest"） $3=当前版本 $4=是否可锁版本(1/0)
@@ -991,8 +978,8 @@ _mig_install_native() {
       return 0
     elif [[ -z "$have" ]]; then
       # 不在此处调 install_caddy：它内部用 err()（exit 1），会杀掉恢复流程
-      warn "[$name] 本机缺失。恢复完成后请到「AI 服务栈 → 安装」装 Caddy"
-      info "  apt 源无法锁到旧机的 ${want}，装到的是当前最新版"
+      warn "[$name] 本机缺失, 请改选安装最新版或先安装 Caddy 再恢复"
+      return 1
     else
       info "[$name] 本机 ${have} / 旧机 ${want}，apt 管理不锁版本，保持现状"
     fi
@@ -1074,8 +1061,9 @@ migrate_action_pack() {
     fi
   else
     bk_ts=$(_bk_ts)
-    bk_dir="$(backup_root)/$bk_ts"
-    mkdir -p "$bk_dir" && chmod 0700 "$bk_dir"
+    mkdir -p "$(backup_root)" || return 1
+    bk_dir=$(mktemp -d "$(backup_root)/${bk_ts}.XXXXXX") || return 1
+    bk_ts=$(basename "$bk_dir")
     echo '{"timestamp":"'"$bk_ts"'","scopes_ok":[],"scopes_fail":[]}' > "$bk_dir/manifest.json"
   fi
 
@@ -1086,8 +1074,8 @@ migrate_action_pack() {
   #   仅选 docker-images/custom（未走 backup_create）、复用旧备份点（可能是
   #   本功能上线前创建的）、以及 backup_create 当时 docker 不可用的情况。
   # 缺了镜像锁，新机就无法按旧机的确切版本拉镜像。
-  [[ -f "$bk_dir/host-inventory.json" ]]      || _bk_write_inventory  "$bk_dir" >&2 || true
-  [[ -f "$bk_dir/docker-images.lock.json" ]]  || _bk_write_image_lock "$bk_dir" >&2 || true
+  [[ -f "$bk_dir/host-inventory.json" ]]      || _bk_write_inventory  "$bk_dir" >&2 || return 1
+  [[ -f "$bk_dir/docker-images.lock.json" ]]  || _bk_write_image_lock "$bk_dir" >&2 || return 1
 
   # 4) 特殊 scope 打入备份点目录
   local -a packed_scopes=()
@@ -1100,14 +1088,14 @@ migrate_action_pack() {
         _bk_do_docker_images "$bk_dir" 2>&1 && {
           packed_scopes+=("docker-images")
           log "docker-images 完成"
-        } || warn "docker-images 打包失败，跳过"
+        } || { unset MIG_PASSPHRASE; warn "docker-images 打包失败, 已停止"; return 1; }
         ;;
       custom)
         info "打包自定义路径..."
         _bk_do_custom "$bk_dir" 2>&1 && {
           packed_scopes+=("custom")
           log "custom 完成（$MIG_CUSTOM_PATHS）"
-        } || warn "custom 打包失败，跳过"
+        } || { unset MIG_PASSPHRASE; warn "custom 打包失败, 已停止"; return 1; }
         ;;
     esac
   done
@@ -1115,12 +1103,13 @@ migrate_action_pack() {
   (( ${#packed_scopes[@]} == 0 )) && { unset MIG_PASSPHRASE; err "无任何内容打包成功"; return 1; }
 
   # 5) 写 manifest v2（cipher 已知）
-  mig_write_manifest_v2 "$bk_dir" "$MIG_CIPHER" "${packed_scopes[@]}" 2>/dev/null || true
+  _mig_resync_manifest "$bk_dir" || { unset MIG_PASSPHRASE; return 1; }
+  mig_write_manifest_v2 "$bk_dir" "$MIG_CIPHER" "${MIG_SELECTED_SCOPES[@]}" || { unset MIG_PASSPHRASE; return 1; }
 
   # 6) 打包 bundle（MIG_PASSPHRASE 已预设，mig_prompt_passphrase_new 直接使用）
   info "打包 bundle（cipher: $MIG_CIPHER）..."
   local out
-  out=$(mig_pack_bundle "$bk_ts" "$MIG_CIPHER" "" "${MIG_AGE_KEYFILE:-}") \
+  out=$(mig_pack_bundle "$bk_ts" "$MIG_CIPHER" "" "${MIG_AGE_KEYFILE:-}" "${MIG_SELECTED_SCOPES[@]}") \
     || { unset MIG_PASSPHRASE; err "打包失败"; return 1; }
   unset MIG_PASSPHRASE  # 用完立即清除
 
@@ -1350,21 +1339,7 @@ _mig_restore_from_bundle() {
   local bk_dir; bk_dir="$(backup_root)/$restored_ts"
   local mfile_v2="$bk_dir/migrate-manifest.json"
 
-  # 判断是否 v2 manifest
-  local is_v2=0
-  if [[ -f "$mfile_v2" ]] && command -v python3 >/dev/null 2>&1; then
-    python3 -c "
-import json,sys
-d=json.load(open('$mfile_v2'))
-sys.exit(0 if d.get('format_version',1)>=2 else 1)
-" 2>/dev/null && is_v2=1
-  fi
-
-  if (( is_v2 )); then
-    _mig_restore_v2 "$bk_dir" "$mfile_v2"
-  else
-    _mig_restore_v1_fallback "$bk_dir" "$restored_ts"
-  fi
+  _mig_restore_v2 "$bk_dir" "$mfile_v2"
 }
 
 # manifest v2 驱动的恢复
@@ -1373,15 +1348,14 @@ _mig_restore_v2() {
 
   # 展示源主机信息
   python3 -c "
-import json
-d=json.load(open('$mfile'))
+import json,sys
+d=json.load(open(sys.argv[1]))
 print(f'  源主机：{d[\"source_host\"]}  OS：{d[\"source_os\"]}')
 scopes=d.get('scopes',[])
 total=sum(s.get('size',0) for s in scopes)
-import math
 def h(b): return f'{round(b/1024/1024,1)}M' if b>1024*1024 else f'{round(b/1024,0):.0f}K'
 print(f'  包含 {len(scopes)} 个 scope，合计 {h(total)}')
-" 2>/dev/null
+" "$mfile" || return 1
   echo ""
 
   # 读取 scope 列表
@@ -1417,20 +1391,17 @@ print(f'  包含 {len(scopes)} 个 scope，合计 {h(total)}')
     local pair
     pair=$(python3 - "$strats_json" <<'PY' 2>/dev/null
 import json, sys
-try:
-    arr = [s for s in json.loads(sys.argv[1]) if s.get("id") != "skip"]
-except Exception:
-    arr = []
+arr = [s for s in json.loads(sys.argv[1]) if s["id"] != "skip"]
 if not arr:
-    arr = [{"id": "restore", "label": "恢复"}]
+    sys.exit("没有可用的恢复策略")
 print(" ".join(s["id"] for s in arr))
 print("\x1f".join(s.get("label", s["id"]) for s in arr))
 PY
-    )
+    ) || return 1
     local ids_line labels_line
     ids_line=$(sed -n 1p <<< "$pair")
     labels_line=$(sed -n 2p <<< "$pair")
-    [[ -z "$ids_line" ]] && { ids_line="restore"; labels_line="恢复"; }
+    [[ -n "$ids_line" ]] || { warn "恢复策略为空"; return 1; }
 
     plan_scope+=("$sk")
     plan_ids+=("$ids_line")
@@ -1486,7 +1457,7 @@ PY
       echo ""
       [[ -n "$_pmsg" ]] && { echo -e "  ${Y}$_pmsg${N}"; _pmsg=""; echo ""; }
 
-      local _in; read -erp "  选择: " _in
+      local _in; read -erp "  选择: " _in || return 1
       [[ -z "$_in" ]] && break
       case "${_in,,}" in
         q|quit) info "已取消"; return 0 ;;
@@ -1523,125 +1494,110 @@ PY
   # 前置：先让运行环境就位，再落数据。顺序颠倒的话 ai-pg 会因为 ai-db
   # 容器不存在而失败。
   #   ① Docker 本体检查（安装或版本切换）
-  _mig_preflight_docker "$bk_dir" || return 0
+  _mig_preflight_docker "$bk_dir" || return 1
 
   #   ② 统一版本对账：原生二进制 + 镜像（docker-images scope 有自己的策略时跳过镜像部分）
   if [[ " ${restore_plan[*]} " != *" docker-images:"* ]]; then
     echo ""
-    _mig_reconcile_all "$bk_dir" || return 0
+    _mig_reconcile_all "$bk_dir" || return 1
   else
     # docker-images scope 已选中，只对账原生二进制
-    _mig_reconcile_binaries_only "$bk_dir" || return 0
+    _mig_reconcile_binaries_only "$bk_dir" || return 1
   fi
 
-  # ④ 逐项落数据
-  echo ""
-  local pair
+  # 先停止当前服务并恢复配置, 再落数据, 数据库最后导入.
+  local base="${BACKUP_AI_BASE:-/opt/ai-stack}" pair sk strat
+  if [[ " ${plan_scope[*]} " == *" ai-"* || " ${plan_scope[*]} " == *" kiro "* || " ${plan_scope[*]} " == *" nrouter "* ]] && [[ -f "$base/docker-compose.yml" ]]; then
+    (cd "$base" && docker compose stop) || return 1
+  fi
   for pair in "${restore_plan[@]}"; do
-    local sk="${pair%%:*}" strat="${pair##*:}"
-    section "$sk → $strat"
-    mig_execute_strategy "$sk" "$strat" "$bk_dir" || warn "$sk 执行失败，继续"
+    [[ "$pair" == ai-config:* ]] || continue
+    mig_execute_strategy ai-config "${pair#*:}" "$bk_dir" || return 1
   done
-
-  # ⑤ 起容器。必须在数据落位之后——compose 文件此时才在盘上。
-  # 判据改为「盘上是否真有 compose 文件」而不是「本轮是否恢复了 ai-config」，
-  # 这样只恢复数据（compose 早就在）的场景也能正常起容器。
-  _mig_offer_compose_up
-
-  # 恢复后验证
-  _mig_verify_restore
+  for pair in "${restore_plan[@]}"; do
+    sk=${pair%%:*}; strat=${pair#*:}
+    [[ "$sk" == ai-config || "$sk" == ai-pg ]] && continue
+    mig_execute_strategy "$sk" "$strat" "$bk_dir" || { warn "$sk 恢复失败, 已停止"; return 1; }
+  done
+  for pair in "${restore_plan[@]}"; do
+    [[ "$pair" == ai-pg:* ]] || continue
+    [[ -f "$base/docker-compose.yml" ]] || { warn "缺少数据库 Compose 配置"; return 1; }
+    (cd "$base" && docker compose up -d --pull never --wait --wait-timeout 60 ai-db) || return 1
+    mig_execute_strategy ai-pg "${pair#*:}" "$bk_dir" || return 1
+  done
+  _mig_activate_native_services "${plan_scope[@]}" || return 1
+  local startup=0
+  if [[ " ${plan_scope[*]} " == *" ai-"* || " ${plan_scope[*]} " == *" kiro "* || " ${plan_scope[*]} " == *" nrouter "* ]]; then
+    _mig_offer_compose_up || startup=$?
+  fi
+  if (( startup == 2 )); then
+    info "数据已恢复, 服务未启动; 请启动并完成验证后再切换业务"
+    return 2
+  fi
+  (( startup == 0 )) || return 1
+  _mig_verify_restore "${plan_scope[@]}" || return 1
 
   echo ""
   log "恢复流程完成"
   _mig_show_inventory "$bk_dir"
 }
 
+# 原生服务需要在配置落位后激活; 安装二进制本身不代表迁移完成.
+_mig_activate_native_services() {
+  local scopes=" $* " base="${BACKUP_AI_BASE:-/opt/ai-stack}"
+  if [[ "$scopes" == *" singbox "* || "$scopes" == *" clash "* ]]; then
+    [[ -f "$base/.env" && -f "$base/clash/nodes.yaml" ]] || {
+      warn "sing-box 恢复还需要 ai-config 与 clash 配置, 请一并选择"
+      return 1
+    }
+    source "$base/.env" || return 1
+    local previous_ip="$VPS_IP"
+    use_current_ipv4 || return 1
+    python3 - "$base" "$previous_ip" "$VPS_IP" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+base, previous, current = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+path = base / 'clash/nodes.yaml'
+data = yaml.safe_load(path.read_text(encoding='utf-8'))
+for node in data['nodes']:
+    if node.get('server') == previous:
+        node['server'] = current
+        if node.get('sni') == previous:
+            node['sni'] = current
+path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding='utf-8')
+env = base / '.env'
+env.write_text('\n'.join('VPS_IP=' + current if line.startswith('VPS_IP=') else line for line in env.read_text(encoding='utf-8').splitlines()) + '\n', encoding='utf-8')
+PY
+    [[ $? == 0 ]] || return 1
+    INST_SINGBOX=true
+    setup_clash_subscription || return 1
+    write_singbox_config || return 1
+    render_clash_subscription || return 1
+    setup_clash_nft || return 1
+    systemctl restart sing-box || return 1
+  fi
+  if [[ "$scopes" == *" caddy "* ]]; then
+    caddy validate --config /etc/caddy/Caddyfile || return 1
+    systemctl enable caddy && systemctl restart caddy || return 1
+  fi
+  if [[ "$scopes" == *" frps "* ]]; then
+    systemctl daemon-reload && systemctl enable frps && systemctl restart frps || return 1
+  fi
+}
+
 # 镜像就位后询问是否直接起容器
 _mig_offer_compose_up() {
   local base="${BACKUP_AI_BASE:-/opt/ai-stack}"
-  [[ -f "$base/docker-compose.yml" ]] || return 0
-  command -v docker >/dev/null 2>&1 || return 0
-
-  echo ""
+  [[ -f "$base/docker-compose.yml" ]] || { warn "缺少服务栈 Compose 配置"; return 1; }
   local yn
-  askyn yn "立即启动服务栈（docker compose up -d）？" y
-  $yn || {
-    info "稍后可手动执行：cd $base && docker compose up -d"
-    return 0
-  }
-  info "启动容器..."
-  ( cd "$base" && docker compose up -d ) || {
-    warn "启动失败，可手动排查：cd $base && docker compose up -d"
+  askyn yn "立即启动服务栈并等待健康检查？" y
+  $yn || return 2
+  if ! (cd "$base" && docker compose up -d --pull never --wait --wait-timeout 60); then
+    warn "服务栈启动或健康检查失败, 未完成迁移验收"
     return 1
-  }
-
-  # 等待健康检查（最长60秒）
-  info "等待容器健康检查..."
-  local elapsed=0 max_wait=60
-  while (( elapsed < max_wait )); do
-    # 用 docker compose ps --format json 获取状态，Python 解析 Health 字段
-    local check_result
-    check_result=$(cd "$base" && docker compose ps --format json 2>/dev/null | python3 -c '
-import json, sys
-lines = sys.stdin.read().strip().split("\n")
-if not lines or not lines[0]: sys.exit(0)
-containers = [json.loads(line) for line in lines if line]
-total = len(containers)
-healthy = sum(1 for c in containers if c.get("Health") == "healthy" or c.get("State") == "running" and not c.get("Health"))
-unhealthy = [c.get("Service","?") for c in containers if c.get("Health") == "unhealthy"]
-exited = [c.get("Service","?") for c in containers if c.get("State") == "exited"]
-if unhealthy or exited:
-  print(f"unhealthy|{\" \".join(unhealthy + exited)}")
-elif healthy == total:
-  print("ok")
-else:
-  print("starting")
-' 2>/dev/null)
-
-    case "$check_result" in
-      ok)
-        echo ""
-        log "服务栈已启动并通过健康检查"
-        return 0
-        ;;
-      unhealthy\|*)
-        local failed="${check_result#unhealthy|}"
-        echo ""
-        warn "部分容器未通过健康检查: $failed"
-        echo ""
-        ( cd "$base" && docker compose ps )
-        echo ""
-        info "常见排查命令："
-        info "  docker compose logs --tail=50 $failed"
-        info "  docker compose restart $failed"
-        echo ""
-        local yn
-        askyn yn "容器可能仍在启动中，是否继续？" y
-        $yn && return 0 || return 1
-        ;;
-      starting)
-        echo -ne "  等待中... ${elapsed}s / ${max_wait}s\r"
-        sleep 3
-        (( elapsed += 3 ))
-        ;;
-      *)
-        # docker/python 不可用或其他错误，降级为直接返回
-        echo ""
-        log "服务栈已启动（无法检测健康状态）"
-        return 0
-        ;;
-    esac
-  done
-
-  # 超时
-  echo ""
-  warn "健康检查超时（${max_wait}s），部分容器可能仍在启动"
-  ( cd "$base" && docker compose ps )
-  echo ""
-  info "可稍后检查: cd $base && docker compose ps"
-  local yn
-  askyn yn "是否继续？" y
-  $yn && return 0 || return 1
+  fi
+  log "服务栈已启动并通过健康检查"
 }
 
 # 恢复后验证：检查容器、服务、端口、配置
@@ -1652,15 +1608,17 @@ _mig_verify_restore() {
 
   local -a pass=() fail=() skip=()
   local base="${BACKUP_AI_BASE:-/opt/ai-stack}"
+  local requested=" $* "
 
   # 1. Docker 容器健康状态
-  if [[ -f "$base/docker-compose.yml" ]] && command -v docker >/dev/null 2>&1; then
+  if [[ "$requested" == *" ai-"* || "$requested" == *" kiro "* || "$requested" == *" nrouter "* ]]; then
     local compose_check
     compose_check=$(cd "$base" && docker compose ps --format json 2>/dev/null | python3 -c '
 import json, sys
-lines = sys.stdin.read().strip().split("\n")
-if not lines or not lines[0]: print("skip"); sys.exit(0)
-containers = [json.loads(line) for line in lines if line]
+raw = sys.stdin.read().strip()
+if not raw: print("fail|没有容器状态"); sys.exit(1)
+containers = json.loads(raw) if raw.startswith("[") else [json.loads(line) for line in raw.splitlines()]
+if not containers: print("fail|未发现服务容器"); sys.exit(1)
 total = len(containers)
 running = sum(1 for c in containers if c.get("State") == "running")
 healthy = sum(1 for c in containers if c.get("Health") == "healthy" or (c.get("State") == "running" and not c.get("Health")))
@@ -1671,13 +1629,13 @@ if unhealthy > 0 or exited > 0:
 elif healthy == total:
   print(f"pass|{total} 个运行中，全部健康")
 else:
-  print(f"pass|{running}/{total} 个运行中")
+  print(f"fail|{running}/{total} 个运行中, 部分容器尚未健康")
 ' 2>/dev/null)
 
     case "$compose_check" in
       pass\|*) pass+=("容器：${compose_check#pass|}") ;;
       fail\|*) fail+=("容器：${compose_check#fail|}") ;;
-      *) skip+=("容器：无法检测状态") ;;
+      *) fail+=("容器：无法检测状态") ;;
     esac
   else
     skip+=("容器：compose 文件不存在或 docker 不可用")
@@ -1685,17 +1643,24 @@ else:
 
   # 2. 原生服务状态（caddy / sing-box / frps）
   for svc in caddy sing-box frps; do
-    if command -v "$svc" >/dev/null 2>&1 || systemctl list-unit-files "$svc.service" >/dev/null 2>&1; then
+    case "$svc" in
+      caddy) [[ "$requested" == *" caddy "* ]] || continue ;;
+      sing-box) [[ "$requested" == *" singbox "* || "$requested" == *" clash "* ]] || continue ;;
+      frps) [[ "$requested" == *" frps "* ]] || continue ;;
+    esac
+    if command -v "$svc" >/dev/null 2>&1 || systemctl list-unit-files --no-legend "$svc.service" 2>/dev/null | grep -q "^${svc}.service"; then
       if systemctl is-active --quiet "$svc" 2>/dev/null; then
         pass+=("$svc：运行中")
       else
         fail+=("$svc：已安装但未运行")
       fi
+    else
+      fail+=("$svc：未安装或启动单元缺失")
     fi
   done
 
   # 3. 端口监听（80 / 443）
-  if command -v ss >/dev/null 2>&1; then
+  if [[ "$requested" == *" caddy "* ]] && command -v ss >/dev/null 2>&1; then
     local port_80 port_443
     port_80=$(ss -tlnp 2>/dev/null | grep -E ':80\s' | wc -l)
     port_443=$(ss -tlnp 2>/dev/null | grep -E ':443\s' | wc -l)
@@ -1712,7 +1677,7 @@ else:
   fi
 
   # 4. Caddyfile 语法
-  if [[ -f /etc/caddy/Caddyfile ]] && command -v caddy >/dev/null 2>&1; then
+  if [[ "$requested" == *" caddy "* ]] && command -v caddy >/dev/null 2>&1; then
     if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
       pass+=("Caddyfile：语法正确")
     else
@@ -1753,36 +1718,14 @@ else:
     info "  docker compose logs --tail=50    # 容器日志"
     info "  systemctl status sing-box        # 服务状态"
     info "  caddy validate --config /etc/caddy/Caddyfile  # Caddyfile 语法"
+    return 1
   elif (( ${#pass[@]} > 0 )); then
     log "所有检查通过"
   fi
+  return 0
 }
 
-# v1 兜底：无 manifest v2 的旧 bundle
-_mig_restore_v1_fallback() {
-  local bk_dir=$1 ts=$2
-  warn "旧版 bundle（无 migrate-manifest.json v2），使用兼容模式"
 
-  local -a scopes=()
-  mapfile -t scopes < <(backup_point_scopes "$ts")
-  (( ${#scopes[@]} == 0 )) && { err "包内无任何 scope"; return 1; }
-
-  local -a slabels=()
-  local sk
-  for sk in "${scopes[@]}"; do slabels+=("$sk  $(backup_scope_desc "$sk")"); done
-
-  input_multi "选择要恢复的 scope" "${slabels[@]}"
-  local -a to_restore=()
-  for i in "${INPUT_RESULTS[@]}"; do to_restore+=("${scopes[$i]}"); done
-  (( ${#to_restore[@]} == 0 )) && { info "未选择任何 scope"; return 0; }
-
-  local yn; askyn yn "确认恢复以上 ${#to_restore[@]} 个 scope？" n
-  $yn || return 0
-  backup_restore "$ts" "${to_restore[@]}"
-  echo ""
-  log "恢复完成"
-  _mig_show_inventory "$bk_dir"
-}
 
 # inventory 摘要展示
 _mig_show_inventory() {
@@ -1810,8 +1753,9 @@ try:
     if todos:
         print(f"\n  待办：")
         for i, t in enumerate(todos, 1): print(f"    {i}. {t}")
-except Exception as e:
+except (OSError, ValueError, KeyError, TypeError) as e:
     print(f"  解析失败: {e}")
+    sys.exit(1)
 PY
   else
     grep -E '"host"|"os"|"new_host_todos"' "$inv" | head -10 | sed 's/^/    /'
@@ -1926,7 +1870,7 @@ migrate_menu() {
     echo "  0. 返回"
     echo ""
     local choice
-    read -erp "  请输入选择（0 返回）：" choice
+    read -erp "  请输入选择（0 返回）：" choice || return 0
     case "$choice" in
       1) migrate_action_pack ;;
       2) migrate_action_transfer ;;

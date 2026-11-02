@@ -27,16 +27,12 @@ Linux VPS 管理工具箱，集成 AI 服务栈一键部署与 sing-box + Clash 
 ## 快速开始
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/luck-gh/Howe_Linux_sh/main/howe.sh)
-```
-
-或克隆后本地运行：
-
-```bash
 git clone https://github.com/luck-gh/Howe_Linux_sh.git
 cd Howe_Linux_sh
 bash howe.sh
 ```
+
+入口依赖仓库中的模块, 请使用完整克隆, 不单独下载或通过进程替换运行 howe.sh.
 
 ## 目录结构
 
@@ -63,24 +59,59 @@ modules/             # 功能模块入口
 
 - Ubuntu 22.04 / Debian 12（推荐）
 - Docker + Docker Compose
-- Python 3.10+（公网 IP 校验与订阅管理脚本）
+- Python 3.10.12+ 与 PyYAML（公网 IP 校验, 归档安全过滤和订阅管理）
+- 支持 `up/start --wait` 的 Docker Compose v2（升级与恢复等待健康检查）
 - sing-box 1.11+（代理服务，静态 IP 多用户路由依赖此版本）
 
 ## 开发验证
 
 ```bash
 bash tests/public_ip.sh
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+bash tests/lifecycle.sh
 ```
 
-公网地址测试使用模拟网络响应, 覆盖双栈, 无 IPv6, 错误地址族, 无效响应,
-旧地址更新和探测失败中止配置生成; 不访问外网或修改业务配置.
+以上测试使用合成数据与模拟服务命令, 不修改业务配置. 覆盖公网地址, 归档路径与摘要,
+备份失败中止升级, 镜像回滚, 首次恢复顺序, 迁移健康检查与交互取消.
+安装 age 后会运行密钥模式回归; 在内存充足的 Linux 测试机上设置
+`HOWE_TEST_AGE_PASSPHRASE=1` 可额外运行真实口令交互测试.
+
+真实数据库与 Compose 集成测试需要本机已有 PostgreSQL 16 镜像:
+
+```bash
+POSTGRES_TEST_IMAGE=postgres:16-alpine bash tests/integration_postgres.sh
+```
+
+集成测试仅创建自动清理的独立容器与卷, 不拉取镜像, 不开放主机端口,
+不挂载生产目录. 测试真实 dump/restore, SQL 回滚及健康/不健康状态.
+这些检查不等同于实际业务迁移验收, 正式迁移仍需确认范围, 停机和回退条件.
+
+## 备份与迁移约束
+
+迁移只接受当前 manifest v2; 旧格式请用当前脚本重新打包. 打包与解包均核对 scope,
+归档摘要和路径, 同名备份点不自动覆盖. 恢复按配置、文件数据、数据库、服务启动顺序执行;
+任何失败都会中止. 用户选择暂不启动时返回未完成状态, 不报告迁移验收成功.
+
+新增 frps 配置/启动单元备份, AI 配置备份包含数据库初始化脚本.
+主机安全配置仅解压到 `/root/howe-migrate-restore/system-sec`, 需对比目标机配置后处理.
+自定义备份路径逐行输入, 支持路径包含空格. 备份有失败项时返回非零, 不用于自动升级.
+
+9router 与 kiro-rs 的健康探针已修正. 已存在容器仍使用创建时的探针,
+需要在计划维护时重新生成 Compose 并重建相应服务才会应用.
 
 ## 致谢
 
 本项目的系统工具部分（网络测速、流媒体检测、Docker 安装等）参考并借鉴了 [kejilion/sh](https://github.com/kejilion/sh)，该项目同样采用 Apache-2.0 协议。
 
+ECS 启动器来自 [oneclickvirt/ecs](https://github.com/oneclickvirt/ecs), 随仓库版本取自
+`01a8003f840292396d1364a1dfef82a9a8f8b597` 的 `goecs.sh`. 更新工具时先下载到临时文件,
+语法检查通过后再替换; 综合测评本身涉及外部下载与资源消耗, 未纳入自动回归.
+该独立脚本遵循上游 GPL-3.0, 许可证见 [ecs.LICENSE](lib/scripts/ecs.LICENSE).
+
 ## License
 
 [Apache-2.0](LICENSE)
+
+第三方脚本保留各自许可证; ECS 例外见上方说明.
 
 本项目基于 Apache-2.0 协议开源，在 [kejilion/sh](https://github.com/kejilion/sh)（Apache-2.0）基础上进行了扩展开发。

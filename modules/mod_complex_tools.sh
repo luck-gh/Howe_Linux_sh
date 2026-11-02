@@ -21,13 +21,13 @@ _warn_complex_tool_risk() {
       echo -e "  ${R}║  ● 风险等级：危险 (danger)                          ║${N}"
       echo -e "  ${R}╚══════════════════════════════════════════════════════╝${N}"
       echo ""
-      echo -e "  ${W}spiritysdx 融合怪测评 (ecs.sh)${N}"
+      echo -e "  ${W}oneclickvirt ECS 融合怪测评${N}"
       echo ""
       echo -e "  ${Y}检测到以下安全风险：${N}"
       echo ""
-      echo -e "  ${R}1.${N} 使用 curl -k（禁用 SSL 证书验证），存在中间人攻击风险"
-      echo -e "  ${R}2.${N} 包含自更新机制，可能在执行时修改自身代码"
-      echo -e "  ${R}3.${N} 包含遥测/数据上报功能，会向第三方服务器发送信息"
+      echo -e "  ${R}1.${N} 将下载并运行第三方测评程序"
+      echo -e "  ${R}2.${N} 测速会消耗服务器流量与计算资源"
+      echo -e "  ${R}3.${N} 测评会访问外部服务, 请先了解上游的数据处理方式"
       echo ""
       echo -e "  ${DIM}脚本路径：${_COMPLEX_SCRIPT}${N}"
       echo ""
@@ -68,7 +68,7 @@ declare -gA _COMPLEX_TOOLS=(
   [yabs]="yabs.sh|yabs 综合性能测试（fio+iperf3+geekbench）"
   [gb5]="gb5.sh|Geekbench 5 CPU 性能测试（本地重写）"
   [nodequality]="nodequality.sh|nodequality 融合怪测评"
-  [ecs-fusion]="ecs.sh|spiritysdx 融合怪测评"
+  [ecs-fusion]="ecs.sh|oneclickvirt ECS 融合怪测评"
 )
 
 # 从 urls.sh 获取更新源
@@ -115,11 +115,15 @@ _update_complex_tool() {
   fi
 
   echo -ne "  ${DIM}更新 ${desc} ...${N} "
-  if curl -sL --max-time 60 "$url" -o "$dest" 2>/dev/null; then
-    chmod +x "$dest"
+  local candidate
+  candidate=$(mktemp "${dest}.download.XXXXXX") || return 1
+  if curl -fsSL --max-time 60 "$url" -o "$candidate" && bash -n "$candidate"; then
+    chmod +x "$candidate" && mv -f "$candidate" "$dest" || { rm -f "$candidate"; return 1; }
     echo -e "${G}完成${N}"
   else
+    rm -f "$candidate"
     echo -e "${R}失败${N}"
+    return 1
   fi
 }
 
