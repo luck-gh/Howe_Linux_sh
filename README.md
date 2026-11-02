@@ -19,6 +19,7 @@ Linux VPS 管理工具箱，集成 AI 服务栈一键部署与 sing-box + Clash 
 - 自动生成节点显示名（IP 地理位置 → `[自建] 🇺🇸 美国 · 洛杉矶`）
 
 **系统工具**
+- 启动页分别探测并显示当前公网 IPv4 / IPv6, IPv6 不可用时明确显示未获取
 - 网络测速 / 流媒体解锁检测 / VPS 综合测评
 - Docker 安装 / 防火墙管理 / SSH 安全加固
 - AI 智能体 CLI 工具安装（Claude Code / OpenCode 等）
@@ -62,8 +63,17 @@ modules/             # 功能模块入口
 
 - Ubuntu 22.04 / Debian 12（推荐）
 - Docker + Docker Compose
-- Python 3.10+（订阅管理脚本）
+- Python 3.10+（公网 IP 校验与订阅管理脚本）
 - sing-box 1.11+（代理服务，静态 IP 多用户路由依赖此版本）
+
+## 开发验证
+
+```bash
+bash tests/public_ip.sh
+```
+
+公网地址测试使用模拟网络响应, 覆盖双栈, 无 IPv6, 错误地址族, 无效响应,
+旧地址更新和探测失败中止配置生成; 不访问外网或修改业务配置.
 
 ## 致谢
 

@@ -11,6 +11,7 @@ service_stack_menu() {
 
     if [[ -f "$BASE_DIR/.env" ]]; then
       source "$BASE_DIR/.env" 2>/dev/null
+      VPS_IP="$PUBLIC_IP"
       detect_installed_services
       echo -e "  ${G}已安装${N}"
       [[ -n "${DOMAIN:-}" ]] && echo -e "  域名：${C}${DOMAIN}${N}"
@@ -714,13 +715,17 @@ ai_agent_menu() {
 main() {
   [[ $EUID -ne 0 ]] && err "请用 root 运行：sudo bash $0"
   [[ -f /etc/os-release ]] || err "无法识别操作系统"
+  detect_public_ips
 
   while true; do
     print_header "AI 服务栈 一键安装脚本 V1.5"
+    show_public_ips
+    echo ""
 
     # 服务栈摘要
     if [[ -f "$BASE_DIR/.env" ]]; then
       source "$BASE_DIR/.env" 2>/dev/null
+      VPS_IP="$PUBLIC_IP"
       detect_installed_services
       echo -e "  ${W}服务栈${N}  ${G}已安装${N}"
       [[ -n "${DOMAIN:-}" ]] && echo -e "  域名：${C}${DOMAIN}${N}"

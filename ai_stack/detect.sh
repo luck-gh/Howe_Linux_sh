@@ -76,8 +76,8 @@ preflight() {
   log "硬件：${SYS_CPU}核 CPU | ${SYS_MEM_MB}MB RAM | ${SYS_DISK_GB}GB 磁盘"
   curl -fs --max-time 8 https://github.com > /dev/null || err "无法访问外网，请检查网络"
   log "网络连通"
-  VPS_IP=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || echo "")
-  [[ -n "$VPS_IP" ]] && log "公网 IP：${VPS_IP}" || warn "无法获取公网 IP"
+  refresh_current_ipv4 || return 1
+  log "公网 IPv4：${VPS_IP}"
 }
 
 # ═══════════════════════════════════════════════════════════════════

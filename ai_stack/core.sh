@@ -45,6 +45,8 @@ askyn() {
 
 # ── 通用工具函数（input_choose / break_end 等）──────────────────
 _AI_STACK_DIR="${BASH_SOURCE[0]%/*}"
+source "${_AI_STACK_DIR}/../lib/urls.sh"
+source "${_AI_STACK_DIR}/../lib/public_ip.sh"
 # 拆分后 utils.sh 仍在 lib/，从 ai_stack/ 引入需要 ../lib
 #
 # 注意：这里绝对不能 source lib/colors.sh。

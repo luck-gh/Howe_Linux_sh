@@ -186,7 +186,7 @@ reconfigure_domain() {
 
   # 加载现有配置
   [[ -f "$BASE_DIR/.env" ]] && source "$BASE_DIR/.env"
-  VPS_IP="${VPS_IP:-$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || echo "")}"
+  refresh_current_ipv4 || return 1
   detect_installed_services
   INST_CADDY=true
 

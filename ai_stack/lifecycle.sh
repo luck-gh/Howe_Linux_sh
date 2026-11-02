@@ -201,7 +201,7 @@ confirm_installation() {
 install_or_update() {
   STEP=0
 
-  preflight      # 系统/网络预检，探测资源，获取 VPS IP
+  preflight || return 1  # 系统/网络预检, IPv4 探测失败时中止安装.
 
   # 配置收集 + 确认循环（Esc 可返回重新配置）
   # collect_config 返回 1 = 用户在首屏按 0，要返回上一级菜单
@@ -222,7 +222,7 @@ install_or_update() {
 
   if $INST_SINGBOX; then
     install_singbox
-    write_singbox_config
+    write_singbox_config || return 1
     setup_clash_subscription
     render_clash_subscription || true
   fi

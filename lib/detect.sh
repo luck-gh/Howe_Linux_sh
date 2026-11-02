@@ -56,17 +56,15 @@ detect_distro() {
 }
 
 # ── IP 地址检测 ───────────────────────────────────────────────────
-PUBLIC_IP=""
 LOCAL_IP=""
-IPV6_ADDRESS=""
 ISP_INFO=""
 
 detect_ip() {
-  PUBLIC_IP=$(curl -s --max-time 5 "${URL_IPINFO}/ip" 2>/dev/null || echo "")
+  detect_public_ips
+  VPS_IP="$PUBLIC_IP"
   LOCAL_IP=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K[^ ]+' || \
              hostname -I 2>/dev/null | awk '{print $1}' || echo "")
-  IPV6_ADDRESS=$(curl -s --max-time 3 "${URL_IPINFO_V6}/ip" 2>/dev/null || echo "")
-  ISP_INFO=$(curl -s --max-time 3 "${URL_IPINFO}/org" 2>/dev/null || echo "")
+  ISP_INFO=$(curl -4 -s --max-time 3 "${URL_IPINFO}/org" 2>/dev/null || echo "")
 }
 
 # ── 网络连通性检测 ────────────────────────────────────────────────
@@ -77,7 +75,6 @@ check_network() {
     warn "网络连通性检测失败，可能无法访问 GitHub"
     return 1
   fi
-  VPS_IP=$(curl -s --max-time 5 "${URL_IPINFO}/ip" 2>/dev/null || echo "未知")
   return 0
 }
 

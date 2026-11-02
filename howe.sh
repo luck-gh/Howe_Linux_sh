@@ -21,6 +21,7 @@ HOWE_DIR=$(cd "$HOWE_DIR" && pwd)
 # 加载 lib
 source "${HOWE_DIR}/lib/colors.sh"
 source "${HOWE_DIR}/lib/urls.sh"
+source "${HOWE_DIR}/lib/public_ip.sh"
 source "${HOWE_DIR}/lib/utils.sh"
 source "${HOWE_DIR}/lib/detect.sh"
 source "${HOWE_DIR}/lib/nettest.sh"
@@ -56,6 +57,7 @@ main() {
 
   # 交互模式
   detect_distro
+  detect_public_ips
 
   while true; do
     clear
@@ -69,10 +71,9 @@ main() {
     local _mem=$(free -m | awk 'NR==2{printf "%d/%dMB (%.0f%%)", $3, $2, $3*100/$2}')
     local _disk=$(df -h / | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')
     local _load=$(uptime | awk '{print $(NF-2), $(NF-1), $NF}')
-    local _ip="${PUBLIC_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
     echo -e "  ${DIM}系统：${N}${DISTRO_PRETTY}"
     echo -e "  ${DIM}资源：${N}${_mem}  ${DIM}磁盘：${N}${_disk}  ${DIM}负载：${N}${_load}"
-    [[ -n "$_ip" ]] && echo -e "  ${DIM}IP：${N}$_ip"
+    show_public_ips
     echo ""
 
     echo "  1. 系统管理     （信息 / 更新 / 清理 / 备份）"

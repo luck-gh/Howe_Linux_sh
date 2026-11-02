@@ -151,8 +151,7 @@ show_system_info() {
   echo -e "${C}总接收/发送:  ${N}${NET_RX} / ${NET_TX}"
   echo -e "${C}网络算法:     ${N}$congestion / $qdisc"
   echo -e "${C}─────────────────────────────────────"
-  [[ -n "$PUBLIC_IP" ]] && echo -e "${C}公网 IP:      ${N}$PUBLIC_IP"
-  [[ -n "$IPV6_ADDRESS" ]] && echo -e "${C}IPv6:         ${N}$IPV6_ADDRESS"
+  show_public_ips
   [[ -n "$ISP_INFO" ]] && echo -e "${C}运营商:       ${N}$ISP_INFO"
   echo -e "${C}DNS:          ${N}$dns_addr"
   echo -e "${C}─────────────────────────────────────"

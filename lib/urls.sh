@@ -86,6 +86,9 @@ URL_IPDENY="http://www.ipdeny.com/ipblocks/data/countries"
 # 安全: ● 安全 [GET] — 仅读取 IP 信息，不执行代码
 URL_IPINFO="https://ipinfo.io"
 
+# 双栈公网地址回显, 请求方通过 curl -4 / -6 指定地址族.
+URL_PUBLIC_IP="https://api64.ipify.org"
+
 # ipinfo.io IPv6 版本
 # 安全: ● 安全 [GET] — 同上，IPv6 专用端点
 URL_IPINFO_V6="https://v6.ipinfo.io"

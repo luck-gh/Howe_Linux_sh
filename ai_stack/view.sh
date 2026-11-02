@@ -137,8 +137,10 @@ show_config() {
     $SVC_CADDY_INSTALLED   && INST_CADDY=true
     $SVC_PGSQL_INSTALLED   && INST_PGSQL=true
     $SVC_REDIS_INSTALLED   && INST_REDIS=true
-    # VPS_IP 兜底
-    [[ -z "${VPS_IP:-}" ]] && VPS_IP=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || echo "")
+    # 配置中的旧地址不代表当前主机, 展示本次启动探测到的结果.
+    VPS_IP="$PUBLIC_IP"
+    show_public_ips
+    echo ""
 
     # 运行状态
     echo -e "  ${W}运行状态${N}"

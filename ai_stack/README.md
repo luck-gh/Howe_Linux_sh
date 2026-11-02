@@ -35,6 +35,7 @@ core → detect → select → base → clash → compose → caddy → services
 
 约束来源：
 - `core.sh` 定义颜色、日志、`ask*`、`_AI_STACK_DIR`、全局常量 — 其它所有模块都用。
+- `core.sh` 加载共享 `lib/public_ip.sh`: 首页探测 IPv4 / IPv6, 服务配置使用当前进程的 IPv4 探测结果, 不复用旧 `.env` 中的 IP.
 - `detect.sh` 定义 `INST_*` / `SVC_*_INSTALLED` 等运行时变量 — `select / view / lifecycle` 依赖。
 - `clash.sh` 用到的 `BASE_DIR` 在 `core.sh` 定义；`reload_clash_subscription`（在 `services.sh`）反向引用 `_sync_clash_ufw`（`clash.sh`）。bash 是动态作用域，只要调用前 source 完即可，所以 `clash → services` 这个顺序必须保持。
 - `lifecycle.sh` 调度上面所有写文件的函数，必须在它们之后 source。

@@ -88,7 +88,7 @@ reload_clash_subscription() {
   command -v sing-box &>/dev/null || return 0
   local _cfg=/etc/sing-box/config.json _old_hash=""
   [[ -f "$_cfg" ]] && _old_hash=$(sha256sum "$_cfg" | awk '{print $1}')
-  write_singbox_config
+  write_singbox_config || return 1
   setup_clash_nft || true
   _sync_clash_ufw || true
   if systemctl is-active sing-box &>/dev/null; then
@@ -103,13 +103,8 @@ reload_clash_subscription() {
 write_singbox_config() {
   $INST_SINGBOX || return 0
 
-  # 兜底：VPS_IP 若空，再尝试一次（写 config 前必须有可信值，否则证书 CN/SNI 会回退到 localhost）
-  if [[ -z "${VPS_IP:-}" ]]; then
-    VPS_IP=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null \
-          || curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
-          || echo "")
-  fi
-  [[ -n "$VPS_IP" ]] || warn "无法获取公网 IP，sing-box 证书 CN 将回退到 localhost（客户端连接需 skip-cert-verify=true）"
+  # 使用本次探测结果覆盖旧 .env 中的地址; 探测失败时不落盘.
+  use_current_ipv4 || return 1
 
   # 确保日志目录可写
   touch /var/log/sing-box.log 2>/dev/null || true
@@ -126,8 +121,8 @@ write_singbox_config() {
   if $_need_regen; then
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
       -keyout "$SINGBOX_DIR/key.pem" -out "$SINGBOX_DIR/cert.pem" \
-      -days 3650 -nodes -subj "/CN=${VPS_IP:-localhost}" 2>/dev/null
-    log "自签 TLS 证书已生成（CN=${VPS_IP:-localhost}, 10年）"
+      -days 3650 -nodes -subj "/CN=${VPS_IP}" 2>/dev/null
+    log "自签 TLS 证书已生成（CN=${VPS_IP}, 10年）"
   else
     info "TLS 证书已存在（CN=${VPS_IP}），保持不变"
   fi
@@ -141,7 +136,7 @@ write_singbox_config() {
                        sing-box-inbounds \
                        --tls-cert "$SINGBOX_DIR/cert.pem" \
                        --tls-key  "$SINGBOX_DIR/key.pem" \
-                       --server-name "${VPS_IP:-localhost}" 2>/dev/null || echo "[]")
+                       --server-name "${VPS_IP}" 2>/dev/null || echo "[]")
     # 静态 IP 出口：远端 socks5/anytls outbound + user→outbound 路由规则
     local _ob _rr
     _ob=$(python3 "$(_clash_py)" --base "$(_clash_dir)" sing-box-outbounds 2>/dev/null) \
@@ -154,7 +149,7 @@ write_singbox_config() {
   # sing-box 至少要有一个 inbound 才能起。空时塞一个监听 127.0.0.1 的占位 inbound
   if ! echo "$_inbounds_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
     _inbounds_json=$(jq -nc --arg cert "$SINGBOX_DIR/cert.pem" --arg key "$SINGBOX_DIR/key.pem" \
-      --arg sni "${VPS_IP:-localhost}" '[
+      --arg sni "${VPS_IP}" '[
       {"type":"direct","tag":"placeholder","listen":"127.0.0.1","listen_port":1}
     ]')
   fi
