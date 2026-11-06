@@ -7,6 +7,7 @@
 `nodes.yaml` 是自建节点连接地址的唯一配置来源. 首次安装可填写稳定域名或 IP;
 回车明确选择当前 IPv4, 输入结束或非法地址会停止安装. 初始化订阅之后才生成 sing-box 入站,
 避免新建的默认订阅未进入服务端配置. `list --names` 在没有订阅时输出为空, 供脚本判断.
+首装同时启用 Caddy 并填写节点域名时默认开启受信任 TLS; IP 或未启用 Caddy 的安装保留显式跳过校验模式.
 
 已有安装使用 `Clash 订阅管理 → [e] 节点入口`, 或在仓库中执行:
 
@@ -22,12 +23,66 @@ python3 ai_stack/doc/clash_subs.py --base /opt/ai-stack/clash render --all
 先确认域名 A/AAAA 指向可用节点, 再更新订阅. 客户端更新一次后才能取得域名版配置.
 静态出口节点的客户端入口复用自建节点地址, 外购节点保留其自身地址.
 
+### SNI、证书与自动续期
+
+`server` 决定连接地址, `sni` 决定 TLS 名称; SNI 不会将连接重新导向其中填写的 IP.
+严格 TLS 使用自己的完整节点域名, 不能用 Google 等无关域名代替证书身份.
+节点池中的 `skip_cert_verify: false` 会同时作用于自建节点、静态出口节点和对应信息节点,
+下发为 `skip-cert-verify: false`; 外购节点保持供应方配置. 未单独填写 SNI 时, 客户端生成器使用节点自身地址.
+
+严格模式复用本项目安装的官方 Caddy systemd 服务: `caddy` 用户、默认 HOME
+`/var/lib/caddy`、默认 FileStorage, 不支持自定义 HOME、XDG_DATA_HOME、EnvironmentFile 或 storage.
+节点 HTTPS 站点只返回 404, 固定使用 Let's Encrypt ACME; Caddy 负责首次签发和持续续期.
+sing-box 以 root 读取以下受限文件, 不复制私钥、不放宽权限、无需额外续期定时任务:
+
+```text
+/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/<节点域名>/<节点域名>.crt
+/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/<节点域名>/<节点域名>.key
+```
+
+这些路径属于上述受控安装契约. 脚本检查运行环境、DNS SAN、有效期、系统信任链和私钥匹配;
+证书缺失或校验失败会停止生成, 不退回自签证书. 所有严格节点须使用同一个 SNI,
+因为当前服务端入站共用一张证书. 节点域名必须直连, 80/443 须持续可达以供 ACME 验证.
+首次安装最多等待 120 秒; 超时后检查 DNS 和 Caddy 日志再重试.
+
+已有安装升级时, 先备份并由 Caddy 签发节点证书. 在维护锁内准备候选节点配置,
+让 sing-box 加载并验证该证书后, 才发布严格校验订阅. 以下命令只修改候选节点字段,
+不会签发证书或重载服务; `--base` 应指向候选目录, 验证后再发布:
+
+```bash
+python3 ai_stack/doc/clash_subs.py --base /path/to/candidate-clash node-endpoint \
+  --from-server node.example.com --server node.example.com \
+  --sni node.example.com --verify-cert
+```
+
+重载正在使用的代理前, 先验证独立管理通道及备用线路, 准备不依赖当前会话的服务器侧自动回滚,
+向用户提供可独立执行的一键恢复、回退点、步骤和影响并完成回退检查. 准备新鲜完整的回退快照,
+保留客户端旧配置; 服务重载可能中断代理连接. 不满足这些条件时不要重载.
+
+本轮 TLS 发布的限定回退工具 `ai_stack/clash_rollback.py` 使用 `--snapshot` 指定快照目录,
+默认或显式 `--check` 只检查, 显式 `--apply` 才恢复并重载 sing-box. 快照包含 `nodes.yaml`,
+`clash_subs.py`, `server.json` 和各订阅的 `output/<token>/clash.yaml`; 工具保留当前生成器,
+仅恢复节点池、订阅输出和服务端配置, 不覆盖账单、密码、DNS、Caddy 或防火墙.
+快照订阅的用量显示名称可能暂时过期, 账单数据不变. 已缓存严格校验配置的客户端在回退到自签证书后
+需要更新订阅或切回保留的旧配置; 本机检查通过不等于大陆客户端验收.
+
+服务端刷新根据节点池选择域名证书, 不再因 VPS IP 改变而重签严格节点的证书.
+迁移严格节点必须同时恢复 `ai-config`、`clash`、`singbox` 和 `caddy` 所需配置及证书数据,
+并保持 Caddy 运行负责续期; 仅复制 sing-box 配置不足以完成恢复. DNS 尚未切换时可使用已恢复的有效证书,
+不能假定目标机能立即重新签发. sing-box 监听证书文件变更, 续期无需额外重启;
+不要把整个证书目录替换掉, 以免破坏文件监听.
+
+证书加载与续期机制参考 [Caddy 自动 HTTPS](https://caddyserver.com/docs/automatic-https) 和
+[sing-box TLS 文件热加载](https://sing-box.sagernet.org/configuration/shared/tls/).
+
+### DNS 分工
+
 HTTPS 订阅域名可经 CDN, AnyTLS 节点域名需要直达节点端口. 使用 Cloudflare 普通代理时,
 节点记录应为“仅 DNS”, 不能直接复用解析到 CDN 的订阅入口. 迁移时脚本保留已有节点域名;
 目标端协议, 端口, 凭据和 TLS 配置验收后, 再切换节点记录及订阅入口的回源目标.
 DNS 缓存与现有连接不会即时迁移.
 
-模板的 DNS 分工:
+模板采用以下解析路径:
 
 - `default-nameserver` 使用公共 DNS IP, 为加密 DNS 服务的域名提供引导解析.
 - `proxy-server-nameserver` 和 `direct-nameserver` 使用国内 DoH 并指定 `#DIRECT`,

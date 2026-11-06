@@ -85,7 +85,7 @@ setup_clash_nft() {
 # 仅在 config 真的发生变化时才 restart sing-box（避免断开在线客户端连接）
 reload_clash_subscription() {
   $INST_SINGBOX || return 0
-  command -v sing-box &>/dev/null || return 0
+  command -v sing-box &>/dev/null || { warn "sing-box 未安装, 无法应用订阅服务端配置"; return 1; }
   local _cfg=/etc/sing-box/config.json _old_hash=""
   [[ -f "$_cfg" ]] && _old_hash=$(sha256sum "$_cfg" | awk '{print $1}')
   write_singbox_config || return 1
@@ -95,7 +95,10 @@ reload_clash_subscription() {
     local _new_hash=""
     [[ -f "$_cfg" ]] && _new_hash=$(sha256sum "$_cfg" | awk '{print $1}')
     if [[ "$_old_hash" != "$_new_hash" ]]; then
-      systemctl restart sing-box || warn "sing-box restart 失败（配置已更新但服务未重启）"
+      systemctl restart sing-box || {
+        warn "sing-box restart 失败（配置已更新但服务未重启）"
+        return 1
+      }
     fi
   fi
 }
@@ -106,26 +109,39 @@ write_singbox_config() {
   # 使用本次探测结果覆盖旧 .env 中的地址; 探测失败时不落盘.
   use_current_ipv4 || return 1
 
-  # 确保日志目录可写
-  touch /var/log/sing-box.log 2>/dev/null || true
-
-  # 自签证书（Caddy 已占 80，sing-box 无法 ACME）
-  # 只在缺失或 CN 与当前 VPS_IP 不一致时重新生成
-  local _need_regen=true
-  if [[ -f "$SINGBOX_DIR/cert.pem" ]] && [[ -n "$VPS_IP" ]]; then
-    local _cur_cn
-    _cur_cn=$(openssl x509 -in "$SINGBOX_DIR/cert.pem" -noout -subject 2>/dev/null \
-            | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')
-    [[ "$_cur_cn" == "$VPS_IP" ]] && _need_regen=false
-  fi
-  if $_need_regen; then
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-      -keyout "$SINGBOX_DIR/key.pem" -out "$SINGBOX_DIR/cert.pem" \
-      -days 3650 -nodes -subj "/CN=${VPS_IP}" 2>/dev/null
-    log "自签 TLS 证书已生成（CN=${VPS_IP}, 10年）"
+  local _tls_domain _tls_dir _tls_cert="$SINGBOX_DIR/cert.pem" _tls_key="$SINGBOX_DIR/key.pem" _tls_name="$VPS_IP"
+  _tls_domain=$(_clash_tls_domain) || return 1
+  if [[ -n "$_tls_domain" ]]; then
+    if ! ${INST_CADDY:-false}; then
+      warn "严格 TLS 节点需要启用 Caddy 管理证书"
+      return 1
+    fi
+    _tls_dir=$(_caddy_node_cert_dir "$_tls_domain") || return 1
+    _tls_cert="$_tls_dir/$_tls_domain.crt"
+    _tls_key="$_tls_dir/$_tls_domain.key"
+    _tls_name="$_tls_domain"
+    _verify_clash_tls_certificate "$_tls_cert" "$_tls_key" "$_tls_name" || return 1
   else
-    info "TLS 证书已存在（CN=${VPS_IP}），保持不变"
+    # 明确选择跳过校验的 IP/旧节点继续使用自签模式, 严格模式绝不回退到这里.
+    local _need_regen=true
+    if [[ -f "$_tls_cert" ]] && [[ -n "$VPS_IP" ]]; then
+      local _cur_cn
+      _cur_cn=$(openssl x509 -in "$_tls_cert" -noout -subject 2>/dev/null \
+              | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')
+      [[ "$_cur_cn" == "$VPS_IP" ]] && _need_regen=false
+    fi
+    if $_need_regen; then
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout "$_tls_key" -out "$_tls_cert" \
+        -days 3650 -nodes -subj "/CN=${VPS_IP}" 2>/dev/null || return 1
+      log "自签 TLS 证书已生成（CN=${VPS_IP}, 10年）"
+    else
+      info "TLS 证书已存在（CN=${VPS_IP}），保持不变"
+    fi
   fi
+
+  # 证书就绪后才处理服务文件.
+  touch /var/log/sing-box.log 2>/dev/null || true
 
   # 多 inbound：每订阅独立 anytls 端口；clash_subs.py 输出 inbounds[] JSON
   local _inbounds_json="[]"
@@ -134,9 +150,9 @@ write_singbox_config() {
   if [[ -x "$(_clash_py)" ]] && [[ -f "$(_clash_dir)/subs.yaml" ]]; then
     _inbounds_json=$(python3 "$(_clash_py)" --base "$(_clash_dir)" \
                        sing-box-inbounds \
-                       --tls-cert "$SINGBOX_DIR/cert.pem" \
-                       --tls-key  "$SINGBOX_DIR/key.pem" \
-                       --server-name "${VPS_IP}" 2>/dev/null || echo "[]")
+                       --tls-cert "$_tls_cert" \
+                       --tls-key  "$_tls_key" \
+                       --server-name "$_tls_name") || return 1
     # 静态 IP 出口：远端 socks5/anytls outbound + user→outbound 路由规则
     local _ob _rr
     _ob=$(python3 "$(_clash_py)" --base "$(_clash_dir)" sing-box-outbounds 2>/dev/null) \
@@ -202,8 +218,8 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 UNIT
 
-  systemctl daemon-reload
-  systemctl enable --now sing-box
+  systemctl daemon-reload || return 1
+  systemctl enable --now sing-box || return 1
   local _n
   _n=$(echo "$_inbounds_json" | jq 'length' 2>/dev/null || echo "?")
   log "sing-box 已启动（${_n} 个订阅 inbound）"

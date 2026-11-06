@@ -15,12 +15,82 @@ https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
     apt-get update -qq || err "Caddy 源更新失败"
     apt-get install -y -qq caddy || err "Caddy 安装失败"
   fi
+  # 首次安装时 setup_dirs 早于 caddy 用户创建, 此处再确定日志目录归属.
+  install -d -o caddy -g caddy -m 0755 /var/log/caddy || return 1
   log "Caddy $(caddy version | head -1)"
+}
+
+# 本脚本只共享官方 systemd 服务的默认 FileStorage, 不猜测自定义存储位置.
+_caddy_node_cert_dir() {
+  local _domain=$1 _user _home _environment _envfiles _config
+  _user=$(systemctl show caddy --property=User --value) || return 1
+  _home=$(getent passwd caddy | cut -d: -f6) || return 1
+  _environment=$(systemctl show caddy --property=Environment --value) || return 1
+  _envfiles=$(systemctl show caddy --property=EnvironmentFiles --value) || return 1
+  if [[ "$_user" != caddy || "$_home" != /var/lib/caddy || -n "$_envfiles" ]]; then
+    warn "节点证书要求官方 caddy 用户、默认 HOME 和无自定义 EnvironmentFile 的 systemd 服务"
+    return 1
+  fi
+  python3 - "$_environment" <<'PY' || return 1
+import shlex
+import sys
+environment = dict(item.split("=", 1) for item in shlex.split(sys.argv[1]))
+if (environment.get("HOME", "/var/lib/caddy") != "/var/lib/caddy"
+        or environment.get("XDG_DATA_HOME", "/var/lib/caddy/.local/share") != "/var/lib/caddy/.local/share"):
+    raise SystemExit("节点证书不支持自定义 Caddy HOME/XDG_DATA_HOME")
+PY
+  _config=$(caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile) || return 1
+  if ! jq -e 'has("storage") | not' <<<"$_config" >/dev/null; then
+    warn "节点证书不支持自定义 Caddy storage; 需使用官方默认 FileStorage"
+    return 1
+  fi
+  printf '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/%s\n' "$_domain"
+}
+
+# 证书来自外部文件: 检查 SAN、有效期、系统信任链和密钥配对, 不输出私钥.
+_verify_clash_tls_certificate() {
+  local _cert=$1 _key=$2 _domain=$3 _cert_pub _key_pub _san
+  [[ -r "$_cert" && -r "$_key" ]] || { warn "节点受信任证书或私钥尚未就绪"; return 1; }
+  _san=$(openssl x509 -in "$_cert" -noout -ext subjectAltName) || return 1
+  [[ "$_san" == *"DNS:"* ]] || { warn "节点证书缺少 DNS SAN"; return 1; }
+  openssl x509 -in "$_cert" -checkend 0 -noout >/dev/null || return 1
+  openssl verify -purpose sslserver -verify_hostname "$_domain" -untrusted "$_cert" "$_cert" >/dev/null || return 1
+  _cert_pub=$(openssl x509 -in "$_cert" -noout -pubkey) || return 1
+  _key_pub=$(openssl pkey -in "$_key" -passin pass: -pubout) || return 1
+  [[ "$_cert_pub" == "$_key_pub" ]] || { warn "节点证书与私钥不匹配"; return 1; }
+}
+
+wait_clash_tls_certificate() {
+  local _domain _dir _attempt _error=""
+  _domain=$(_clash_tls_domain) || return 1
+  [[ -n "$_domain" ]] || return 0
+  if ! ${INST_CADDY:-false}; then
+    warn "严格 TLS 节点需要启用 Caddy 管理证书"
+    return 1
+  fi
+  _dir=$(_caddy_node_cert_dir "$_domain") || return 1
+  info "等待 Caddy 完成节点证书签发 (最多 120 秒)"
+  for _attempt in {1..60}; do
+    if _error=$(_verify_clash_tls_certificate "$_dir/$_domain.crt" "$_dir/$_domain.key" "$_domain" 2>&1); then
+      return 0
+    fi
+    sleep 2
+  done
+  warn "节点证书校验未通过, 已停止安装; 请检查节点 DNS、80/443 和 Caddy 日志"
+  printf '%s\n' "$_error" >&2
+  return 1
 }
 
 write_caddyfile() {
   $INST_CADDY || return 0
-  local _cf="$BASE_DIR/caddy/Caddyfile"
+  local _target="$BASE_DIR/caddy/Caddyfile" _cf _node_domain=""
+  if ${INST_SINGBOX:-false}; then
+    _node_domain=$(_clash_tls_domain) || return 1
+    if [[ -n "$_node_domain" ]]; then
+      _caddy_node_cert_dir "$_node_domain" >/dev/null || return 1
+    fi
+  fi
+  _cf=$(mktemp "$BASE_DIR/caddy/Caddyfile.XXXXXX") || return 1
 
   if [[ -z "$DOMAIN" ]]; then
     # HTTP 模式：多行 handle 块（Caddy v2.11+ 不支持单行内联写法）
@@ -149,17 +219,36 @@ EOF
     fi
   fi
 
-  ln -sf "$_cf" /etc/caddy/Caddyfile
-  systemctl enable caddy 2>/dev/null
+  if [[ -n "$_node_domain" ]]; then
+    cat >> "$_cf" <<EOF
+
+# 节点证书由 Caddy 自动续期, sing-box 直接监听证书文件变化.
+${_node_domain} {
+  tls {
+    issuer acme https://acme-v02.api.letsencrypt.org/directory
+  }
+  respond 404
+}
+EOF
+  fi
+  chmod 0644 "$_cf" || return 1
+  # 使用实际服务身份预检, 避免 root 预检创建 caddy 无权续写的日志/数据文件.
+  if ! runuser -u caddy -- caddy validate --config "$_cf" --adapter caddyfile; then
+    rm -f -- "$_cf"
+    return 1
+  fi
+  mv -f -- "$_cf" "$_target" || return 1
+  ln -sf "$_target" /etc/caddy/Caddyfile || return 1
+  systemctl enable caddy || return 1
   if systemctl restart caddy 2>&1; then
-    log "Caddyfile → $_cf"
+    log "Caddyfile → $_target"
   else
     err "Caddy 启动失败，请检查日志：journalctl -u caddy -n 20 --no-pager"
-    echo "  Caddyfile 路径：$_cf"
+    echo "  Caddyfile 路径：$_target"
     echo ""
     echo "  常见原因："
     echo "    1. 端口 80/443 被占用 → ss -tlnp | grep -E ':80|:443'"
-    echo "    2. Caddyfile 语法错误 → caddy validate --config $_cf"
+    echo "    2. Caddyfile 语法错误 → caddy validate --config $_target"
     echo "    3. DNS 未解析到本机 → 确认 A 记录指向 ${VPS_IP:-本机 IP}"
     return 1
   fi
@@ -244,8 +333,8 @@ reconfigure_domain() {
   echo ""
   warn "如果使用 Cloudflare 橙色云朵（CF 代理）："
   info "  CF Edge 证书传播需要 5-15 分钟，期间访问可能出现 SSL 错误，属正常现象"
-  info "  CF Universal SSL 仅覆盖 *.guohowe.com，不覆盖二级通配符（如 *.ai.guohowe.com）"
-  info "  建议域名直接用 guohowe.com 下的子域，避免二级子域证书问题"
+  info "  CF Universal SSL 的通配符覆盖如 *.example.com，不覆盖 *.ai.example.com"
+  info "  建议使用根域名下的直接子域，避免二级子域证书问题"
 }
 
 # ═══════════════════════════════════════════════════════════════════

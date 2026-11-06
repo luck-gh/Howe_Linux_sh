@@ -223,18 +223,23 @@ install_or_update() {
   if $INST_SINGBOX; then
     install_singbox
     setup_clash_subscription || return 1
+  fi
+
+  # ACME 首次签发需要 80/443 先可达; 节点已初始化, 端口段也可一起设置.
+  configure_firewall || return 1
+  if $INST_CADDY; then
+    step "安装 Caddy 反向代理"
+    install_caddy || return 1
+    write_caddyfile || return 1
+  fi
+
+  if $INST_SINGBOX; then
+    wait_clash_tls_certificate || return 1
     write_singbox_config || return 1
     render_clash_subscription || return 1
   fi
 
-  if $INST_CADDY; then
-    step "安装 Caddy 反向代理"
-    install_caddy
-    write_caddyfile
-  fi
-
   install_frp_server
-  configure_firewall
   start_services
   health_check
 

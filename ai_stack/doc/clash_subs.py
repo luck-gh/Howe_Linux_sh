@@ -14,7 +14,8 @@ Clash 订阅管理 + 渲染工具
 子命令
   init [--base DIR]                            初始化缺失的 subs/defaults 文件
   node-endpoint [--init | --from-server OLD]
-          [--server HOST] [--sni HOST]         查询 / 设置自建节点入口, 保留未指定的 SNI
+          [--server HOST] [--sni HOST] [--verify-cert]
+                                               查询 / 设置自建节点入口, 显式启用证书校验
   list [--brief|--names] [--base DIR]          列出所有订阅
   show NAME [--base DIR]                       显示一条订阅明细
   add NAME [--traffic-gb N] [--reset-day N]
@@ -1293,7 +1294,7 @@ def node_host(value):
 
 
 def cmd_node_endpoint(args):
-    """管理 nodes.yaml 中的连接入口; 仅显式传入 --sni 时改变已有 TLS 名称."""
+    """管理 nodes.yaml 的连接入口; TLS 名称与校验模式仅按显式参数更新."""
     path = paths(args.base)["nodes"]
     if args.init:
         if args.server is None:
@@ -1305,7 +1306,7 @@ def cmd_node_endpoint(args):
             "name": "vps-anytls", "server": args.server, "port": 0,
             "password": "PER_SUB", "type": "anytls",
             "sni": args.sni if args.sni is not None else args.server,
-            "skip_cert_verify": True,
+            "skip_cert_verify": not args.verify_cert,
         }]}
         dump_yaml(path, data)
         print("已初始化节点入口")
@@ -1314,6 +1315,8 @@ def cmd_node_endpoint(args):
         raise SystemExit("修改节点入口需要同时指定 --from-server 和 --server")
     if args.sni is not None and args.server is None:
         raise SystemExit("--sni 需与 --from-server 和 --server 一起使用")
+    if args.verify_cert and args.server is None:
+        raise SystemExit("--verify-cert 需与 --from-server 和 --server 一起使用")
     try:
         with open(path, encoding="utf-8") as source:
             data = yaml.safe_load(source)
@@ -1328,7 +1331,8 @@ def cmd_node_endpoint(args):
             raise SystemExit("nodes.yaml 中每个节点必须包含非空 server 字符串")
     if args.server is None:
         for index, node in enumerate(data["nodes"], 1):
-            print(f"{index}: server={node['server']} sni={node.get('sni', '(未设置)')}")
+            verify = "off" if node.get("skip_cert_verify", True) else "on"
+            print(f"{index}: server={node['server']} sni={node.get('sni', '(未设置)')} verify_cert={verify}")
         return 0
     selected = [node for node in data["nodes"] if node["server"] == args.from_server]
     if not selected:
@@ -1337,6 +1341,8 @@ def cmd_node_endpoint(args):
         node["server"] = args.server
         if args.sni is not None:
             node["sni"] = args.sni
+        if args.verify_cert:
+            node["skip_cert_verify"] = False
     dump_yaml(path, data)
     print(f"已更新 {len(selected)} 个节点入口; 请重新渲染订阅并更新客户端")
     return 0
@@ -1807,12 +1813,12 @@ def make_proxy(name, n, password=None, port=None):
         "port": port if port is not None else n["port"],
         "password": password if password is not None else n["password"],
         "udp": True,
-        "sni": n.get("sni", "baidu.com"),
+        "sni": n.get("sni") or n["server"],
         "skip-cert-verify": bool(n.get("skip_cert_verify", True)),
     })
 
 
-def make_static_proxy(name, sub_password, sub_port, vps_server, sni):
+def make_static_proxy(name, sub_password, sub_port, vps_server, sni, skip_cert_verify):
     """静态 IP 节点：客户端看到的还是连本机 anytls，server/port 都是本机；
     password 用 sub["static_passwords"][i]，让 sing-box 据此把流量路由去对应的远端 outbound。"""
     return _FlowMap({
@@ -1823,7 +1829,7 @@ def make_static_proxy(name, sub_password, sub_port, vps_server, sni):
         "password": sub_password,
         "udp": True,
         "sni": sni or vps_server,
-        "skip-cert-verify": True,
+        "skip-cert-verify": bool(skip_cert_verify),
     })
 
 
@@ -1935,6 +1941,7 @@ def render_one(base, sub):
             node = make_static_proxy(
                 name=name, sub_password=static_pwds[i],
                 sub_port=sub_port, vps_server=vps_server, sni=sni,
+                skip_cert_verify=head.get("skip_cert_verify", True),
             )
             if _is_quality_enabled(defs, "static") and target:
                 _, sc = lookup_ip_quality(target, base, defs, node_key=_static_nk, prefer_cache=prefer_cache)
@@ -1966,6 +1973,7 @@ def render_one(base, sub):
                 sub_port=sub_port,
                 vps_server=head.get("server"),
                 sni=head.get("sni"),
+                skip_cert_verify=head.get("skip_cert_verify", True),
             ))
 
     # 组顺序: 自建(info+real) → 静态(static_info+static_nodes) → 外购(external)
@@ -2558,6 +2566,7 @@ def build_parser():
     endpoint_mode.add_argument("--from-server", help="精确匹配需要修改的原入口")
     endpoint.add_argument("--server", type=node_host, help="直达 VPS 的完整域名或 IP")
     endpoint.add_argument("--sni", type=node_host, help="显式设置 TLS 名称; 修改已有节点时默认保留")
+    endpoint.add_argument("--verify-cert", action="store_true", help="显式启用服务端证书校验; 应先部署对应的受信任证书")
 
     ls = sub.add_parser("list")
     g_ls = ls.add_mutually_exclusive_group()

@@ -45,7 +45,12 @@ class NodeEndpointTests(unittest.TestCase):
                 node = self.read_nodes()["nodes"][0]
                 self.assertEqual(node["server"], expected)
                 self.assertEqual(node["sni"], expected)
+                self.assertTrue(node["skip_cert_verify"])
                 self.path.unlink()
+
+    def test_init_can_enable_certificate_verification(self):
+        self.command("node-endpoint", "--init", "--server", "node.example.com", "--verify-cert")
+        self.assertFalse(self.read_nodes()["nodes"][0]["skip_cert_verify"])
 
     def test_init_never_overwrites_existing_pool(self):
         self.command("node-endpoint", "--init", "--server", "node.example.com")
@@ -88,6 +93,35 @@ class NodeEndpointTests(unittest.TestCase):
                          "--server", "different.example.com")
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_verify_certificate_only_changes_selected_tls_fields(self):
+        data = {"nodes": [
+            {"name": "self", "server": "node.example.com", "sni": "192.0.2.10",
+             "port": 13443, "password": "synthetic-self", "skip_cert_verify": True},
+            {"name": "other", "server": "other.example.com", "sni": "other-tls.example.com",
+             "port": 443, "password": "synthetic-other", "skip_cert_verify": True},
+        ]}
+        clash.dump_yaml(str(self.path), data)
+        self.command("node-endpoint", "--from-server", "node.example.com",
+                     "--server", "node.example.com", "--sni", "node.example.com", "--verify-cert")
+        data["nodes"][0]["sni"] = "node.example.com"
+        data["nodes"][0]["skip_cert_verify"] = False
+        self.assertEqual(self.read_nodes(), data)
+        self.assertIn("verify_cert=on", self.command("node-endpoint"))
+
+    def test_verify_certificate_requires_explicit_selection(self):
+        self.command("node-endpoint", "--init", "--server", "node.example.com")
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(SystemExit, "--verify-cert"):
+            self.command("node-endpoint", "--verify-cert")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_unspecified_sni_uses_node_server(self):
+        node = {"server": "node.example.com", "port": 443,
+                "password": "synthetic", "skip_cert_verify": False}
+        self.assertEqual(clash.make_proxy("self", node)["sni"], node["server"])
+        node["sni"] = ""
+        self.assertEqual(clash.make_proxy("self", node)["sni"], node["server"])
+
     def test_listing_does_not_expose_credentials(self):
         self.command("node-endpoint", "--init", "--server", "node.example.com")
         data = self.read_nodes()
@@ -102,7 +136,6 @@ class NodeEndpointTests(unittest.TestCase):
         self.command("node-endpoint", "--init", "--server", "192.0.2.10")
         self.command("node-endpoint", "--from-server", "192.0.2.10",
                      "--server", "node.example.com")
-        before = self.path.read_bytes()
         self.command("init")
         clash.write_defaults(str(self.base), {
             "quality_check_enabled": "off", "exit_ip_show_enabled": "off",
@@ -118,18 +151,25 @@ class NodeEndpointTests(unittest.TestCase):
         })
         external = {"name": "external", "type": "anytls", "server": "external.example.com",
                     "port": 443, "password": "synthetic-external", "sni": "external-tls.example.com"}
-        for _ in range(2):
-            with mock.patch.object(clash, "load_external_proxies", return_value=[external]), \
-                    mock.patch.object(clash, "format_geo_label", return_value="synthetic-exit"):
-                self.command("render", "--all")
-            output = yaml.safe_load((self.base / "output/synthetic-token/clash.yaml").read_text(encoding="utf-8"))
-            proxies = output["proxies"]
-            self.assertIn(external, proxies)
-            local_nodes = [node for node in proxies if node["name"] != "external"]
-            self.assertTrue(any(node["name"].startswith("[静态]") for node in local_nodes))
-            self.assertTrue(all(node["server"] == "node.example.com" for node in local_nodes))
-            self.assertTrue(all(node["sni"] == "192.0.2.10" for node in local_nodes))
-            self.assertEqual(self.path.read_bytes(), before)
+        for verify_cert in (False, True):
+            if verify_cert:
+                self.command("node-endpoint", "--from-server", "node.example.com",
+                             "--server", "node.example.com", "--sni", "node.example.com", "--verify-cert")
+            before = self.path.read_bytes()
+            expected_sni = "node.example.com" if verify_cert else "192.0.2.10"
+            for _ in range(2):
+                with mock.patch.object(clash, "load_external_proxies", return_value=[external]), \
+                        mock.patch.object(clash, "format_geo_label", return_value="synthetic-exit"):
+                    self.command("render", "--all")
+                output = yaml.safe_load((self.base / "output/synthetic-token/clash.yaml").read_text(encoding="utf-8"))
+                proxies = output["proxies"]
+                self.assertIn(external, proxies)
+                local_nodes = [node for node in proxies if node["name"] != "external"]
+                self.assertTrue(any(node["name"].startswith("[静态]") for node in local_nodes))
+                self.assertTrue(all(node["server"] == "node.example.com" for node in local_nodes))
+                self.assertTrue(all(node["sni"] == expected_sni for node in local_nodes))
+                self.assertTrue(all(node["skip-cert-verify"] is not verify_cert for node in local_nodes))
+                self.assertEqual(self.path.read_bytes(), before)
 
     @unittest.skipUnless(os.name == "posix", "首次安装 Shell 流程在 Linux 验证")
     def test_shell_setup_prompts_once_and_preserves_domain(self):

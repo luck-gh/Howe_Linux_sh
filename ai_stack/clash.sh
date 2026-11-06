@@ -24,6 +24,53 @@ _clash_stats_py() { echo "$(_clash_dir)/clash_subs_stats.py"; }
 _clash_serve_py() { echo "$(_clash_dir)/clash_subs_serve.py"; }
 CLASH_SERVE_PORT=13888
 
+# 严格 TLS 的证书身份只来自节点池; 当前服务端所有订阅共用一张证书.
+_clash_tls_domain() {
+  python3 - "$(_clash_dir)" <<'PY'
+import argparse
+import ipaddress
+from pathlib import Path
+import sys
+import yaml
+
+base = Path(sys.argv[1])
+sys.path.insert(0, str(base))
+from clash_subs import node_host
+
+try:
+    data = yaml.safe_load((base / "nodes.yaml").read_text(encoding="utf-8"))
+except OSError:
+    raise SystemExit("无法读取 nodes.yaml 的节点 TLS 配置") from None
+except yaml.YAMLError:
+    raise SystemExit("nodes.yaml YAML 语法无效, 请修正后重试") from None
+if not isinstance(data, dict) or not isinstance(data.get("nodes"), list) or not data["nodes"]:
+    raise SystemExit("nodes.yaml 必须包含非空 nodes 列表")
+domains = set()
+for node in data["nodes"]:
+    if not isinstance(node, dict) or not isinstance(node.get("skip_cert_verify", True), bool):
+        raise SystemExit("节点 skip_cert_verify 必须为布尔值")
+    if node.get("skip_cert_verify", True):
+        continue
+    sni = node.get("sni")
+    if not isinstance(sni, str):
+        raise SystemExit("严格 TLS 节点必须设置域名 SNI")
+    try:
+        domain = node_host(sni)
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(f"严格 TLS 的 SNI 无效: {exc}") from exc
+    try:
+        ipaddress.ip_address(domain)
+    except ValueError:
+        domains.add(domain)
+    else:
+        raise SystemExit("严格 TLS 需要域名 SNI, 不支持 IP 证书")
+if len(domains) > 1:
+    raise SystemExit("当前 sing-box 的严格 TLS 节点必须使用同一个 SNI 域名")
+if domains:
+    print(domains.pop())
+PY
+}
+
 # 端口段（来自 clash_subs.py defaults，ufw allow 用）
 _clash_port_range() {
   local _lo=13443 _hi=13458
@@ -86,7 +133,33 @@ setup_clash_subscription() {
       warn "未读取到节点入口, 已停止初始化"
       return 1
     }
-    python3 "$(_clash_py)" --base "$_dir" node-endpoint --init --server "$_node_server" || return 1
+    local -a _endpoint_args=(node-endpoint --init --server "$_node_server")
+    if ${INST_CADDY:-false}; then
+      local _is_domain
+      _is_domain=$(python3 - "$_dir" "$_node_server" <<'PY'
+import argparse
+import ipaddress
+import sys
+sys.path.insert(0, sys.argv[1])
+from clash_subs import node_host
+try:
+    host = node_host(sys.argv[2])
+except argparse.ArgumentTypeError as exc:
+    raise SystemExit(str(exc)) from None
+try:
+    ipaddress.ip_address(host)
+except ValueError:
+    print("true")
+else:
+    print("false")
+PY
+      ) || return 1
+      if $_is_domain; then
+        _endpoint_args+=(--verify-cert)
+        info "节点将使用 Caddy 管理的受信任证书; 请确认该域名直连本机且 80/443 可达"
+      fi
+    fi
+    python3 "$(_clash_py)" --base "$_dir" "${_endpoint_args[@]}" || return 1
     log "Clash 节点池已就绪：$_dir/nodes.yaml"
   fi
 
@@ -787,10 +860,11 @@ _refresh_set_cache_hours() {
 # 子菜单：刷新所有（用户主动同步 → 强制重新探测出口 IP / 评分，绕过缓存）
 _clash_menu_refresh() {
   setup_clash_subscription || return 1
-  python3 "$(_clash_py)" --base "$(_clash_dir)" clear-external-cache >/dev/null 2>&1 || true
+  write_caddyfile || return 1
+  wait_clash_tls_certificate || return 1
+  reload_clash_subscription || return 1
+  python3 "$(_clash_py)" --base "$(_clash_dir)" clear-external-cache >/dev/null || return 1
   python3 "$(_clash_py)" --base "$(_clash_dir)" render --all --refresh-quality || return 1
-  write_caddyfile
-  reload_clash_subscription
   echo ""
   _clash_menu_list
 }
