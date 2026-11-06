@@ -60,18 +60,12 @@ _sync_clash_ufw() {
   ufw allow "${_range}/tcp" comment 'Clash anytls subs' &>/dev/null || true
 }
 
-# 首次安装：拷贝模板 / 脚本，初始化 subs+defaults，写默认 nodes.yaml
+# 首次安装：生成模板 / 拷贝脚本，初始化 subs+defaults，写默认 nodes.yaml
 setup_clash_subscription() {
   $INST_SINGBOX || return 0
   local _dir; _dir=$(_clash_dir)
   local _repo_doc="${_AI_STACK_DIR%/}/doc"
   mkdir -p "$_dir/output"
-
-  if [[ ! -f "$_dir/template.yaml" ]]; then
-    [[ -f "$_repo_doc/vps.yaml" ]] || { warn "未找到 $_repo_doc/vps.yaml"; return 1; }
-    cp "$_repo_doc/vps.yaml" "$_dir/template.yaml"
-    log "Clash 模板已就绪：$_dir/template.yaml"
-  fi
 
   # 总是覆盖 clash_subs.py + clash_subs_stats.py + clash_subs_serve.py（脚本由仓库分发，用户不应改）
   [[ -f "$_repo_doc/clash_subs.py" ]] || { warn "未找到 $_repo_doc/clash_subs.py"; return 1; }
@@ -86,37 +80,60 @@ setup_clash_subscription() {
   rm -f "$_dir/render_clash_sub.py"   # 清理旧脚本
 
   if [[ ! -f "$_dir/nodes.yaml" ]]; then
-    cat > "$_dir/nodes.yaml" <<NODESCFG
-# Clash 节点池（订阅元数据已迁移到 subs.yaml）
-# server / sni 决定 Clash 客户端连接的目标；port / password 在 render 时被订阅自身覆盖
-# 编辑后运行：bash howe.sh → 配置查询与修改 → Clash 订阅管理 → 刷新
-nodes:
-  - name: vps-anytls
-    server: ${VPS_IP:-YOUR_IP}
-    port: 0
-    password: PER_SUB
-    type: anytls
-    sni: ${VPS_IP:-YOUR_IP}
-    skip_cert_verify: true
-NODESCFG
+    local _node_server
+    info "节点域名须直接解析到本机, 不要使用仅支持 HTTPS 的 CDN 订阅域名"
+    ask _node_server "节点域名或 IP (回车使用当前 IPv4)" "$VPS_IP" || {
+      warn "未读取到节点入口, 已停止初始化"
+      return 1
+    }
+    python3 "$(_clash_py)" --base "$_dir" node-endpoint --init --server "$_node_server" || return 1
     log "Clash 节点池已就绪：$_dir/nodes.yaml"
   fi
 
-  python3 "$(_clash_py)" --base "$_dir" init >/dev/null
+  if [[ ! -f "$_dir/template.yaml" ]]; then
+    [[ -f "$_repo_doc/vps.yaml" ]] || { warn "未找到 $_repo_doc/vps.yaml"; return 1; }
+    local _sub_host=""
+    [[ -z "$DOMAIN" ]] || _sub_host="${PREFIX_VPS}.${DOMAIN}"
+    # 节点输入成功后才落模板; 取消首装时不留下绑定旧域名的半成品.
+    python3 - "$_repo_doc/vps.yaml" "$_dir/template.yaml" "$_sub_host" <<'PY' || return 1
+from pathlib import Path
+import sys
+import yaml
+
+source, target, host = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+template = yaml.safe_load(source.read_text(encoding="utf-8"))
+policy = template["dns"]["nameserver-policy"]
+subscription_dns = policy.pop("YOUR_SUB_DOMAIN")
+rule_index = template["rules"].index("DOMAIN,YOUR_SUB_DOMAIN,DIRECT")
+if host:
+    policy[host] = subscription_dns
+    template["rules"][rule_index] = f"DOMAIN,{host},DIRECT"
+else:
+    del template["rules"][rule_index]
+temporary = target.with_suffix(".yaml.tmp")
+temporary.write_text(yaml.safe_dump(template, allow_unicode=True, sort_keys=False), encoding="utf-8")
+temporary.replace(target)
+PY
+    log "Clash 模板已就绪：$_dir/template.yaml"
+  fi
+
+  python3 "$(_clash_py)" --base "$_dir" init >/dev/null || return 1
 
   # 把用户安装时填的端口段同步进 defaults.yaml
   if [[ -n "${CLASH_PORT_MIN:-}" ]] || [[ -n "${CLASH_PORT_MAX:-}" ]]; then
     local -a _da=(defaults)
     [[ -n "${CLASH_PORT_MIN:-}" ]] && _da+=(--port-min "$CLASH_PORT_MIN")
     [[ -n "${CLASH_PORT_MAX:-}" ]] && _da+=(--port-max "$CLASH_PORT_MAX")
-    python3 "$(_clash_py)" --base "$_dir" "${_da[@]}" >/dev/null
+    python3 "$(_clash_py)" --base "$_dir" "${_da[@]}" >/dev/null || return 1
   fi
 
   # 全新安装且无任何订阅：自动建一条 default
   # 不再传 --password，每订阅自动生成独立密码
-  if [[ -z "$(python3 "$(_clash_py)" --base "$_dir" list --names 2>/dev/null)" ]]; then
+  local _names
+  _names=$(python3 "$(_clash_py)" --base "$_dir" list --names) || return 1
+  if [[ -z "$_names" ]]; then
     python3 "$(_clash_py)" --base "$_dir" add default \
-      --traffic-gb 1000 --reset-day 1 --expire 2099-12-31 >/dev/null
+      --traffic-gb 1000 --reset-day 1 --expire 2099-12-31 >/dev/null || return 1
     log "已创建默认订阅 default"
   fi
 
@@ -776,6 +793,24 @@ _clash_menu_refresh() {
   reload_clash_subscription
   echo ""
   _clash_menu_list
+}
+
+# 节点入口只影响客户端订阅, 不重写服务端 TLS 配置或重启 sing-box.
+_clash_menu_node_endpoint() {
+  echo ""
+  python3 "$(_clash_py)" --base "$(_clash_dir)" node-endpoint || return 1
+  info "稳定域名须直达 VPS 的节点端口; 修改入口会保留现有 SNI"
+  local _from _server _apply
+  ask _from "要修改的原 server (空回车取消)" || return 1
+  [[ -n "$_from" ]] || return 0
+  ask _server "新的节点域名或 IP (空回车取消)" || return 1
+  [[ -n "$_server" ]] || return 0
+  askyn _apply "将 server=$_from 改为 $_server 并重新生成订阅?" n || return 1
+  $_apply || return 0
+  python3 "$(_clash_py)" --base "$(_clash_dir)" node-endpoint \
+    --from-server "$_from" --server "$_server" || return 1
+  render_clash_subscription || return 1
+  info "订阅已重新生成, 请在客户端更新订阅"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1619,6 +1654,7 @@ refresh_clash_subscription() {
     echo -e "    ${W}[7]${N} 同步配置（重渲染 yaml + 同步 Caddyfile / sing-box / nft，仅在变化时重启）"
     echo -e "    ${W}[8]${N} 静态 IP 资源管理（默认池 / 订阅池，host:port:user:password）"
     echo -e "    ${W}[9]${N} IP 检测（[自建]/[外购]/[静态] 节点名后缀质量分）"
+    echo -e "    ${W}[e]${N} 节点入口（稳定域名 / IP, 保留现有 SNI）"
     echo ""
     echo -e "    ${DIM}[0] 返回${N}"
     echo ""
@@ -1634,6 +1670,7 @@ refresh_clash_subscription() {
       7) _clash_menu_refresh ;;
       8) _clash_menu_static ;;
       9) _clash_menu_quality ;;
+      e|E) _clash_menu_node_endpoint || return 1 ;;
       0|"") break ;;
       *) warn "无效选项" ;;
     esac

@@ -197,9 +197,88 @@ PY
   [[ $? == 0 ]] && grep -q '^restart sing-box$' "$CASE_DIR/events"
 }
 
+native_domain_endpoint_survives() {
+  mkdir -p "$BASE_DIR/clash"
+  printf 'VPS_IP=8.8.8.8\n' > "$BASE_DIR/.env"
+  cat > "$BASE_DIR/clash/nodes.yaml" <<'YAML'
+nodes:
+  - {name: vps-anytls, type: anytls, server: node.example, sni: 8.8.8.8, skip_cert_verify: true, port: 0, password: PER_SUB}
+  - {name: external, server: external.example, sni: external.example}
+YAML
+  cp "$BASE_DIR/clash/nodes.yaml" "$CASE_DIR/original-nodes.yaml"
+  PUBLIC_IP=1.1.1.1
+  setup_clash_subscription() { :; }; write_singbox_config() { :; }
+  render_clash_subscription() {
+    # 确认真实迁移路径在渲染前保留完整域名节点, 包括独立的 SNI 契约.
+    python3 - "$CASE_DIR/original-nodes.yaml" "$BASE_DIR/clash/nodes.yaml" <<'PY'
+from pathlib import Path
+import sys, yaml
+original, restored = (yaml.safe_load(Path(path).read_text()) for path in sys.argv[1:])
+assert restored == original
+PY
+    [[ $? == 0 ]] || return
+    touch "$CASE_DIR/domain-rendered"
+  }
+  setup_clash_nft() { :; }
+  systemctl() { printf '%s\n' "$*" >> "$CASE_DIR/events"; }
+  _mig_activate_native_services singbox clash || return
+  grep -q '^VPS_IP=1.1.1.1$' "$BASE_DIR/.env" || return
+  [[ -f "$CASE_DIR/domain-rendered" ]] || return
+  grep -q '^restart sing-box$' "$CASE_DIR/events"
+}
+
 native_startup_failure() {
   systemctl() { [[ "$*" != 'restart frps' ]]; }
   ! _mig_activate_native_services frps
+}
+
+clash_install_model() {
+  DOMAIN= DEPLOY_MODE=single VPS_IP=1.1.1.1
+  INST_SINGBOX=true INST_CADDY=false INST_DIFY=false
+  CLASH_PORT_MIN=15443 CLASH_PORT_MAX=15458
+  preflight() { :; }; collect_config() { :; }; confirm_installation() { :; }
+  install_deps() { :; }; setup_dirs() { :; }; write_env() { :; }
+  write_compose() { :; }; write_litellm_config() { :; }; install_singbox() { :; }
+  setup_clash_stats_timer() { :; }; setup_clash_serve_service() { :; }
+  # 保留真实订阅初始化和入站生成, 仅隔离主机安装及系统配置写入.
+  write_singbox_config() {
+    touch "$CASE_DIR/config-requested"
+    python3 "$(_clash_py)" --base "$(_clash_dir)" sing-box-inbounds \
+      --tls-cert "$CASE_DIR/cert.pem" --tls-key "$CASE_DIR/key.pem" \
+      --server-name "$VPS_IP" > "$CASE_DIR/inbounds.json"
+  }
+  render_clash_subscription() { touch "$CASE_DIR/rendered"; }
+  install_frp_server() { :; }; configure_firewall() { :; }
+  start_services() { touch "$CASE_DIR/services-started"; }
+  health_check() { :; }; print_summary() { :; }
+}
+
+first_clash_install_has_subscription_inbound() {
+  clash_install_model
+  install_or_update <<< $'node.example\n\n' || return
+  python3 - "$BASE_DIR/clash" "$CASE_DIR/inbounds.json" <<'PY'
+from pathlib import Path
+import json, sys, yaml
+base = Path(sys.argv[1])
+subs = yaml.safe_load((base / 'subs.yaml').read_text())['subscriptions']
+nodes = yaml.safe_load((base / 'nodes.yaml').read_text())['nodes']
+inbounds = json.loads(Path(sys.argv[2]).read_text())
+assert len(subs) == len(inbounds) == 1
+assert subs[0]['name'] == 'default'
+assert inbounds[0]['type'] == 'anytls'
+assert inbounds[0]['listen_port'] == subs[0]['port'] == 15443
+assert inbounds[0]['users'] == [{'name': 'default', 'password': subs[0]['password']}]
+assert nodes[0]['server'] == nodes[0]['sni'] == 'node.example'
+PY
+  [[ $? == 0 ]] || return
+  [[ -f "$CASE_DIR/rendered" && -f "$CASE_DIR/services-started" ]]
+}
+
+clash_setup_failure_stops_install() {
+  clash_install_model
+  install_or_update </dev/null && return 1
+  [[ ! -f "$BASE_DIR/clash/subs.yaml" && ! -f "$CASE_DIR/config-requested" \
+     && ! -f "$CASE_DIR/rendered" && ! -f "$CASE_DIR/services-started" ]]
 }
 
 restore_verification() {
@@ -361,7 +440,10 @@ run_case metadata_escape metadata_rejects_escape
 run_case ssh_failure ssh_failure_is_returned
 run_case postgres_init_script postgres_init_script_is_backed_up
 run_case native_ip_and_startup native_ip_and_startup
+run_case native_domain_endpoint_survives native_domain_endpoint_survives
 run_case native_startup_failure native_startup_failure
+run_case first_clash_install first_clash_install_has_subscription_inbound
+run_case clash_setup_failure clash_setup_failure_stops_install
 run_case health_json_lines restore_verification '{"State":"running","Health":"healthy"}' 0
 run_case health_json_array restore_verification $'[\n {"State":"running","Health":"healthy"}\n]' 0
 run_case health_starting_fails restore_verification '{"State":"running","Health":"starting"}' 1

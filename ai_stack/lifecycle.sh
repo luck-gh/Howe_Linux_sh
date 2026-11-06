@@ -222,9 +222,9 @@ install_or_update() {
 
   if $INST_SINGBOX; then
     install_singbox
+    setup_clash_subscription || return 1
     write_singbox_config || return 1
-    setup_clash_subscription
-    render_clash_subscription || true
+    render_clash_subscription || return 1
   fi
 
   if $INST_CADDY; then

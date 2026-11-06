@@ -40,6 +40,8 @@ core → detect → select → base → clash → compose → caddy → services
 - `detect.sh` 定义 `INST_*` / `SVC_*_INSTALLED` 等运行时变量 — `select / view / lifecycle` 依赖。
 - `clash.sh` 用到的 `BASE_DIR` 在 `core.sh` 定义；`reload_clash_subscription`（在 `services.sh`）反向引用 `_sync_clash_ufw`（`clash.sh`）。bash 是动态作用域，只要调用前 source 完即可，所以 `clash → services` 这个顺序必须保持。
 - `lifecycle.sh` 调度上面所有写文件的函数，必须在它们之后 source。
+- sing-box 首装依次初始化 Clash 订阅、生成服务端入站、渲染客户端配置, 任一步失败即停止;
+  节点入口与 DNS 的配置契约见 [订阅子系统说明](doc/README.md#节点入口与-dns).
 - `backup_lib.sh` 提供低层备份 / 恢复函数；`backup.sh` 是它的菜单和编排层，依赖前者。
 - `view.sh` 的升级回滚菜单调用 `backup.sh` 的恢复入口，所以排在 backup 之后。
 - `migrate_lib.sh` 依赖 `backup_lib` 提供的 `backup_root`/`backup_create` 等；`migrate.sh` 菜单又调用 `migrate_lib`，故都排在 `backup*` 之后。

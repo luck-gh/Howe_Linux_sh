@@ -1,6 +1,49 @@
-# Clash 订阅子系统 — 节点命名规范
+# Clash 订阅子系统 — 配置与节点命名
 
 本目录(`ai_stack/doc/`)是 Clash 多订阅子系统的核心代码,部署到 `/opt/ai-stack/clash/`。
+
+## 节点入口与 DNS
+
+`nodes.yaml` 是自建节点连接地址的唯一配置来源. 首次安装可填写稳定域名或 IP;
+回车明确选择当前 IPv4, 输入结束或非法地址会停止安装. 初始化订阅之后才生成 sing-box 入站,
+避免新建的默认订阅未进入服务端配置. `list --names` 在没有订阅时输出为空, 供脚本判断.
+
+已有安装使用 `Clash 订阅管理 → [e] 节点入口`, 或在仓库中执行:
+
+```bash
+python3 ai_stack/doc/clash_subs.py --base /opt/ai-stack/clash node-endpoint
+python3 ai_stack/doc/clash_subs.py --base /opt/ai-stack/clash node-endpoint \
+  --from-server 192.0.2.10 --server node.example.com
+python3 ai_stack/doc/clash_subs.py --base /opt/ai-stack/clash render --all
+```
+
+修改仅匹配指定的原 `server`, 保留 SNI, 端口, 密码及其他入口; 如需修改 SNI, 必须显式指定
+`--sni`. SNI 属于服务端 TLS 契约, 不能跟随所有 IP 批量替换. 命令不创建 DNS 记录;
+先确认域名 A/AAAA 指向可用节点, 再更新订阅. 客户端更新一次后才能取得域名版配置.
+静态出口节点的客户端入口复用自建节点地址, 外购节点保留其自身地址.
+
+HTTPS 订阅域名可经 CDN, AnyTLS 节点域名需要直达节点端口. 使用 Cloudflare 普通代理时,
+节点记录应为“仅 DNS”, 不能直接复用解析到 CDN 的订阅入口. 迁移时脚本保留已有节点域名;
+目标端协议, 端口, 凭据和 TLS 配置验收后, 再切换节点记录及订阅入口的回源目标.
+DNS 缓存与现有连接不会即时迁移.
+
+模板的 DNS 分工:
+
+- `default-nameserver` 使用公共 DNS IP, 为加密 DNS 服务的域名提供引导解析.
+- `proxy-server-nameserver` 和 `direct-nameserver` 使用国内 DoH 并指定 `#DIRECT`,
+  让节点解析和国内直连不依赖代理先建立.
+- 海外域名策略和 `fallback` 指定 `#代理`, 跟随名为“代理”的策略组. 改组名必须同步改 DNS 引用;
+  用户选择 DIRECT 时该组也会直连, 已有客户端选择不会被模板的默认顺序覆盖.
+- 首次模板生成自动填入订阅域名的直连规则及独立 DNS 策略; 无域名安装则移除这两处占位.
+
+已有 `template.yaml` 在刷新时保留, 不被仓库模板覆盖. 更新已有安装时, 备份模板后合入
+`vps.yaml` 的 DNS 配置, 将 `YOUR_SUB_DOMAIN` 替换为实际订阅域名, 再重新渲染和更新客户端.
+DNS 解析器地址不是 VPS 的地址, 不随业务迁移替换. 适用于支持 AnyTLS 和 DNS 代理参数的
+Mihomo 客户端; 配置通过内核检查后仍需验证用户所在网络的冷启动解析与国内外访问.
+
+字段语义参考 [Mihomo DNS](https://wiki.metacubex.one/config/dns/),
+[TLS](https://wiki.metacubex.one/config/proxies/tls/) 与
+[Cloudflare 代理状态](https://developers.cloudflare.com/dns/proxy-status/).
 
 ## 节点命名统一规范(物理节点)
 
@@ -22,11 +65,11 @@
 **示例**(全开 / 关风险 / 关 IP / 都关 / 带 annotation):
 
 ```
-[自建](机-66) 🇺🇸 美国 · 洛杉矶 (199.193.124.234)
-[自建] 🇺🇸 美国 · 洛杉矶 (199.193.124.234)
+[自建](机-66) 🇺🇸 美国 · 洛杉矶 (192.0.2.10)
+[自建] 🇺🇸 美国 · 洛杉矶 (192.0.2.10)
 [自建](机-66) 🇺🇸 美国 · 洛杉矶
 [自建] 🇺🇸 美国 · 洛杉矶
-[静态](宅-0)[好用1] 🇺🇸 美国 · 洛杉矶 (172.56.121.124)
+[静态](宅-0)[好用1] 🇺🇸 美国 · 洛杉矶 (198.51.100.20)
 ```
 
 **静态 IP 资源录入格式**:
@@ -43,7 +86,7 @@
 | 类别 | server 含义 | 真实出口 IP 来源 | 评分 | 命名生成 |
 |---|---|---|---|---|
 | `[自建]` | VPS 域名/IP | VPS 本机 `curl ipify`(直发) | ✓ | 自动 |
-| `[静态]` | socks5 入口(IP 或 LB 域名) | `curl --socks5-hostname` 走该节点测 ipify | ✓ | 自动 |
+| `[静态]` | 客户端: 自建 VPS 入口; 资源池: socks5 入口(IP 或域名) | `curl --socks5-hostname` 走远端 socks5 测 ipify | ✓ | 自动 |
 | `[外购]` | 机场 anytls/vless/... 入口 | 协议私有,无法实测 | **✗ 不评分** | 沿用机场原 name,仅加 `[外购] ` 前缀 |
 
 **外购例外说明**: 外购协议是 anytls/vless/vmess 等私有协议,Python 无法直接连。若强行按 server 字段查 quality,得到的是入口 LB 而不是真实落地,误差大。因此**外购组始终不参与评分**,节点名沿用机场原始 name。

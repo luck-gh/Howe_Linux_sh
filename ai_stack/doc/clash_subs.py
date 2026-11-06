@@ -13,6 +13,8 @@ Clash 订阅管理 + 渲染工具
 
 子命令
   init [--base DIR]                            初始化缺失的 subs/defaults 文件
+  node-endpoint [--init | --from-server OLD]
+          [--server HOST] [--sni HOST]         查询 / 设置自建节点入口, 保留未指定的 SNI
   list [--brief|--names] [--base DIR]          列出所有订阅
   show NAME [--base DIR]                       显示一条订阅明细
   add NAME [--traffic-gb N] [--reset-day N]
@@ -50,7 +52,9 @@ Clash 订阅管理 + 渲染工具
 """
 import argparse
 import hashlib
+import ipaddress
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -1126,7 +1130,7 @@ def format_quality_suffix(server, base, defs=None, kind_label=None, node_key=Non
 
 def auto_node_name(node, base, defs=None, prefer_cache=False):
     """节点 name 为空时，根据 server 地址自动生成显示名。
-    格式：[自建](机-23) 🇺🇸 United States · Los Angeles (199.193.124.234)
+    格式：[自建](机-23) 🇺🇸 United States · Los Angeles (192.0.2.10)
     server 字段可能是域名(LB)，所以 geo / quality 都基于 VPS 真实出口 IP。
     出口 IP 显示开关关时，末尾 (IP) 隐藏。
     """
@@ -1267,6 +1271,77 @@ def cmd_init(args):
     return 0
 
 
+def node_host(value):
+    """校验 CLI 输入的节点域名或 IP, 不接受 URL, 端口或路径."""
+    value = value.strip()
+    if not value or "%" in value:
+        raise argparse.ArgumentTypeError("请输入域名或 IP, 不要包含 URL, 端口或路径")
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    try:
+        hostname = value.removesuffix(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise argparse.ArgumentTypeError("节点域名编码无效") from exc
+    labels = hostname.split(".")
+    if (len(hostname) > 253 or len(labels) < 2 or labels[-1].isdigit()
+            or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                   for label in labels)):
+        raise argparse.ArgumentTypeError("请输入完整域名或有效 IP, 不要包含 URL, 端口或路径")
+    return hostname
+
+
+def cmd_node_endpoint(args):
+    """管理 nodes.yaml 中的连接入口; 仅显式传入 --sni 时改变已有 TLS 名称."""
+    path = paths(args.base)["nodes"]
+    if args.init:
+        if args.server is None:
+            raise SystemExit("初始化节点入口需要 --server")
+        if os.path.exists(path):
+            raise SystemExit("nodes.yaml 已存在, 请用 --from-server 修改指定入口")
+        os.makedirs(args.base, exist_ok=True)
+        data = {"nodes": [{
+            "name": "vps-anytls", "server": args.server, "port": 0,
+            "password": "PER_SUB", "type": "anytls",
+            "sni": args.sni if args.sni is not None else args.server,
+            "skip_cert_verify": True,
+        }]}
+        dump_yaml(path, data)
+        print("已初始化节点入口")
+        return 0
+    if (args.server is None) != (args.from_server is None):
+        raise SystemExit("修改节点入口需要同时指定 --from-server 和 --server")
+    if args.sni is not None and args.server is None:
+        raise SystemExit("--sni 需与 --from-server 和 --server 一起使用")
+    try:
+        with open(path, encoding="utf-8") as source:
+            data = yaml.safe_load(source)
+    except FileNotFoundError as exc:
+        raise SystemExit("nodes.yaml 不存在, 请先初始化节点入口") from exc
+    except yaml.YAMLError as exc:
+        raise SystemExit("nodes.yaml YAML 语法无效, 请修正后重试") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list) or not data["nodes"]:
+        raise SystemExit("nodes.yaml 必须包含非空 nodes 列表")
+    for node in data["nodes"]:
+        if not isinstance(node, dict) or not isinstance(node.get("server"), str) or not node["server"]:
+            raise SystemExit("nodes.yaml 中每个节点必须包含非空 server 字符串")
+    if args.server is None:
+        for index, node in enumerate(data["nodes"], 1):
+            print(f"{index}: server={node['server']} sni={node.get('sni', '(未设置)')}")
+        return 0
+    selected = [node for node in data["nodes"] if node["server"] == args.from_server]
+    if not selected:
+        raise SystemExit("未找到 --from-server 指定的节点入口, 配置未修改")
+    for node in selected:
+        node["server"] = args.server
+        if args.sni is not None:
+            node["sni"] = args.sni
+    dump_yaml(path, data)
+    print(f"已更新 {len(selected)} 个节点入口; 请重新渲染订阅并更新客户端")
+    return 0
+
+
 # ─── list / show ───────────────────────────────────────────────────
 def fmt_sub(s, defs=None):
     u = s.get("usage") or _empty_usage()
@@ -1342,7 +1417,8 @@ def fmt_sub_brief(s):
 def cmd_list(args):
     subs = read_subs_normalized(args.base)
     if not subs:
-        print("(尚无订阅)")
+        if not getattr(args, "names", False):
+            print("(尚无订阅)")
         return 0
     if getattr(args, "brief", False):
         print(f"共 {len(subs)} 条订阅:")
@@ -1811,7 +1887,7 @@ def render_one(base, sub):
     external = load_external_proxies(base, sub, defs, ttl, prefer_cache=prefer_cache)
 
     # ── 静态 IP 出口节点 ─────────────────────────────────────────────
-    # 客户端看到的还是连本机的 anytls 节点（server=VPS_IP, port=订阅端口）；
+    # 客户端仍连接自建入口的 anytls 节点（server 来自 nodes.yaml, port=订阅端口）；
     # password 取自 sub["static_passwords"][i]，sing-box inbound 多挂的 user 在
     # route.rules 里被映射到对应的远端 socks5 outbound。
     static_strategy = "off" if expired else resolve_static_strategy(sub, defs)
@@ -2476,6 +2552,13 @@ def build_parser():
 
     sub.add_parser("init")
 
+    endpoint = sub.add_parser("node-endpoint", help="查询或修改 nodes.yaml 的自建节点入口")
+    endpoint_mode = endpoint.add_mutually_exclusive_group()
+    endpoint_mode.add_argument("--init", action="store_true", help="首次创建节点池, 已存在时拒绝覆盖")
+    endpoint_mode.add_argument("--from-server", help="精确匹配需要修改的原入口")
+    endpoint.add_argument("--server", type=node_host, help="直达 VPS 的完整域名或 IP")
+    endpoint.add_argument("--sni", type=node_host, help="显式设置 TLS 名称; 修改已有节点时默认保留")
+
     ls = sub.add_parser("list")
     g_ls = ls.add_mutually_exclusive_group()
     g_ls.add_argument("--brief", action="store_true", help="一行一条简要列表")
@@ -2646,6 +2729,7 @@ def build_parser():
 
 HANDLERS = {
     "init": cmd_init,
+    "node-endpoint": cmd_node_endpoint,
     "list": cmd_list,
     "show": cmd_show,
     "add": cmd_add,

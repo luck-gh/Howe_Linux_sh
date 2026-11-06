@@ -22,19 +22,23 @@ dns:
     enhanced-mode: fake-ip
     fake-ip-range: 198.18.0.1/16
     use-hosts: true
-    # 海外服务走 Cloudflare DoH 解析，避免国内 DNS 污染
-    nameserver-policy: { +.google.com: 'https://dns.cloudflare.com/dns-query', +.googleapis.com: 'https://dns.cloudflare.com/dns-query', +.googleapis.cn: 'https://dns.cloudflare.com/dns-query', +.googlevideo.com: 'https://dns.cloudflare.com/dns-query', +.gstatic.com: 'https://dns.cloudflare.com/dns-query', +.youtube.com: 'https://dns.cloudflare.com/dns-query', +.youtu.be: 'https://dns.cloudflare.com/dns-query', +.facebook.com: 'https://dns.cloudflare.com/dns-query', +.twitter.com: 'https://dns.cloudflare.com/dns-query', +.x.com: 'https://dns.cloudflare.com/dns-query', +.github.com: 'https://dns.cloudflare.com/dns-query', +.githubusercontent.com: 'https://dns.cloudflare.com/dns-query', +.openai.com: 'https://dns.cloudflare.com/dns-query', +.chatgpt.com: 'https://dns.cloudflare.com/dns-query', +.anthropic.com: 'https://dns.cloudflare.com/dns-query' }
+    # 节点域名独立直连解析, 避免解析节点时依赖尚未建立的代理.
+    proxy-server-nameserver: ['https://dns.alidns.com/dns-query#DIRECT', 'https://doh.pub/dns-query#DIRECT']
+    # 国内直连流量使用国内 DNS, 不跟随海外域名解析策略.
+    direct-nameserver: ['https://dns.alidns.com/dns-query#DIRECT', 'https://doh.pub/dns-query#DIRECT']
+    # 海外解析显式使用模板中的“代理”组; 改组名须同步修改 # 后的名称.
+    nameserver-policy: { YOUR_SUB_DOMAIN: ['https://dns.alidns.com/dns-query#DIRECT', 'https://doh.pub/dns-query#DIRECT'], +.google.com: 'https://dns.cloudflare.com/dns-query#代理', +.googleapis.com: 'https://dns.cloudflare.com/dns-query#代理', +.googleapis.cn: 'https://dns.cloudflare.com/dns-query#代理', +.googlevideo.com: 'https://dns.cloudflare.com/dns-query#代理', +.gstatic.com: 'https://dns.cloudflare.com/dns-query#代理', +.youtube.com: 'https://dns.cloudflare.com/dns-query#代理', +.youtu.be: 'https://dns.cloudflare.com/dns-query#代理', +.facebook.com: 'https://dns.cloudflare.com/dns-query#代理', +.twitter.com: 'https://dns.cloudflare.com/dns-query#代理', +.x.com: 'https://dns.cloudflare.com/dns-query#代理', +.github.com: 'https://dns.cloudflare.com/dns-query#代理', +.githubusercontent.com: 'https://dns.cloudflare.com/dns-query#代理', +.openai.com: 'https://dns.cloudflare.com/dns-query#代理', +.chatgpt.com: 'https://dns.cloudflare.com/dns-query#代理', +.anthropic.com: 'https://dns.cloudflare.com/dns-query#代理' }
     # 国内 DNS（默认）
-    nameserver: ['https://doh.pub/dns-query', 'https://dns.alidns.com/dns-query', 'tls://dot.pub:853', 'tls://dns.alidns.com:853']
-    # 海外 fallback DNS
-    fallback: ['https://dns.cloudflare.com/dns-query', 'https://dns.google/dns-query', 'tls://1.1.1.1:853', 'tls://8.8.8.8:853']
+    nameserver: ['https://doh.pub/dns-query#DIRECT', 'https://dns.alidns.com/dns-query#DIRECT', 'tls://dot.pub:853#DIRECT', 'tls://dns.alidns.com:853#DIRECT']
+    # 海外备用解析也经代理, 不依赖本地网络直连海外 DNS.
+    fallback: ['https://dns.cloudflare.com/dns-query#代理', 'https://dns.google/dns-query#代理', 'tls://1.1.1.1:853#代理', 'tls://8.8.8.8:853#代理']
     fallback-filter: { geoip: true, geoip-code: CN, ipcidr: [0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4], domain: [+.google.com, +.facebook.com, +.youtube.com, +.githubusercontent.com, +.googlevideo.com, +.googleapis.cn] }
     fake-ip-filter: ['*.lan', '*.local', '*.localhost', '*.test', localhost.ptlogin2.qq.com, '+.stun.*.*', '+.stun.*.*.*', '+.stun.*.*.*.*', lens.l.google.com, '*.srv.nintendo.net', +.stun.playstation.net, 'xbox.*.*.microsoft.com', '*.*.xboxlive.com', +.msftncsi.com, +.msftconnecttest.com]
 
 # ── 代理节点（按需添加，本模板仅给出示例）─────────────────────
 # 注意事项：
 #   1. server / port / password 替换为实际值
-#   2. sni 可任意伪装域名（如 baidu.com / qq.com）
+#   2. sni / servername 必须按服务端 TLS 契约设置, 不随节点地址批量替换
 #   3. skip-cert-verify: true 适用于自签证书
 proxies:
     # ── 信息展示节点（伪节点）───────────────────────────────────
