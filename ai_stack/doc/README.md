@@ -82,19 +82,31 @@ HTTPS 订阅域名可经 CDN, AnyTLS 节点域名需要直达节点端口. 使�
 目标端协议, 端口, 凭据和 TLS 配置验收后, 再切换节点记录及订阅入口的回源目标.
 DNS 缓存与现有连接不会即时迁移.
 
-模板采用以下解析路径:
+模板按实际出站处理解析, 不维护国内外网站 DNS 名单:
 
-- `default-nameserver` 使用公共 DNS IP, 为加密 DNS 服务的域名提供引导解析.
-- `proxy-server-nameserver` 和 `direct-nameserver` 使用国内 DoH 并指定 `#DIRECT`,
-  让节点解析和国内直连不依赖代理先建立.
-- 海外域名策略和 `fallback` 指定 `#代理`, 跟随名为“代理”的策略组. 改组名必须同步改 DNS 引用;
-  用户选择 DIRECT 时该组也会直连, 已有客户端选择不会被模板的默认顺序覆盖.
-- 首次模板生成自动填入订阅域名的直连规则及独立 DNS 策略; 无域名安装则移除这两处占位.
+- `nameserver` 只配置 `https://1.1.1.1/dns-query#代理`, 需要客户端解析时通过所选主代理组访问 Cloudflare DoH.
+- `proxy-server-nameserver: [system]` 通过客户端系统 DNS 解析节点, 避免建立代理前依赖代理.
+- `direct-nameserver: [system]` 供已有规则判定 DIRECT 的连接使用. 完全绕过 Clash 的应用继续使用自身/系统 DNS.
+- 原订阅域名独立使用系统解析, 便于线路故障时下载配置. 新配置不设置海外域名白名单、国内默认解析或 fallback.
+- 支持域名传递的代理连接可将目标域名交给实际代理端解析. 按 IP 匹配规则时可能先解析再定出站,
+  此类预解析使用主代理组, 不能保证与最终选中的其他代理组出口相同. 应用提前本地解析的查询不受本配置控制.
 
-已有 `template.yaml` 在刷新时保留, 不被仓库模板覆盖. 更新已有安装时, 备份模板后合入
-`vps.yaml` 的 DNS 配置, 将 `YOUR_SUB_DOMAIN` 替换为实际订阅域名, 再重新渲染和更新客户端.
-DNS 解析器地址不是 VPS 的地址, 不随业务迁移替换. 适用于支持 AnyTLS 和 DNS 代理参数的
-Mihomo 客户端; 配置通过内核检查后仍需验证用户所在网络的冷启动解析与国内外访问.
+已有 `template.yaml` 在普通刷新时保留, 不自动覆盖自定义配置. 显式采用新 DNS 路径时,
+先复制完整 Clash 目录作为候选, 再运行以下命令; 省略 `--subscription-host` 表示没有域名订阅入口:
+
+```bash
+python3 ai_stack/doc/clash_subs.py --base /path/to/candidate-clash dns-routing \
+  --source-template ai_stack/doc/vps.yaml --subscription-host sub.example.com
+python3 ai_stack/doc/clash_subs.py --base /path/to/candidate-clash render --all
+```
+
+命令保留现有访问规则、节点、DNS 监听和 fake-ip 设置, 显式替换 DNS 路由字段; 采用模板中的第一个代理组,
+不新增流量分流规则. 使用者须让该组的选择与预期代理出口一致. 验证候选后再持维护锁发布模板和订阅,
+不需要重载 Caddy 或 sing-box. 发布前提供可独立执行的 DNS 回退, 保留客户端旧配置及可用备用线路;
+自动更新订阅也可能让客户端立即采用新 DNS. 客户端更新订阅后生效, DNS 覆写和浏览器自定义 DNS 需另行核对.
+
+节点域名迁移时保留, DNS 解析器不随 VPS 的 IP 改写. `system` 指运行客户端的设备,
+服务器上的隔离测试不能证明大陆 Windows 的系统 DNS 与冷启动行为, 仍须实际验收.
 
 字段语义参考 [Mihomo DNS](https://wiki.metacubex.one/config/dns/),
 [TLS](https://wiki.metacubex.one/config/proxies/tls/) 与

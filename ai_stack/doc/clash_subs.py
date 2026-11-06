@@ -16,6 +16,8 @@ Clash 订阅管理 + 渲染工具
   node-endpoint [--init | --from-server OLD]
           [--server HOST] [--sni HOST] [--verify-cert]
                                                查询 / 设置自建节点入口, 显式启用证书校验
+  dns-routing --source-template FILE [--subscription-host HOST]
+                                               显式更新模板 DNS 路径, 不改访问规则
   list [--brief|--names] [--base DIR]          列出所有订阅
   show NAME [--base DIR]                       显示一条订阅明细
   add NAME [--traffic-gb N] [--reset-day N]
@@ -1293,6 +1295,33 @@ def node_host(value):
     return hostname
 
 
+def cmd_dns_routing(args):
+    """从仓库模板采用代理 DNS 路径, 保留访问规则和非路由 DNS 设置."""
+    target = paths(args.base)["template"]
+    template = load_yaml(target)
+    source = load_yaml(args.source_template)
+    groups = template.get("proxy-groups")
+    if not groups or not isinstance(groups[0].get("name"), str):
+        raise SystemExit("模板必须包含具名的主代理组")
+    group = groups[0]["name"]
+    if group in ("DIRECT", "REJECT"):
+        raise SystemExit("主代理组不能使用保留名称")
+    source_dns = source["dns"]
+    if source_dns["nameserver"] != ["https://1.1.1.1/dns-query#代理"]:
+        raise SystemExit("来源模板不是当前受支持的代理 DNS 配置")
+    dns = template.setdefault("dns", {})
+    for key in ("default-nameserver", "nameserver-policy", "fallback", "fallback-filter",
+                "proxy-server-nameserver-policy"):
+        dns.pop(key, None)
+    dns.update({"enable": True, "proxy-server-nameserver": ["system"],
+                "direct-nameserver": ["system"], "direct-nameserver-follow-policy": False,
+                "nameserver": ["https://1.1.1.1/dns-query#" + group]})
+    if args.subscription_host:
+        dns["nameserver-policy"] = {args.subscription_host: ["system"]}
+    dump_yaml(target, template)
+    print("DNS_ROUTING_UPDATED: 仅更新模板 DNS; 请验证候选输出后发布")
+
+
 def cmd_node_endpoint(args):
     """管理 nodes.yaml 的连接入口; TLS 名称与校验模式仅按显式参数更新."""
     path = paths(args.base)["nodes"]
@@ -2560,6 +2589,10 @@ def build_parser():
 
     sub.add_parser("init")
 
+    dns = sub.add_parser("dns-routing", help="显式采用仓库代理 DNS 路径, 保留已有访问规则")
+    dns.add_argument("--source-template", required=True, help="仓库 ai_stack/doc/vps.yaml")
+    dns.add_argument("--subscription-host", type=node_host, help="原订阅域名, 无域名时省略")
+
     endpoint = sub.add_parser("node-endpoint", help="查询或修改 nodes.yaml 的自建节点入口")
     endpoint_mode = endpoint.add_mutually_exclusive_group()
     endpoint_mode.add_argument("--init", action="store_true", help="首次创建节点池, 已存在时拒绝覆盖")
@@ -2739,6 +2772,7 @@ def build_parser():
 HANDLERS = {
     "init": cmd_init,
     "node-endpoint": cmd_node_endpoint,
+    "dns-routing": cmd_dns_routing,
     "list": cmd_list,
     "show": cmd_show,
     "add": cmd_add,

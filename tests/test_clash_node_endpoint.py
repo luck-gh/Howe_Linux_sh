@@ -221,9 +221,7 @@ class NodeEndpointTests(unittest.TestCase):
         self.assertNotIn("DOMAIN,YOUR_SUB_DOMAIN,DIRECT", template["rules"])
         policy = template["dns"]["nameserver-policy"]
         self.assertNotIn("YOUR_SUB_DOMAIN", policy)
-        self.assertEqual(policy["sub.example.com"], [
-            "https://dns.alidns.com/dns-query#DIRECT", "https://doh.pub/dns-query#DIRECT",
-        ])
+        self.assertEqual(policy["sub.example.com"], ["system"])
 
     @unittest.skipUnless(os.name == "posix", "首次安装 Shell 流程在 Linux 验证")
     def test_shell_setup_without_domain_removes_subscription_placeholders(self):
@@ -233,7 +231,7 @@ class NodeEndpointTests(unittest.TestCase):
         self.assertNotIn("YOUR_SUB_DOMAIN", template["dns"]["nameserver-policy"])
         self.assertFalse(any(rule.startswith("DOMAIN,vps.,") for rule in template["rules"]))
         self.assertNotIn("vps.", template["dns"]["nameserver-policy"])
-        self.assertIn("+.google.com", template["dns"]["nameserver-policy"])
+        self.assertEqual(template["dns"]["nameserver-policy"], {})
 
     @unittest.skipUnless(os.name == "posix", "首次安装 Shell 流程在 Linux 验证")
     def test_shell_setup_preserves_existing_template(self):

@@ -18,21 +18,18 @@ tcp-concurrent: true
 dns:
     enable: true
     ipv6: false
-    default-nameserver: [223.5.5.5, 119.29.29.29]
     enhanced-mode: fake-ip
     fake-ip-range: 198.18.0.1/16
     use-hosts: true
-    # 节点域名独立直连解析, 避免解析节点时依赖尚未建立的代理.
-    proxy-server-nameserver: ['https://dns.alidns.com/dns-query#DIRECT', 'https://doh.pub/dns-query#DIRECT']
-    # 国内直连流量使用国内 DNS, 不跟随海外域名解析策略.
-    direct-nameserver: ['https://dns.alidns.com/dns-query#DIRECT', 'https://doh.pub/dns-query#DIRECT']
-    # 海外解析显式使用模板中的“代理”组; 改组名须同步修改 # 后的名称.
-    nameserver-policy: { YOUR_SUB_DOMAIN: ['https://dns.alidns.com/dns-query#DIRECT', 'https://doh.pub/dns-query#DIRECT'], +.google.com: 'https://dns.cloudflare.com/dns-query#代理', +.googleapis.com: 'https://dns.cloudflare.com/dns-query#代理', +.googleapis.cn: 'https://dns.cloudflare.com/dns-query#代理', +.googlevideo.com: 'https://dns.cloudflare.com/dns-query#代理', +.gstatic.com: 'https://dns.cloudflare.com/dns-query#代理', +.youtube.com: 'https://dns.cloudflare.com/dns-query#代理', +.youtu.be: 'https://dns.cloudflare.com/dns-query#代理', +.facebook.com: 'https://dns.cloudflare.com/dns-query#代理', +.twitter.com: 'https://dns.cloudflare.com/dns-query#代理', +.x.com: 'https://dns.cloudflare.com/dns-query#代理', +.github.com: 'https://dns.cloudflare.com/dns-query#代理', +.githubusercontent.com: 'https://dns.cloudflare.com/dns-query#代理', +.openai.com: 'https://dns.cloudflare.com/dns-query#代理', +.chatgpt.com: 'https://dns.cloudflare.com/dns-query#代理', +.anthropic.com: 'https://dns.cloudflare.com/dns-query#代理' }
-    # 国内 DNS（默认）
-    nameserver: ['https://doh.pub/dns-query#DIRECT', 'https://dns.alidns.com/dns-query#DIRECT', 'tls://dot.pub:853#DIRECT', 'tls://dns.alidns.com:853#DIRECT']
-    # 海外备用解析也经代理, 不依赖本地网络直连海外 DNS.
-    fallback: ['https://dns.cloudflare.com/dns-query#代理', 'https://dns.google/dns-query#代理', 'tls://1.1.1.1:853#代理', 'tls://8.8.8.8:853#代理']
-    fallback-filter: { geoip: true, geoip-code: CN, ipcidr: [0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4], domain: [+.google.com, +.facebook.com, +.youtube.com, +.githubusercontent.com, +.googlevideo.com, +.googleapis.cn] }
+    # 先通过客户端系统 DNS 解析节点, 避免建立代理前依赖代理.
+    proxy-server-nameserver: [system]
+    # 既有规则判定 DIRECT 时使用客户端系统 DNS.
+    direct-nameserver: [system]
+    # 订阅自身保留独立解析, 便于代理故障时更新配置.
+    nameserver-policy: { YOUR_SUB_DOMAIN: [system] }
+    # 需要客户端解析的网站统一经所选代理查询, 不维护海外域名名单.
+    # 使用 IP 形式的 DoH 端点, 无需另行解析 DNS 服务商域名.
+    nameserver: ['https://1.1.1.1/dns-query#代理']
     fake-ip-filter: ['*.lan', '*.local', '*.localhost', '*.test', localhost.ptlogin2.qq.com, '+.stun.*.*', '+.stun.*.*.*', '+.stun.*.*.*.*', lens.l.google.com, '*.srv.nintendo.net', +.stun.playstation.net, 'xbox.*.*.microsoft.com', '*.*.xboxlive.com', +.msftncsi.com, +.msftconnecttest.com]
 
 # ── 代理节点（按需添加，本模板仅给出示例）─────────────────────
