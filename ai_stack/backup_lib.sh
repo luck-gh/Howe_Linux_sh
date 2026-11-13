@@ -22,7 +22,7 @@
 BACKUP_LIB_DIR="${BASH_SOURCE[0]%/*}"
 BACKUP_ROOT_DEFAULT=/var/backups/howe
 BACKUP_KEEP_DEFAULT=7
-BACKUP_DEFAULT_SCOPES_DEFAULT="ai-pg,ai-data,ai-config,clash,singbox,caddy,frps,kiro,system-sec,system-tune"
+BACKUP_DEFAULT_SCOPES_DEFAULT="ai-pg,ai-data,ai-config,clash,singbox,caddy,frps,kiro,nrouter,system-sec,system-tune"
 BACKUP_AUTO_BEFORE_UPGRADE_DEFAULT=true
 BACKUP_TIMER_ENABLED_DEFAULT=false
 BACKUP_TIMER_SCHEDULE_DEFAULT=daily

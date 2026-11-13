@@ -56,7 +56,8 @@ main() {
       ai-stack) mod_ai_stack_main ;;
       test)     mod_test_main ;;
       info)     preflight; show_system_info ;;
-      *)        echo "用法: $0 [system|memmgr|docker|security|network|ai-stack|test|info]" ;;
+      update-self) howe_update_self "${2:-$HOWE_DIR}" ;;
+      *)        echo "用法: $0 [system|memmgr|docker|security|network|ai-stack|test|info|update-self]" ;;
     esac
     return
   fi

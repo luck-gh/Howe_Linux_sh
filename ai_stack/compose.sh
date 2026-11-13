@@ -1,6 +1,32 @@
 #!/usr/bin/env bash
-# write_env + write_compose + write_litellm_config
-# 由 ai_stack/ai-stack-setup.sh 统一 source；不可独立运行。
+# Compose 配置生成与已知健康探针修复; 由统一入口加载.
+_repair_known_healthcheck() {
+  local service=$1 endpoint
+  case "$service" in
+    9router) endpoint=http://127.0.0.1:20128/ ;;
+    kiro-rs) endpoint=http://127.0.0.1:8990/admin ;;
+    *) return 0 ;;
+  esac
+  python3 - "$BASE_DIR/docker-compose.yml" "$service" "$endpoint" <<'PY'
+from pathlib import Path
+import os
+import shutil
+import sys
+import tempfile
+import yaml
+path, service, endpoint = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+document = yaml.safe_load(path.read_text(encoding='utf-8'))
+document['services'][service]['healthcheck']['test'] = ['CMD', 'wget', '-q', '-O', '/dev/null', '-T', '3', endpoint]
+fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.howe-health-')
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as output:
+        yaml.safe_dump(document, output, allow_unicode=True, sort_keys=False)
+    shutil.copystat(path, temporary)
+    os.replace(temporary, path)
+finally:
+    Path(temporary).unlink(missing_ok=True)
+PY
+}
 
 # ═══════════════════════════════════════════════════════════════════
 # 写入配置文件（含所有变量，chmod 600）

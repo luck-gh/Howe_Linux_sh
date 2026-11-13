@@ -64,7 +64,7 @@ upgrade_model() {
       'compose config --format json') printf '{"services":{"new-api":{"image":"%s"}}}\n' "${DESIRED_IMAGE:-example.invalid/service:latest}" ;;
       'compose pull new-api'|'inspect new-api'|'logs --tail 30 new-api') return 0 ;;
       'image inspect '* ) [[ "$3" == "${DESIRED_IMAGE:-example.invalid/service:latest}" ]] || return 98; echo sha256:new ;;
-      'compose up '*) [[ "$*" == *'--wait --wait-timeout 60'* ]] || return 98; return "${WAIT_RC:-0}" ;;
+      'compose up '*) [[ "$*" == *'--wait --wait-timeout 180'* ]] || return 98; return "${WAIT_RC:-0}" ;;
       *) return 97 ;;
     esac
   }
@@ -406,6 +406,51 @@ missing_compose_is_failure() {
   ! _mig_verify_restore ai-config
 }
 
+healthcheck_repair_preserves_other_config() {
+  cat > "$BASE_DIR/docker-compose.yml" <<'YAML'
+services:
+  9router:
+    image: example.invalid/app:latest
+    environment: {TOKEN: '${TOKEN}'}
+    volumes: ['./data:/app/data']
+    healthcheck: {test: ['CMD-SHELL', 'wget http://localhost:20128/'], interval: 30s}
+  other: {image: example.invalid/other:pinned}
+YAML
+  cp "$BASE_DIR/docker-compose.yml" "$CASE_DIR/before.yml"
+  _repair_known_healthcheck 9router || return
+  python3 - "$CASE_DIR/before.yml" "$BASE_DIR/docker-compose.yml" <<'PY'
+import sys, yaml
+before, after = [yaml.safe_load(open(path)) for path in sys.argv[1:]]
+probe = after['services']['9router']['healthcheck']['test']
+assert probe == ['CMD', 'wget', '-q', '-O', '/dev/null', '-T', '3', 'http://127.0.0.1:20128/']
+before['services']['9router']['healthcheck']['test'] = probe
+assert before == after
+PY
+}
+
+same_image_health_repair() {
+  local status=$1
+  docker() {
+    case "$*" in
+      'inspect kiro-rs'|'compose pull kiro-rs'|'logs --tail 30 kiro-rs') return 0 ;;
+      'compose config --services') echo kiro-rs ;;
+      'compose config --format json') echo '{"services":{"kiro-rs":{"image":"example.invalid/service:latest"}}}' ;;
+      'image inspect '*) echo sha256:current ;;
+      'inspect --format '*) echo "$status" ;;
+      'compose up '*) touch "$CASE_DIR/recreated" ;;
+      *) return 97 ;;
+    esac
+  }
+  _record_image_history() { :; }
+  _repair_known_healthcheck() { touch "$CASE_DIR/repaired"; }
+  upgrade_single_service synthetic kiro-rs || return
+  if [[ "$status" == unhealthy ]]; then
+    [[ -f "$CASE_DIR/repaired" && -f "$CASE_DIR/recreated" ]]
+  else
+    [[ ! -e "$CASE_DIR/repaired" && ! -e "$CASE_DIR/recreated" ]]
+  fi
+}
+
 tests=0; failures=0
 run_case() {
   local name=$1; shift
@@ -461,6 +506,9 @@ run_case native_install_failure native_install_failure_is_returned
 run_case image_pull_failure image_pull_failure_is_returned
 run_case missing_native_service missing_native_service_is_failure
 run_case missing_compose missing_compose_is_failure
+run_case healthcheck_repair healthcheck_repair_preserves_other_config
+run_case pinned_unhealthy_repair same_image_health_repair unhealthy
+run_case pinned_healthy_skip same_image_health_repair healthy
 if command -v age >/dev/null; then
   run_case bundle_age_keyfile age_keyfile_roundtrip
 else

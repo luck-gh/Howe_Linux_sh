@@ -432,7 +432,7 @@ _upgrade_scope_matches_service() {
     ai-data)
       case "$_svc" in new-api|sub2api|litellm|openwebui) return 0 ;; *) return 1 ;; esac ;;
     ai-config)
-      case "$_svc" in new-api|sub2api|litellm|openwebui|ai-db|ai-redis|dify-nginx) return 0 ;; *) return 1 ;; esac ;;
+      case "$_svc" in new-api|sub2api|litellm|openwebui|ai-db|ai-redis|dify-nginx|kiro-rs|9router) return 0 ;; *) return 1 ;; esac ;;
     singbox) [[ "$_svc" == "sing-box" ]] ;;
     caddy) [[ "$_svc" == "caddy" ]] ;;
     kiro) [[ "$_svc" == "kiro-rs" ]] ;;
@@ -465,7 +465,7 @@ _upgrade_backup_scopes_for_services() {
     done
   done
 
-  printf '%s\n' "${_out[@]}"
+  if (( ${#_out[@]} > 0 )); then printf '%s\n' "${_out[@]}"; fi
 }
 
 # 取容器当前镜像引用（如 calciumion/new-api:latest）和镜像 ID
@@ -611,8 +611,18 @@ upgrade_single_service() {
   local _post_pull_id
   _post_pull_id=$(docker image inspect "$_desired_ref" --format '{{.Id}}') || return 1
   if [[ -n "$_post_pull_id" && "$_post_pull_id" == "$_cur_id" ]]; then
-    info "镜像已是最新（${_cur_id:0:19}），跳过容器重建"
-    return 0
+    local _repair_health=false _health
+    case "$_svc" in
+      9router|kiro-rs)
+        _health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$_svc") || return 1
+        if [[ "$_health" == unhealthy ]]; then _repair_health=true; fi
+        ;;
+    esac
+    if ! $_repair_health; then
+      info "镜像已是最新（${_cur_id:0:19}），跳过容器重建"
+      return 0
+    fi
+    info "镜像版本未变, 将备份并修复已知健康探针"
   fi
 
   # 远端确有新镜像后再备份，避免无升级也产生回滚文件和数据备份。
@@ -621,10 +631,11 @@ upgrade_single_service() {
     _dump_db_if_needed "$_svc" || { warn "数据库备份失败, 已停止升级"; return 1; }
   fi
   _record_image_history "$_svc" "$_cur_ref" "$_cur_id"
+  _repair_known_healthcheck "$_svc" || return 1
 
   # 4) up -d 重建（--no-deps 防止重建依赖容器，例如 ai-db）
   step "docker compose up -d --no-deps ${_svc}"
-  if ! (cd "$BASE_DIR" && docker compose up -d --no-deps --pull never --wait --wait-timeout 60 "$_svc"); then
+  if ! (cd "$BASE_DIR" && docker compose up -d --no-deps --pull never --wait --wait-timeout 180 "$_svc"); then
     warn "容器启动失败，准备回滚提示"
     echo ""
     echo -e "  ${R}启动失败${N}，可执行回滚："
@@ -899,14 +910,15 @@ _check_one_update() {
 
   if [[ "$_type" == "docker" ]]; then
     # 镜像引用（带 tag）
-    local _ref _local_digest _remote_digest
-    _ref=$(_svc_image_ref "$_svc" 2>/dev/null)
+    local _ref _image_id _local_digest _remote_digest
+    _ref=$(_svc_image_ref "$_svc" 2>/dev/null) || return 1
     [[ -z "$_ref" ]] && { echo "${_key}|${_name}|未运行|-|-" > "$_out"; return; }
 
-    # 本地 image 对应 registry 的 digest（来自 RepoDigests）
-    _local_digest=$(docker image inspect "$_ref" --format '{{if .RepoDigests}}{{(index .RepoDigests 0)}}{{end}}' 2>/dev/null | sed 's/.*@//')
+    # 标签可能已被 pull 更新, 检查实际容器使用的不可变 image ID.
+    _image_id=$(_svc_image_id "$_svc") || return 1
+    _local_digest=$(docker image inspect "$_image_id" --format '{{if .RepoDigests}}{{(index .RepoDigests 0)}}{{end}}' 2>/dev/null | sed 's/.*@//') || return 1
     # 上游 manifest digest（imagetools 返回 list digest，与 RepoDigests 同源）
-    _remote_digest=$(timeout 10 docker buildx imagetools inspect "$_ref" --format '{{.Manifest.Digest}}' 2>/dev/null)
+    _remote_digest=$(timeout 10 docker buildx imagetools inspect "$_ref" --format '{{.Manifest.Digest}}' 2>/dev/null) || _remote_digest=""
 
     _cur=$_ref
     if [[ -z "$_remote_digest" ]]; then
@@ -995,18 +1007,22 @@ check_all_updates() {
   # 输出汇总
   printf "  ${W}%-12s %-40s %-22s %s${N}\n" "服务" "当前" "最新" "状态"
   echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────${N}"
-  local _n_upgrade=0 _i
+  local _n_upgrade=0 _n_unknown=0 _i
   for (( _i=0; _i<${#_SVCS[@]}; _i++ )); do
     IFS='|' read -r _key _name _type _target <<< "${_SVCS[$_i]}"
     local _f="${_UPDATE_CACHE_DIR}/${_key}"
-    [[ -f "$_f" ]] || continue
+    if [[ ! -s "$_f" ]]; then
+      _n_unknown=$((_n_unknown+1))
+      printf '  %-12s %s\n' "$_name" '检查结果缺失'
+      continue
+    fi
     local _ck _cn _cur _new _state
     IFS='|' read -r _ck _cn _cur _new _state < "$_f"
     local _color
     case "$_state" in
       "↑") _color=$Y; _n_upgrade=$((_n_upgrade+1)) ;;
       "✓") _color=$G ;;
-      *)   _color=$DIM ;;
+      *)   _color=$DIM; _n_unknown=$((_n_unknown+1)) ;;
     esac
     printf "  %-12s %-40s %-22s ${_color}%s${N}\n" "$_name" "${_cur:0:38}" "${_new:0:20}" "$_state"
   done
@@ -1015,8 +1031,11 @@ check_all_updates() {
   echo ""
   if (( _n_upgrade > 0 )); then
     echo -e "  ${Y}有 ${_n_upgrade} 个服务可升级${N}，可在下方菜单选择对应服务进行升级"
-  else
+  elif (( _n_unknown == 0 )); then
     echo -e "  ${G}全部已是最新${N}"
+  fi
+  if (( _n_unknown > 0 )); then
+    warn "${_n_unknown} 个服务未能确认版本, 不能判定全部已是最新"
   fi
   echo ""
   read -erp "  按回车返回（输入 r 强制刷新）：" _ans

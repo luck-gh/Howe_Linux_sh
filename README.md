@@ -40,6 +40,9 @@ bash howe.sh
 
 入口依赖仓库中的模块, 请使用完整克隆, 不单独下载或通过进程替换运行 howe.sh.
 
+更新管理脚本使用 `bash howe.sh update-self`. 仅支持干净的 main 分支快进更新;
+存在未提交文件或分叉时停止, 不覆盖本地修改、不创建合并提交. 此入口不升级业务容器.
+
 ## 目录结构
 
 ```
@@ -75,6 +78,8 @@ modules/             # 功能模块入口
 bash tests/public_ip.sh
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 bash tests/lifecycle.sh
+bash tests/update_checks.sh
+bash tests/self_update.sh
 ```
 
 以上测试使用合成数据与模拟服务命令, 不修改业务配置. 覆盖公网地址, 归档路径与摘要,

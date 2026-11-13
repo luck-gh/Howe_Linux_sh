@@ -6,6 +6,19 @@
 # 来源：kejilion.sh（已去除遥测和安全隐患）
 # ═══════════════════════════════════════════════════════════════════
 
+# ── 更新管理脚本 ──────────────────────────────────────────────────
+howe_update_self() {
+  local repo top status
+  repo=$(cd "$1" && pwd -P) || return 1
+  top=$(git -C "$repo" rev-parse --show-toplevel) || return 1
+  [[ "$(cd "$top" && pwd -P)" == "$repo" ]] || return 1
+  [[ "$(git -C "$repo" branch --show-current)" == main ]] || { warn "脚本更新要求 main 分支"; return 1; }
+  status=$(git -C "$repo" status --porcelain) || return 1
+  [[ -z "$status" ]] || { warn "仓库存在未提交改动, 已停止更新"; return 1; }
+  git -C "$repo" pull --ff-only origin main || return 1
+  log "管理脚本已更新, 请重新打开入口"
+}
+
 # ── 修复 dpkg ─────────────────────────────────────────────────────
 fix_dpkg() {
   pkill -9 -f 'apt|dpkg' 2>/dev/null || true
