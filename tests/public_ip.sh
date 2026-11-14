@@ -101,11 +101,22 @@ installation_stops_after_failed_preflight() {
   [[ "$rc" == 1 && -z "$output" ]]
 }
 
+timeout_is_explicit_and_clears_old_address() {
+  MOCK_IPV4_RC=28
+  PUBLIC_IP=8.8.8.8
+  local feedback
+  feedback=$(detect_public_ips 2>&1)
+  [[ "$feedback" == *'公网 IPv4: 查询超时'* ]] || return 1
+  detect_public_ips 2>/dev/null
+  [[ -z "$PUBLIC_IP" ]]
+}
+
 failures=0
 for test_case in dual_stack ipv6_unavailable ipv4_unavailable ipv4_rejects_ipv6 \
   ipv6_rejects_ipv4 rejects_html rejects_private_address trims_response \
   replaces_saved_ipv4 refreshes_saved_ipv4 failed_refresh_clears_old_ipv4 \
-  singbox_stops_before_writing installation_stops_after_failed_preflight; do
+  singbox_stops_before_writing installation_stops_after_failed_preflight \
+  timeout_is_explicit_and_clears_old_address; do
   if (
     MOCK_IPV4=1.1.1.1; MOCK_IPV6=2606:4700:4700::1111
     MOCK_IPV4_RC=0; MOCK_IPV6_RC=0; PUBLIC_IP=; IPV6_ADDRESS=

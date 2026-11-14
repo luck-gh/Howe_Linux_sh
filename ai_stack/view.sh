@@ -125,7 +125,7 @@ show_config() {
     fi
 
     source "$BASE_DIR/.env" 2>/dev/null
-    detect_installed_services
+    detect_installed_services || return 1
 
     # 用实际检测结果同步 INST_* 变量（.env 可能缺失或过时）
     $SVC_NEWAPI_INSTALLED  && INST_NEWAPI=true
@@ -152,7 +152,8 @@ show_config() {
         if svc_running "$_type" "$_target"; then
           _status="${G}运行中${N}"
         else
-          _status="${Y}已停止${N}"
+          local _rc=$?
+          if (( _rc == 1 )); then _status="${Y}已停止${N}"; else _status="${Y}未知${N}"; fi
         fi
       fi
       printf "    %-15s %b\n" "$_name" "$_status"
@@ -298,7 +299,7 @@ manage_services() {
     fi
 
     source "$BASE_DIR/.env" 2>/dev/null
-    detect_installed_services
+    detect_installed_services || return 1
 
     # 从注册表构建已安装的服务列表
     local -a _MSVCS=()
@@ -324,6 +325,8 @@ manage_services() {
       if svc_running "$_type" "$_svc"; then
         _st="${G}运行中${N}"
       else
+        local _rc=$?
+        (( _rc == 1 )) || { warn "运行状态未知, 已阻止服务操作"; return 1; }
         _st="${Y}已停止${N}"
       fi
       _menu_opts+=("$(printf '%-15s  %b' "$_name" "$_st")")
@@ -358,6 +361,8 @@ manage_services() {
         if svc_running "$_type" "$_svc"; then
           _st_now="${G}运行中${N}"
         else
+          local _rc=$?
+          (( _rc == 1 )) || { warn "运行状态未知, 已阻止服务操作"; return 1; }
           _st_now="${Y}已停止${N}"
         fi
         echo -e "  当前状态：${_st_now}"
@@ -977,7 +982,7 @@ check_all_updates() {
     echo ""; read -erp "  按回车返回..." _; return 0
   fi
   source "$BASE_DIR/.env" 2>/dev/null
-  detect_installed_services
+  detect_installed_services || return 1
 
   local -a _SVCS=()
   local _entry _key _name _type _target _var
@@ -1159,8 +1164,6 @@ upgrade_all_services() {
 }
 
 upgrade_rollback_menu() {
-  # 进入菜单时若缓存无效则先做一次检查（仅首次或过期时打印提示）
-  local _need_initial_check=1
   while true; do
     print_header "升级 / 回滚单服务（程序版本）"
     echo -e "  ${DIM}本菜单管理容器镜像 / 二进制版本。数据与配置的备份恢复见主菜单「备份 / 恢复」${N}"
@@ -1174,7 +1177,7 @@ upgrade_rollback_menu() {
     fi
 
     source "$BASE_DIR/.env" 2>/dev/null
-    detect_installed_services
+    detect_installed_services || return 1
 
     # 列出所有已安装服务（docker + systemd）
     # docker 类：走 upgrade_single_service / rollback_single_service
@@ -1194,26 +1197,14 @@ upgrade_rollback_menu() {
       return 0
     fi
 
-    # 首次进入或缓存过期：在原地展示「检查中…」，跑完再继续渲染
-    if (( _need_initial_check )) && ! _update_cache_valid; then
-      echo -e "  ${DIM}正在检查上游最新版本（最多约 15 秒）...${N}"
-      _update_cache_refresh
-      # 重绘以避免上面那行检查中提示残留
-      print_header "升级 / 回滚单服务（程序版本）"
-      echo -e "  ${DIM}本菜单管理容器镜像 / 二进制版本。数据与配置的备份恢复见主菜单「备份 / 恢复」${N}"
-      echo ""
-      # 若刷新后仍然没拿到时间戳（即全部失败），就别再下次循环里又自动重试
-      _update_cache_valid || _need_initial_check=0
-    fi
-    _need_initial_check=0
-
+    # 进入菜单仅查询本机; 上游版本由用户按 [r] 显式刷新.
     local _cache_age_hint=""
     if _update_cache_valid; then
       local _ts; _ts=$(cat "$(_update_cache_ts_file)" 2>/dev/null)
       local _age=$(( $(date +%s) - _ts ))
       _cache_age_hint="  ${DIM}（版本检查 ${_age} 秒前 · [r] 强制刷新）${N}"
     else
-      _cache_age_hint="  ${Y}（版本检查未完成或网络不通 · [r] 重试）${N}"
+      _cache_age_hint="  ${Y}（尚无有效版本检查 · [r] 查询上游）${N}"
     fi
 
     local _scnt=${#_SVCS[@]} _i
@@ -1914,10 +1905,9 @@ _check_domain_status() {
 
 domain_config_menu() {
   while true; do
-    [[ -f "$BASE_DIR/.env" ]] && source "$BASE_DIR/.env" 2>/dev/null
-    detect_installed_services
-
     print_header "域名配置"
+    [[ -f "$BASE_DIR/.env" ]] && source "$BASE_DIR/.env" 2>/dev/null
+    detect_installed_services || return 1
 
     echo -e "  ${W}域名暴露状态${N}  （域名：${C}${DOMAIN:-未配置}${N}）"
     echo ""

@@ -1,5 +1,29 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
+
+# 有界的只读外部查询. 提示走 stderr, 不污染调用方捕获的数据或泄漏参数.
+# 仅包装外部命令; 不用于交互、写操作或依赖当前 shell 状态的函数.
+howe_query() {
+  local label=$1 seconds=$2 status
+  shift 2
+  printf '  %s: 查询中...\n' "$label" >&2
+  if ! command -v timeout >/dev/null 2>&1; then
+    printf '  %s: 查询失败 (缺少 timeout, 未执行)\n' "$label" >&2
+    return 127
+  fi
+  if timeout --kill-after=1s "${seconds}s" "$@"; then
+    printf '  %s: 查询成功\n' "$label" >&2
+    return 0
+  else
+    status=$?
+  fi
+  case $status in
+    124) printf '  %s: 查询超时, 状态未知\n' "$label" >&2 ;;
+    137) printf '  %s: 查询超时或被终止, 状态未知\n' "$label" >&2 ;;
+    *) printf '  %s: 查询失败 (退出码 %s), 状态未知\n' "$label" "$status" >&2 ;;
+  esac
+  return "$status"
+}
 # Howe_Linux_sh — 交互式键盘菜单引擎
 #
 # 提供两个通用函数：

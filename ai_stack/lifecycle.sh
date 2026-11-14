@@ -264,7 +264,7 @@ uninstall_stack() {
   fi
 
   source "$BASE_DIR/.env" 2>/dev/null
-  detect_installed_services
+  detect_installed_services || return 1
 
   # 构建已安装的服务列表
   local -a _U=()

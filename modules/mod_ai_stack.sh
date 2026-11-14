@@ -72,12 +72,18 @@ _ai_stack_status() {
     return
   fi
 
+  local containers
+  containers=$(howe_query "AI 容器状态" 10 docker ps -a --format '{{.Names}}|{{.State}}') || {
+    warn "容器状态未知, 无法判断 AI 服务是否已安装或停止"
+    return 1
+  }
+
   local services=("new-api" "openwebui" "litellm" "sub2api" "ai-db" "ai-redis" "caddy")
   for svc in "${services[@]}"; do
     local status
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${svc}$"; then
+    if grep -Fxq "${svc}|running" <<< "$containers"; then
       status="${G}运行中${N}"
-    elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${svc}$"; then
+    elif grep -q "^${svc}|" <<< "$containers"; then
       status="${Y}已停止${N}"
     else
       status="${DIM}未安装${N}"
@@ -85,19 +91,18 @@ _ai_stack_status() {
     printf "  %-15s %b\n" "$svc" "$status"
   done
 
-  # sing-box
-  if systemctl is-active sing-box &>/dev/null; then
-    printf "  %-15s %b\n" "sing-box" "${G}运行中${N}"
-  elif [[ -f /usr/local/bin/sing-box ]]; then
-    printf "  %-15s %b\n" "sing-box" "${Y}已停止${N}"
-  else
-    printf "  %-15s %b\n" "sing-box" "${DIM}未安装${N}"
-  fi
-
-  # frp
-  if systemctl is-active frps &>/dev/null; then
-    printf "  %-15s %b\n" "frps" "${G}运行中${N}"
-  elif [[ -f /usr/local/bin/frps ]]; then
-    printf "  %-15s %b\n" "frps" "${Y}已停止${N}"
-  fi
+  local unit state
+  for unit in sing-box frps; do
+    if state=$(howe_query "$unit 运行状态" 5 systemctl show "$unit" --property=ActiveState --value); then
+      case "$state" in
+        active) status="${G}运行中${N}" ;;
+        inactive|failed) status="${Y}已停止或未安装${N}" ;;
+        activating|deactivating|reloading) status="${Y}状态转换中${N}" ;;
+        *) status="${Y}状态未知${N}" ;;
+      esac
+    else
+      status="${Y}状态未知${N}"
+    fi
+    printf "  %-15s %b\n" "$unit" "$status"
+  done
 }

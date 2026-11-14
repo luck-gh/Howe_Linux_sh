@@ -101,12 +101,16 @@ _DOCKER_PS_TTL=3       # 缓存有效期（秒）
 
 # 强制刷新快照（状态变更后可显式调用以立即反映）
 _docker_ps_refresh() {
-  if command -v docker &>/dev/null; then
-    _DOCKER_PS_ALL=$(docker ps -a --format '{{.Names}}' 2>/dev/null)
-    _DOCKER_PS_RUN=$(docker ps --format '{{.Names}}' 2>/dev/null)
-  else
-    _DOCKER_PS_ALL=""; _DOCKER_PS_RUN=""
-  fi
+  _DOCKER_PS_ALL=""; _DOCKER_PS_RUN=""; _DOCKER_PS_TS=-100
+  command -v docker &>/dev/null || { _DOCKER_PS_TS=$SECONDS; return 0; }
+  local _snapshot _name _state
+  # 一次查询同时获取安装与运行状态; 失败时不发布旧快照或空成功状态.
+  _snapshot=$(howe_query "Docker 服务状态" 8 docker ps -a --format '{{.Names}}|{{.State}}') || return $?
+  while IFS='|' read -r _name _state; do
+    [[ -n "$_name" ]] || continue
+    _DOCKER_PS_ALL+="${_name}"$'\n'
+    [[ "$_state" == "running" ]] && _DOCKER_PS_RUN+="${_name}"$'\n'
+  done <<< "$_snapshot"
   _DOCKER_PS_TS=$SECONDS
 }
 
@@ -125,7 +129,7 @@ svc_check() {
   case "$_type" in
     docker)
       command -v docker &>/dev/null || return 1
-      _docker_ps_ensure
+      _docker_ps_ensure || return 2
       grep -Fxq "$_target" <<< "$_DOCKER_PS_ALL"
       ;;
     systemd)
@@ -148,11 +152,17 @@ svc_running() {
   case "$_type" in
     docker)
       command -v docker &>/dev/null || return 1
-      _docker_ps_ensure
+      _docker_ps_ensure || return 2
       grep -Fxq "$_target" <<< "$_DOCKER_PS_RUN"
       ;;
     systemd)
-      systemctl is-active "$_target" &>/dev/null
+      local _state
+      _state=$(howe_query "${_target} 运行状态" 5 systemctl show "$_target" --property=ActiveState --value) || return 2
+      case "$_state" in
+        active) return 0 ;;
+        inactive|failed|activating|deactivating|reloading) return 1 ;;
+        *) return 2 ;;
+      esac
       ;;
     binary)
       command -v "$_target" &>/dev/null
@@ -215,6 +225,11 @@ detect_from_registry() {
     if svc_check "$_type" "$_target"; then
       printf -v "$_var" '%s' "true"
     else
+      local _rc=$?
+      if (( _rc != 1 )); then
+        printf -v "$_var" '%s' unknown
+        return "$_rc"
+      fi
       printf -v "$_var" '%s' "false"
     fi
   done
@@ -222,7 +237,16 @@ detect_from_registry() {
 
 # 便捷包装
 detect_installed_services() {
-  detect_from_registry SVC_REGISTRY_STACK
+  _docker_ps_refresh || {
+    local _entry _key _name _type _target
+    for _entry in "${SVC_REGISTRY_STACK[@]}"; do
+      IFS='|' read -r _key _name _type _target <<< "$_entry"
+      printf -v "SVC_${_key}_INSTALLED" '%s' unknown
+    done
+    warn "服务状态未知, 已阻止依赖安装状态的操作; 请修复查询后重试"
+    return 1
+  }
+  detect_from_registry SVC_REGISTRY_STACK || return $?
   # Dify 特殊：目录也算已安装
   [[ -d /opt/dify/docker ]] && SVC_DIFY_INSTALLED=true
 

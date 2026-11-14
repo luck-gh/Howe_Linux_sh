@@ -12,18 +12,24 @@ service_stack_menu() {
     if [[ -f "$BASE_DIR/.env" ]]; then
       source "$BASE_DIR/.env" 2>/dev/null
       VPS_IP="$PUBLIC_IP"
-      detect_installed_services
+      detect_installed_services || return 1
       echo -e "  ${G}已安装${N}"
       [[ -n "${DOMAIN:-}" ]] && echo -e "  域名：${C}${DOMAIN}${N}"
-      local _running=0 _total=0
+      local _running=0 _total=0 _unknown=0
       for _entry in "${SVC_REGISTRY_STACK[@]}"; do
         IFS='|' read -r _key _name _type _target <<< "$_entry"
         local _var="SVC_${_key}_INSTALLED"
         [[ "${!_var}" != "true" ]] && continue
         ((_total++))
-        svc_running "$_type" "$_target" && ((_running++))
+        local _state_rc=0
+        svc_running "$_type" "$_target" || _state_rc=$?
+        case $_state_rc in
+          0) ((_running++)) ;;
+          1) ;;
+          *) ((_unknown++)) ;;
+        esac
       done
-      echo -e "  运行中：${_running}/${_total} 个服务"
+      echo -e "  运行中：${_running}/${_total} 个服务 (状态未知 ${_unknown})"
     else
       echo -e "  ${DIM}未安装${N}"
     fi
@@ -339,7 +345,7 @@ AGENT_PKGS=(
 )
 
 _agent_cur_ver() {
-  "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?' | head -1
+  howe_query "$1 版本" 5 "$1" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?' | head -1
 }
 
 # 安装方式：claude 区分官方安装器（native）和 npm；其它工具各自的升级命令能自识别
@@ -350,7 +356,7 @@ _agent_install_method() {
     */.local/share/claude/versions/*) echo "native"; return ;;
     */.opencode/*)                    echo "script"; return ;;
   esac
-  command -v npm &>/dev/null && npm ls -g "$_pkg" --depth=0 &>/dev/null && { echo "npm"; return; }
+  command -v npm &>/dev/null && howe_query "npm 安装来源" 8 npm ls -g "$_pkg" --depth=0 >/dev/null && { echo "npm"; return; }
   echo "unknown"
 }
 
@@ -358,13 +364,13 @@ _agent_install_method() {
 _agent_recent_versions() {
   local _pkg="$1" _n="${2:-10}"
   command -v npm &>/dev/null || return 0
-  timeout 30 npm view "$_pkg" versions --json 2>/dev/null \
+  howe_query "npm 可用版本" 15 npm view "$_pkg" versions --json \
     | tr -d '[]", ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n "$_n" | sort -rV
 }
 
 _agent_dist_tag() {
   command -v npm &>/dev/null || return 0
-  timeout 30 npm view "$1" "dist-tags.$2" 2>/dev/null
+  howe_query "npm 发布标签" 15 npm view "$1" "dist-tags.$2"
 }
 
 # 执行更新：_target 为 latest / stable / 具体版本号
@@ -433,6 +439,7 @@ _claude_autoupdate_unlock() {
 }
 
 update_ai_agents() {
+  print_header "AI 智能体 CLI 工具 — 更新 / 指定版本"
   detect_ai_agents
 
   local -a _U=() _labels=()
@@ -457,15 +464,16 @@ update_ai_agents() {
   IFS='|' read -r _cmd _name _pkg <<< "${_U[$INPUT_RESULT]}"
 
   local _cur _method
-  _cur=$(_agent_cur_ver "$_cmd")
+  _cur=$(_agent_cur_ver "$_cmd") || { warn "当前版本未知, 已阻止更新"; return 1; }
+  [[ -n "$_cur" ]] || { warn "当前版本未知, 已阻止更新"; return 1; }
   _method=$(_agent_install_method "$_cmd" "$_pkg")
 
   print_header "${_name} — 更新 / 指定版本"
   echo -e "  当前版本：${G}${_cur:-未知}${N}"
   echo -e "  安装方式：${_method}  ${DIM}($(command -v "$_cmd"))${N}"
   if [[ "$_method" == "unknown" ]]; then
-    warn "无法识别安装方式，将按 npm 全局包处理"
-    _method="npm"
+    warn "无法确认安装方式, 已阻止更新; 请先核实安装来源"
+    return 1
   fi
   echo ""
   info "查询可用版本..."
@@ -657,7 +665,11 @@ show_ai_agents_status() {
 
     if command -v "$_cmd" &>/dev/null; then
       _path=$(command -v "$_cmd")
-      _ver=$("$_cmd" --version 2>/dev/null | head -1 || echo "未知")
+      if _ver=$(howe_query "${_name} 版本" 5 "$_cmd" --version); then
+        _ver=${_ver%%$'\n'*}
+      else
+        _ver="未知 (查询失败或超时)"
+      fi
       _status="${G}已安装${N}"
       printf "    %-15s %b\n" "$_name" "$_status"
       printf "      ${DIM}版本：%s${N}\n" "$_ver"
@@ -715,6 +727,7 @@ ai_agent_menu() {
 main() {
   [[ $EUID -ne 0 ]] && err "请用 root 运行：sudo bash $0"
   [[ -f /etc/os-release ]] || err "无法识别操作系统"
+  print_header "AI 服务栈 — 查询当前状态"
   detect_public_ips
 
   while true; do
@@ -726,18 +739,24 @@ main() {
     if [[ -f "$BASE_DIR/.env" ]]; then
       source "$BASE_DIR/.env" 2>/dev/null
       VPS_IP="$PUBLIC_IP"
-      detect_installed_services
+      detect_installed_services || return 1
       echo -e "  ${W}服务栈${N}  ${G}已安装${N}"
       [[ -n "${DOMAIN:-}" ]] && echo -e "  域名：${C}${DOMAIN}${N}"
-      local _running=0 _total=0
+      local _running=0 _total=0 _unknown=0
       for _entry in "${SVC_REGISTRY_STACK[@]}"; do
         IFS='|' read -r _key _name _type _target <<< "$_entry"
         local _var="SVC_${_key}_INSTALLED"
         [[ "${!_var}" != "true" ]] && continue
         ((_total++))
-        svc_running "$_type" "$_target" && ((_running++))
+        local _state_rc=0
+        svc_running "$_type" "$_target" || _state_rc=$?
+        case $_state_rc in
+          0) ((_running++)) ;;
+          1) ;;
+          *) ((_unknown++)) ;;
+        esac
       done
-      echo -e "  运行中：${_running}/${_total} 个服务"
+      echo -e "  运行中：${_running}/${_total} 个服务 (状态未知 ${_unknown})"
     else
       echo -e "  ${W}服务栈${N}  ${DIM}未安装${N}"
     fi

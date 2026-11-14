@@ -76,11 +76,11 @@ mem_status() {
   fi
 
   # Docker 容器内存（若 docker 可用）
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1; then
     section "Docker 容器内存"
     local _docker_out
-    _docker_out=$(docker stats --no-stream \
-      --format "{{.Name}}|{{.MemUsage}}|{{.MemPerc}}" 2>/dev/null)
+    _docker_out=$(howe_query "Docker 容器内存" 10 docker stats --no-stream \
+      --format "{{.Name}}|{{.MemUsage}}|{{.MemPerc}}") || return 1
     if [[ -z "$_docker_out" ]]; then
       info "无运行中的容器"
     else

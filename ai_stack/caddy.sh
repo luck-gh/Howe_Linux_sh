@@ -276,7 +276,7 @@ reconfigure_domain() {
   # 加载现有配置
   [[ -f "$BASE_DIR/.env" ]] && source "$BASE_DIR/.env"
   refresh_current_ipv4 || return 1
-  detect_installed_services
+  detect_installed_services || return 1
   INST_CADDY=true
 
   # 把真实安装状态回写到 .env，纠正可能存在的过时 INST_*=false

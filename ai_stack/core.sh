@@ -46,6 +46,7 @@ source "${_AI_STACK_DIR}/../lib/public_ip.sh" || return 1
 # colors.sh 里 ai_stack 唯一缺的只是 section()，在下面单独补齐即可。
 # shellcheck source=../lib/utils.sh
 source "${_AI_STACK_DIR}/../lib/utils.sh" || return 1
+source "${_AI_STACK_DIR}/../lib/menu.sh" || return 1
 
 # ── 通用 UI 工具 ─────────────────────────────────────────────────
 

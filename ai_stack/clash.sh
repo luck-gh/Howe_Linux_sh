@@ -328,9 +328,14 @@ _clash_print_url() {
 }
 
 # 子菜单：列出（仅简表）
+# 只读菜单查询统一有界执行, 标签不包含订阅值或凭据.
+_clash_query() {
+  howe_query "Clash 配置" 10 python3 "$(_clash_py)" --base "$(_clash_dir)" "$@"
+}
+
 _clash_menu_list() {
   echo ""
-  python3 "$(_clash_py)" --base "$(_clash_dir)" list --brief || return 1
+  _clash_query list --brief || return 1
   echo ""
   local _host="${PREFIX_VPS:-vps}.${DOMAIN}"
   [[ -n "$DOMAIN" ]] || _host="${VPS_IP:-YOUR_IP}"
@@ -341,7 +346,7 @@ _clash_menu_list() {
 _clash_pick_one() {
   local _prompt="$1" _out_var="$2"
   local _names
-  _names=$(python3 "$(_clash_py)" --base "$(_clash_dir)" list --names 2>/dev/null)
+  _names=$(_clash_query list --names) || return 1
   if [[ -z "$_names" ]]; then
     warn "没有可用订阅"
     eval "$_out_var=''"
@@ -395,17 +400,19 @@ _clash_pick_one() {
 
 # 子菜单：查询单条
 _clash_menu_show() {
+  print_header "Clash 订阅查询"
   local _name
   _clash_pick_one "选择订阅查询" _name || return
   [[ -z "$_name" ]] && return
   echo ""
-  python3 "$(_clash_py)" --base "$(_clash_dir)" show "$_name" || return
+  _clash_query show "$_name" || return
   echo ""
   _clash_print_url "$_name"
 }
 
 # 子菜单：新增
 _clash_menu_add() {
+  print_header "Clash 新增订阅"
   local _name
   ask _name "订阅名称（如 vip / cheap）"
   [[ -z "$_name" ]] && { warn "已取消"; return; }
@@ -425,10 +432,12 @@ _clash_menu_add() {
   local -a _originals=("" "" "" "" "" "")
   local -a _defs_keys=(traffic_gb reset_day "" interval "" external_url)
   declare -A _defs_kv=()
+  local _field_snapshot
+  _field_snapshot=$(_clash_query field-values) || return 1
   while IFS= read -r _line; do
     [[ -z "$_line" ]] && continue
     _defs_kv[${_line%%=*}]=${_line#*=}
-  done < <(python3 "$(_clash_py)" --base "$(_clash_dir)" field-values 2>/dev/null)
+  done <<< "$_field_snapshot"
   local _i
   for (( _i=0; _i<${#_defs_keys[@]}; _i++ )); do
     local _k="${_defs_keys[$_i]}" _v=""
@@ -472,9 +481,9 @@ _clash_field_originals_from() {
   # 拉一次 field-values
   local _raw
   if [[ -n "$_name" ]]; then
-    _raw=$(python3 "$(_clash_py)" --base "$(_clash_dir)" field-values --name "$_name" 2>/dev/null) || _raw=""
+    _raw=$(_clash_query field-values --name "$_name" ) || return 1
   else
-    _raw=$(python3 "$(_clash_py)" --base "$(_clash_dir)" field-values 2>/dev/null) || _raw=""
+    _raw=$(_clash_query field-values ) || return 1
   fi
 
   # key=value 解析进关联数组
@@ -588,10 +597,11 @@ _clash_field_loop() {
 
 # 子菜单：编辑
 _clash_menu_edit() {
+  print_header "Clash 编辑订阅"
   local _name
   _clash_pick_one "选择要编辑的订阅" _name || return
   [[ -z "$_name" ]] && { warn "已取消"; return; }
-  python3 "$(_clash_py)" --base "$(_clash_dir)" show "$_name" || return
+  _clash_query show "$_name" || return
 
   local -a _labels=(
     "新名称"
@@ -611,7 +621,7 @@ _clash_menu_edit() {
   local -a _originals=("" "" "" "" "" "" "" "")
   _clash_field_originals_from \
     "rename,traffic_gb,reset_day,expire,interval,password,port,external_url" \
-    --name "$_name" _originals
+    --name "$_name" _originals || return 1
 
   if ! _clash_field_loop _values _labels "回车顺延到下一项 / 0 完成保存" _hints _originals; then
     info "未修改任何字段"
@@ -636,6 +646,7 @@ _clash_menu_edit() {
 
 # 子菜单：删除
 _clash_menu_remove() {
+  print_header "Clash 删除订阅"
   local _name _yn
   _clash_pick_one "选择要删除的订阅" _name || return
   [[ -z "$_name" ]] && { warn "已取消"; return; }
@@ -649,9 +660,10 @@ _clash_menu_remove() {
 
 # 子菜单：默认值
 _clash_menu_defaults() {
-  python3 "$(_clash_py)" --base "$(_clash_dir)" defaults
+  print_header "Clash 默认值"
+  _clash_query defaults || return 1
   local _old_s
-  _old_s=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting stats_refresh_minutes 2>/dev/null)
+  _old_s=$(_clash_query get-setting stats_refresh_minutes) || return 1
 
   local -a _labels=(
     "默认流量 GB"
@@ -676,7 +688,7 @@ _clash_menu_defaults() {
   local -a _originals=("" "" "" "" "" "" "" "" "" "")
   _clash_field_originals_from \
     "traffic_gb,reset_day,expire_days,interval,stats_refresh_minutes,port_min,port_max,external_url,external_name_prefix,static_name_prefix" \
-    _originals
+    _originals || return 1
 
   if ! _clash_field_loop _values _labels "回车顺延到下一项 / 0 完成保存" _hints _originals; then
     info "未修改任何字段"
@@ -687,7 +699,7 @@ _clash_menu_defaults() {
   for (( i=0; i<${#_labels[@]}; i++ )); do
     [[ -n "${_values[$i]}" ]] && _args+=("${_flags[$i]}" "${_values[$i]}")
   done
-  python3 "$(_clash_py)" --base "$(_clash_dir)" "${_args[@]}"
+  python3 "$(_clash_py)" --base "$(_clash_dir)" "${_args[@]}" || return 1
   # stats_refresh_minutes 改了 → 重写 timer unit + restart
   local _new_s="${_values[4]}"
   if [[ -n "$_new_s" && "$_new_s" != "$_old_s" ]]; then
@@ -699,14 +711,15 @@ _clash_menu_defaults() {
 # 与 [5] 默认值菜单中的 stats_refresh_minutes 同源；0 = 关闭 timer
 _clash_menu_auto_refresh() {
   while true; do
+    print_header "Clash 自动刷新设置"
     local _mode _interval _daily_time _force _cache_hours _timer_st
-    _mode=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_mode 2>/dev/null || echo "interval")
-    _interval=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting stats_refresh_minutes 2>/dev/null || echo 10)
-    _daily_time=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting daily_refresh_time 2>/dev/null || echo "03:00")
-    _force=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_force_recheck 2>/dev/null || echo "false")
-    _cache_hours=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting ip_quality_cache_hours 2>/dev/null || echo 24)
-    [[ "$_interval" =~ ^[0-9]+$ ]] || _interval=10
-    [[ "$_cache_hours" =~ ^[0-9]+$ ]] || _cache_hours=24
+    _mode=$(_clash_query get-setting refresh_mode) || return 1
+    _interval=$(_clash_query get-setting stats_refresh_minutes) || return 1
+    _daily_time=$(_clash_query get-setting daily_refresh_time) || return 1
+    _force=$(_clash_query get-setting refresh_force_recheck) || return 1
+    _cache_hours=$(_clash_query get-setting ip_quality_cache_hours) || return 1
+    [[ "$_interval" =~ ^[0-9]+$ ]] || { warn "刷新间隔无效"; return 1; }
+    [[ "$_cache_hours" =~ ^[0-9]+$ ]] || { warn "缓存时长无效"; return 1; }
 
     # 刷新模式显示
     local _mode_show
@@ -718,11 +731,13 @@ _clash_menu_auto_refresh() {
     esac
 
     # timer 状态
-    if systemctl is-active clash-subs-stats.timer &>/dev/null; then
-      _timer_st="${G}active${N}"
-    else
-      _timer_st="${DIM}inactive${N}"
-    fi
+    local _timer_state
+    _timer_state=$(howe_query "Clash timer 状态" 5 systemctl show clash-subs-stats.timer --property=ActiveState --value) || return 1
+    case "$_timer_state" in
+      active) _timer_st="${G}active${N}" ;;
+      inactive|failed|activating|deactivating) _timer_st="${DIM}${_timer_state}${N}" ;;
+      *) warn "timer 状态未知, 停止修改"; return 1 ;;
+    esac
 
     # 强制重检测显示
     local _force_show
@@ -764,7 +779,7 @@ _clash_menu_auto_refresh() {
 # 自动刷新策略子菜单辅助函数
 _refresh_switch_mode() {
   local _cur
-  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_mode 2>/dev/null || echo "interval")
+  _cur=$(_clash_query get-setting refresh_mode) || return 1
   echo ""
   echo -e "  当前模式: ${W}${_cur}${N}"
   echo -e "  ${W}[1]${N} interval (间隔) - 每 N 分钟刷新一次"
@@ -783,7 +798,7 @@ _refresh_switch_mode() {
   if [[ "$_new" == "$_cur" ]]; then
     info "未变更"
   else
-    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --refresh-mode "$_new" >/dev/null
+    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --refresh-mode "$_new" >/dev/null || return 1
     setup_clash_stats_timer
     info "刷新模式已切换为: $_new"
   fi
@@ -791,7 +806,7 @@ _refresh_switch_mode() {
 
 _refresh_set_interval() {
   local _cur
-  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting stats_refresh_minutes 2>/dev/null || echo 10)
+  _cur=$(_clash_query get-setting stats_refresh_minutes) || return 1
   local _v
   ask _v "间隔分钟数（当前 ${_cur}）"
   if [[ -z "$_v" ]]; then
@@ -801,7 +816,7 @@ _refresh_set_interval() {
   elif [[ "$_v" == "$_cur" ]]; then
     info "未变更"
   else
-    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --stats-refresh-minutes "$_v" >/dev/null
+    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --stats-refresh-minutes "$_v" >/dev/null || return 1
     setup_clash_stats_timer
     info "刷新间隔已设置为: $_v 分钟"
   fi
@@ -809,7 +824,7 @@ _refresh_set_interval() {
 
 _refresh_set_daily_time() {
   local _cur
-  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting daily_refresh_time 2>/dev/null || echo "03:00")
+  _cur=$(_clash_query get-setting daily_refresh_time) || return 1
   local _v
   ask _v "每天刷新时间 HH:MM（当前 ${_cur}）"
   if [[ -z "$_v" ]]; then
@@ -819,7 +834,7 @@ _refresh_set_daily_time() {
   elif [[ "$_v" == "$_cur" ]]; then
     info "未变更"
   else
-    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --daily-refresh-time "$_v" >/dev/null
+    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --daily-refresh-time "$_v" >/dev/null || return 1
     setup_clash_stats_timer
     info "日刷新时间已设置为: 每天 $_v"
   fi
@@ -827,7 +842,7 @@ _refresh_set_daily_time() {
 
 _refresh_toggle_force_recheck() {
   local _cur
-  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting refresh_force_recheck 2>/dev/null || echo "false")
+  _cur=$(_clash_query get-setting refresh_force_recheck) || return 1
   local _new
   if [[ "$_cur" == "true" ]]; then
     _new="false"
@@ -836,13 +851,13 @@ _refresh_toggle_force_recheck() {
     _new="true"
     info "定时刷新将强制重新检测所有 IP 质量（慢，更准确）"
   fi
-  python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --refresh-force-recheck "$_new" >/dev/null
+  python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --refresh-force-recheck "$_new" >/dev/null || return 1
   setup_clash_stats_timer
 }
 
 _refresh_set_cache_hours() {
   local _cur
-  _cur=$(python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting ip_quality_cache_hours 2>/dev/null || echo 24)
+  _cur=$(_clash_query get-setting ip_quality_cache_hours) || return 1
   local _v
   ask _v "IP 质量缓存有效期（小时，当前 ${_cur}）"
   if [[ -z "$_v" ]]; then
@@ -852,7 +867,7 @@ _refresh_set_cache_hours() {
   elif [[ "$_v" == "$_cur" ]]; then
     info "未变更"
   else
-    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --ip-quality-cache-hours "$_v" >/dev/null
+    python3 "$(_clash_py)" --base "$(_clash_dir)" defaults --ip-quality-cache-hours "$_v" >/dev/null || return 1
     info "IP 质量缓存有效期已设置为: $_v 小时"
   fi
 }
@@ -871,8 +886,9 @@ _clash_menu_refresh() {
 
 # 节点入口只影响客户端订阅, 不重写服务端 TLS 配置或重启 sing-box.
 _clash_menu_node_endpoint() {
+  print_header "Clash 节点入口"
   echo ""
-  python3 "$(_clash_py)" --base "$(_clash_dir)" node-endpoint || return 1
+  _clash_query node-endpoint || return 1
   info "稳定域名须直达 VPS 的节点端口; 修改入口会保留现有 SNI"
   local _from _server _apply
   ask _from "要修改的原 server (空回车取消)" || return 1
@@ -908,8 +924,9 @@ _static_input_hint() {
 # 把"全局默认"+所有订阅打成一个编号列表，只输一次编号就锁定目标
 # 输出变量：STATIC_TARGET="" 表示默认；非空表示订阅名
 _static_pick_target() {
+  print_header "Clash 静态资源 — 选择范围"
   local _names
-  _names=$(python3 "$(_clash_py)" --base "$(_clash_dir)" list --names 2>/dev/null)
+  _names=$(_clash_query list --names) || return 1
   echo ""
   echo -e "  ${W}选择操作目标${N}"
   echo -e "    ${W}[1]${N} 全局默认池（所有订阅未自填时继承）"
@@ -946,9 +963,9 @@ _static_menu_list() {
   _static_pick_target || return
   echo ""
   if [[ -z "$STATIC_TARGET" ]]; then
-    python3 "$(_clash_py)" --base "$(_clash_dir)" static-list
+    _clash_query static-list || return 1
   else
-    python3 "$(_clash_py)" --base "$(_clash_dir)" static-list --name "$STATIC_TARGET"
+    _clash_query static-list --name "$STATIC_TARGET" || return 1
   fi
 }
 
@@ -998,9 +1015,9 @@ _static_menu_remove() {
   _static_pick_target || return
   echo ""
   if [[ -z "$STATIC_TARGET" ]]; then
-    python3 "$(_clash_py)" --base "$(_clash_dir)" static-list
+    _clash_query static-list || return 1
   else
-    python3 "$(_clash_py)" --base "$(_clash_dir)" static-list --name "$STATIC_TARGET"
+    _clash_query static-list --name "$STATIC_TARGET" || return 1
   fi
   echo ""
   echo -e "  ${DIM}多个编号用空格或逗号分隔，例如：1 3 / 1,3 / 1-5 (区间)${N}"
@@ -1042,9 +1059,9 @@ _static_menu_remove() {
   echo -e "  ${W}── 即将删除 ──${N}"
   local _list
   if [[ -z "$STATIC_TARGET" ]]; then
-    _list=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list 2>&1)
+    _list=$(_clash_query static-list) || return 1
   else
-    _list=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list --name "$STATIC_TARGET" 2>&1)
+    _list=$(_clash_query static-list --name "$STATIC_TARGET") || return 1
   fi
   echo "$_list" | awk -v IDS="$_expanded" 'BEGIN{n=split(IDS,a," "); for(i=1;i<=n;i++) keep[a[i]]=1}
     /^  [0-9]+ / { if(keep[$1]) print "  -> "$0 }'
@@ -1064,9 +1081,9 @@ _static_menu_modify() {
   echo ""
   local _list
   if [[ -z "$STATIC_TARGET" ]]; then
-    _list=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list)
+    _list=$(_clash_query static-list) || return 1
   else
-    _list=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list --name "$STATIC_TARGET")
+    _list=$(_clash_query static-list --name "$STATIC_TARGET") || return 1
   fi
   echo "$_list"
   echo ""
@@ -1217,13 +1234,15 @@ _static_print_overview() {
   local _kv _line
   echo -e "  ${W}── 全局默认 ──${N}"
   declare -A _g=()
+  local _field_snapshot
+  _field_snapshot=$(_clash_query field-values) || return 1
   while IFS= read -r _line; do
     [[ -z "$_line" ]] && continue
     _g[${_line%%=*}]=${_line#*=}
-  done < <(python3 "$(_clash_py)" --base "$(_clash_dir)" field-values 2>/dev/null)
+  done <<< "$_field_snapshot"
   local _g_pool_n
-  _g_pool_n=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list 2>/dev/null \
-              | awk 'NR==1{print $0}')
+  _g_pool_n=$(_clash_query static-list) || return 1
+  _g_pool_n=${_g_pool_n%%$'\n'*}
   printf "    策略       : %s\n"   "${_g[static_strategy]:-?}"
   printf "    服务包     : %s\n"   "${_g[static_service_packs]:-(空)}"
   printf "    自定义关键词: %s\n"  "${_g[static_custom_keywords]:-(空)}"
@@ -1231,7 +1250,7 @@ _static_print_overview() {
   echo ""
   # 各订阅
   local _names
-  _names=$(python3 "$(_clash_py)" --base "$(_clash_dir)" list --names 2>/dev/null)
+  _names=$(_clash_query list --names) || return 1
   if [[ -z "$_names" ]]; then
     echo -e "  ${DIM}(尚无订阅)${N}"
     return
@@ -1241,13 +1260,15 @@ _static_print_overview() {
   while IFS= read -r _n; do
     [[ -z "$_n" ]] && continue
     declare -A _s=()
+    local _field_snapshot
+    _field_snapshot=$(_clash_query field-values --name "$_n") || return 1
     while IFS= read -r _line; do
       [[ -z "$_line" ]] && continue
       _s[${_line%%=*}]=${_line#*=}
-    done < <(python3 "$(_clash_py)" --base "$(_clash_dir)" field-values --name "$_n" 2>/dev/null)
+    done <<< "$_field_snapshot"
     local _pool
-    _pool=$(python3 "$(_clash_py)" --base "$(_clash_dir)" static-list --name "$_n" 2>/dev/null \
-            | awk 'NR==1{print $0}')
+    _pool=$(_clash_query static-list --name "$_n") || return 1
+    _pool=${_pool%%$'\n'*}
     printf "    %-16s 策略=%s  服务包=%s  关键词=%s  资源=%s\n" \
       "$_n" \
       "${_s[static_strategy]:-?}" \
@@ -1270,10 +1291,13 @@ _static_menu_strategy() {
   local _line
   local -a _fv_args=(field-values)
   [[ -n "$_target" ]] && _fv_args+=(--name "$_target")
+  printf '  正在读取静态 IP 策略...\n' >&2
+  local _field_snapshot
+  _field_snapshot=$(_clash_query "${_fv_args[@]}") || return 1
   while IFS= read -r _line; do
     [[ -z "$_line" ]] && continue
     _cur[${_line%%=*}]=${_line#*=}
-  done < <(python3 "$(_clash_py)" --base "$(_clash_dir)" "${_fv_args[@]}" 2>/dev/null)
+  done <<< "$_field_snapshot"
 
   # 待提交值（空 = 不修改；"-" = 清空回继承）
   local _strat="" _packs="" _kws=""
@@ -1445,7 +1469,7 @@ _clash_menu_static() {
   _STATIC_QUIT=0
   while true; do
     print_header "静态 IP 资源管理"
-    _static_print_overview
+    _static_print_overview || return 1
     echo ""
     echo -e "    ${W}[1]${N} 编辑策略 / 服务包 / 关键词（默认 或 某订阅）"
     echo -e "    ${W}[2]${N} 列出资源（生效池）"
@@ -1482,7 +1506,7 @@ _clash_menu_static() {
 # ═══════════════════════════════════════════════════════════════════
 
 _quality_get() {
-  python3 "$(_clash_py)" --base "$(_clash_dir)" get-setting "$1" 2>/dev/null
+  _clash_query get-setting "$1"
 }
 
 _quality_set() {
@@ -1491,9 +1515,9 @@ _quality_set() {
 
 _quality_toggle() {
   local _key=$1 _label=$2
-  local _cur; _cur=$(_quality_get "$_key")
+  local _cur; _cur=$(_quality_get "$_key") || return 1
   local _new; [[ "$_cur" == "on" ]] && _new="off" || _new="on"
-  _quality_set "--${_key//_/-}" "$_new"
+  _quality_set "--${_key//_/-}" "$_new" || return 1
   info "${_label} 已切换为 ${_new}"
 }
 
@@ -1523,7 +1547,7 @@ _quality_set_source() {
 }
 
 _quality_set_scamalytics_url() {
-  local _cur; _cur=$(_quality_get scamalytics_url)
+  local _cur; _cur=$(_quality_get scamalytics_url) || return 1
   echo ""
   echo -e "  ${W}录入 scamalytics 完整查询 URL${N}"
   echo -e "  ${DIM}格式示例：https://api12.scamalytics.com/v3/?key=XXX&user=YYY${N}"
@@ -1545,7 +1569,7 @@ _quality_set_scamalytics_url() {
 }
 
 _quality_set_proxycheck_key() {
-  local _cur; _cur=$(_quality_get proxycheck_api_key)
+  local _cur; _cur=$(_quality_get proxycheck_api_key) || return 1
   echo ""
   echo -e "  ${W}录入 proxycheck.io API key（可选，免费注册升级到 1000/天）${N}"
   echo -e "  ${DIM}注册地址：https://proxycheck.io/dashboard${N}"
@@ -1585,9 +1609,9 @@ _clash_menu_quality_check() {
   while true; do
     print_header "Clash 订阅管理 / IP 检测 / 风险评分开关"
     local _en _self _sta
-    _en=$(_quality_get quality_check_enabled)
-    _self=$(_quality_get quality_check_for_self)
-    _sta=$(_quality_get quality_check_for_static)
+    _en=$(_quality_get quality_check_enabled) || return 1
+    _self=$(_quality_get quality_check_for_self) || return 1
+    _sta=$(_quality_get quality_check_for_static) || return 1
     local _onoff
     _onoff() { [[ "$1" == "on" ]] && echo "${G}on${N}" || echo "${DIM}off${N}"; }
     echo ""
@@ -1616,9 +1640,9 @@ _clash_menu_exit_ip_show() {
   while true; do
     print_header "Clash 订阅管理 / IP 检测 / 出口 IP 显示开关"
     local _en _self _sta
-    _en=$(_quality_get exit_ip_show_enabled)
-    _self=$(_quality_get exit_ip_show_for_self)
-    _sta=$(_quality_get exit_ip_show_for_static)
+    _en=$(_quality_get exit_ip_show_enabled) || return 1
+    _self=$(_quality_get exit_ip_show_for_self) || return 1
+    _sta=$(_quality_get exit_ip_show_for_static) || return 1
     local _onoff
     _onoff() { [[ "$1" == "on" ]] && echo "${G}on${N}" || echo "${DIM}off${N}"; }
     echo ""
@@ -1647,9 +1671,9 @@ _clash_menu_quality_source() {
   while true; do
     print_header "Clash 订阅管理 / IP 检测 / 数据源配置"
     local _src _scama _proxy
-    _src=$(_quality_get quality_source)
-    _scama=$(_quality_get scamalytics_url)
-    _proxy=$(_quality_get proxycheck_api_key)
+    _src=$(_quality_get quality_source) || return 1
+    _scama=$(_quality_get scamalytics_url) || return 1
+    _proxy=$(_quality_get proxycheck_api_key) || return 1
     local _src_show
     case "$_src" in
       scamalytics)   _src_show="${G}scamalytics${N}（5K/月）" ;;

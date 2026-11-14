@@ -309,8 +309,10 @@ _settings_change_root() {
   local _cur; _cur=$(backup_root)
   echo -e "  当前路径：${C}$_cur${N}"
   if [[ -d "$_cur" ]]; then
-    local _used; _used=$(du -sb "$_cur" 2>/dev/null | awk '{print $1}')
-    echo -e "  已占用：$(_bk_human "${_used:-0}")"
+    local _used
+    _used=$(howe_query "备份迁移目录占用" 8 du -sb "$_cur") || { warn "目录占用未知, 已阻止修改存储路径"; return 1; }
+    _used=${_used%%[[:space:]]*}
+    echo -e "  已占用：$(_bk_human "$_used")"
   fi
   echo ""
   echo -e "  ${DIM}修改后会把已有备份点 mv 到新路径${N}"
@@ -411,10 +413,10 @@ _settings_timer() {
     _enabled=$(backup_conf_get TIMER_ENABLED "$BACKUP_TIMER_ENABLED_DEFAULT")
     _schedule=$(backup_conf_get TIMER_SCHEDULE "$BACKUP_TIMER_SCHEDULE_DEFAULT")
     _ds=$(backup_conf_get DEFAULT_SCOPES "$BACKUP_DEFAULT_SCOPES_DEFAULT")
-    _status=$(backup_timer_status)
-    _next=$(backup_timer_next_run)
+    _status=$(backup_timer_status) || { warn "timer 状态未知, 已阻止定时任务修改"; return 1; }
+    _next=$(backup_timer_next_run) || { warn "timer 下次触发时间未知, 已阻止定时任务修改"; return 1; }
 
-    echo -e "  ${W}启用状态${N}：${C}$_enabled${N} （systemd: ${_status:-inactive}）"
+    echo -e "  ${W}启用状态${N}：${C}$_enabled${N} （systemd: ${_status}）"
     echo -e "  ${W}频率${N}    ：${C}$_schedule${N}"
     echo -e "  ${W}范围${N}    ：${C}${_ds:-（空）}${N} ${DIM}（来自上一级「默认备份范围」）${N}"
     [[ -n "$_next" ]] && echo -e "  ${W}下次触发${N}：${C}$_next${N}"
@@ -469,11 +471,21 @@ backup_action_settings() {
     echo -e "  ${W}保留份数${N}      ：${C}${_keep}${N}"
     echo -e "  ${W}存储路径${N}      ：${C}${_root}${N}"
     if [[ -d "$_root" ]]; then
-      local _used; _used=$(du -sb "$_root" 2>/dev/null | awk '{print $1}')
-      echo -e "  ${W}已占用${N}        ：$(_bk_human "${_used:-0}")"
+      local _used
+      if _used=$(howe_query "备份目录占用" 8 du -sb "$_root"); then
+        _used=${_used%%[[:space:]]*}
+        echo -e "  ${W}已占用${N}        ：$(_bk_human "$_used")"
+      else
+        warn "备份目录占用未知"
+      fi
     fi
-    local _free; _free=$(df -B1 "${_root%/*}" 2>/dev/null | awk 'NR==2{print $4}')
-    [[ -n "$_free" ]] && echo -e "  ${W}可用空间${N}      ：$(_bk_human "$_free")"
+    local _free _disk
+    if _disk=$(howe_query "备份磁盘可用空间" 5 df -B1 "${_root%/*}"); then
+      _free=$(awk 'NR==2{print $4}' <<< "$_disk")
+      [[ -n "$_free" ]] && echo -e "  ${W}可用空间${N}      ：$(_bk_human "$_free")"
+    else
+      warn "备份磁盘可用空间未知"
+    fi
     echo -e "  ${W}默认备份范围${N}  ：${C}${_ds:-（未设置）}${N}"
     echo -e "  ${DIM}                  立即备份预选 / 升级前备份 / 定时备份 都用这个${N}"
     echo -e "  ${W}升级前自动备份${N}：${C}${_au}${N}"
@@ -497,7 +509,8 @@ backup_action_settings() {
       4) _settings_timer ;;
       5)
         print_header "应用保留策略"
-        local _removed; _removed=$(backup_apply_retention "$_keep")
+        local _removed
+        _removed=$(backup_apply_retention "$_keep") || { warn "保留策略执行失败"; return 1; }
         log "已清理 ${_removed} 个超量备份点"
         echo ""; read -erp "  按回车继续..." _
         ;;
@@ -513,7 +526,15 @@ backup_menu() {
     echo ""
 
     local _count=0
-    [[ -d "$BACKUP_ROOT" ]] && _count=$(ls -1 "$BACKUP_ROOT" 2>/dev/null | wc -l)
+    if [[ -d "$BACKUP_ROOT" ]]; then
+      local _listing
+      if _listing=$(howe_query "备份点列表" 8 ls -1 "$BACKUP_ROOT"); then
+        [[ -n "$_listing" ]] && _count=$(printf '%s\n' "$_listing" | wc -l)
+      else
+        warn "备份目录不可读取, 已阻止备份恢复和删除操作"
+        return 1
+      fi
+    fi
     echo -e "  ${W}备份目录${N}：${C}${BACKUP_ROOT}${N}"
     echo -e "  ${W}已有备份${N}：${C}${_count}${N} 个备份点"
     echo ""

@@ -5,7 +5,7 @@ IPV6_ADDRESS=""
 
 _query_public_ip() {
   local family=$1 address
-  address=$(curl "-${family}" --noproxy '*' -fsS --connect-timeout 3 --max-time 5 "$URL_PUBLIC_IP") || return 1
+  address=$(curl "-${family}" --noproxy '*' -fsS --connect-timeout 3 --max-time 5 "$URL_PUBLIC_IP") || return $?
   python3 - "$family" "$address" <<'PY'
 import ipaddress
 import sys
@@ -22,13 +22,30 @@ PY
 }
 
 detect_public_ips() {
-  if ! PUBLIC_IP=$(_query_public_ip 4); then
+  local status
+  printf '  公网 IPv4: 查询中...\n' >&2
+  if PUBLIC_IP=$(_query_public_ip 4); then
+    printf '  公网 IPv4: 查询成功\n' >&2
+  else
+    status=$?
     PUBLIC_IP=""
-    printf '公网 IPv4 未获取, 请检查网络或探测服务.\n' >&2
+    if (( status == 28 )); then
+      printf '  公网 IPv4: 查询超时, 地址未知.\n' >&2
+    else
+      printf '  公网 IPv4: 查询失败, 地址未知 (退出码 %s).\n' "$status" >&2
+    fi
   fi
-  if ! IPV6_ADDRESS=$(_query_public_ip 6); then
+  printf '  公网 IPv6: 查询中...\n' >&2
+  if IPV6_ADDRESS=$(_query_public_ip 6); then
+    printf '  公网 IPv6: 查询成功\n' >&2
+  else
+    status=$?
     IPV6_ADDRESS=""
-    printf '公网 IPv6 未获取, 可能未配置 IPv6 或探测失败.\n' >&2
+    if (( status == 28 )); then
+      printf '  公网 IPv6: 查询超时, 地址未知.\n' >&2
+    else
+      printf '  公网 IPv6: 查询失败或未配置, 地址未知 (退出码 %s).\n' "$status" >&2
+    fi
   fi
 }
 

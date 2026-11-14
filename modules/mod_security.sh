@@ -497,9 +497,8 @@ f2b_status() {
     warn "fail2ban 未安装"
     return 1
   fi
-  fail2ban-client reload 2>/dev/null
-  sleep 1
-  fail2ban-client status
+  section "fail2ban 状态"
+  howe_query "fail2ban 状态" 10 fail2ban-client status
 }
 
 # ── Docker 容器端口访问控制 ──────────────────────────────────────

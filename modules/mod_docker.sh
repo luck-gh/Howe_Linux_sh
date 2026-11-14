@@ -45,13 +45,13 @@ ensure_docker() {
 # ── 容器管理 ─────────────────────────────────────────────────────
 
 docker_container_menu() {
-  ensure_docker || return 1
+  command -v docker >/dev/null 2>&1 || { warn "Docker 未安装, 请先从 Docker 主菜单安装"; return 1; }
 
   while true; do
     clear
     echo -e "${W}Docker 容器管理${N}"
     echo "  ─────────────────────────────────────────────"
-    docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null
+    howe_query "Docker 容器列表" 10 docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" || { break_end; return 1; }
     echo "  ─────────────────────────────────────────────"
     echo ""
     echo "  1. 启动容器              5. 启动所有容器"
@@ -118,13 +118,13 @@ _show_container_networks() {
 # ── 镜像管理 ─────────────────────────────────────────────────────
 
 docker_image_menu() {
-  ensure_docker || return 1
+  command -v docker >/dev/null 2>&1 || { warn "Docker 未安装, 请先从 Docker 主菜单安装"; return 1; }
 
   while true; do
     clear
     echo -e "${W}Docker 镜像管理${N}"
     echo "  ─────────────────────────────────────────────"
-    docker image ls 2>/dev/null
+    howe_query "Docker 镜像列表" 10 docker image ls || { break_end; return 1; }
     echo "  ─────────────────────────────────────────────"
     echo ""
     echo "  1. 拉取镜像"
@@ -154,7 +154,7 @@ docker_network_menu() {
     clear
     echo -e "${W}Docker 网络管理${N}"
     echo "  ─────────────────────────────────────────────"
-    docker network ls 2>/dev/null
+    howe_query "Docker 网络列表" 10 docker network ls || { break_end; return 1; }
     echo "  ─────────────────────────────────────────────"
     echo ""
     echo "  1. 查看网络详情"
@@ -237,10 +237,16 @@ mod_docker_main() {
 
     # 显示 Docker 状态
     if command -v docker &>/dev/null; then
-      local ver=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
-      local running=$(docker ps -q 2>/dev/null | wc -l)
-      local total=$(docker ps -a -q 2>/dev/null | wc -l)
-      echo -e "  Docker ${G}v${ver}${N}  运行中: ${G}${running}${N}  总计: ${total}"
+      local ver containers running total
+      if ! ver=$(howe_query "Docker 版本" 5 docker --version) ||
+         ! containers=$(howe_query "Docker 容器状态" 10 docker ps -a --format '{{.State}}'); then
+        warn "Docker 状态未知, 本轮不提供管理操作"
+        break_end
+        return 1
+      fi
+      running=$(printf '%s\n' "$containers" | awk '$0=="running" {n++} END {print n+0}')
+      total=$(printf '%s\n' "$containers" | awk 'NF {n++} END {print n+0}')
+      echo -e "  ${ver}  运行中: ${G}${running}${N}  总计: ${total}"
     else
       echo -e "  Docker ${R}未安装${N}"
     fi
@@ -250,6 +256,7 @@ mod_docker_main() {
     echo "  2. 镜像管理"
     echo "  3. 网络管理"
     echo "  4. IPv6 开关"
+    echo "  5. 安装 Docker"
     echo "  ─────────────────"
     echo "  0. 返回主菜单"
     echo ""
@@ -261,6 +268,7 @@ mod_docker_main() {
       2) docker_image_menu ;;
       3) docker_network_menu ;;
       4) docker_ipv6_toggle; break_end ;;
+      5) ensure_docker; break_end ;;
       0|*) break ;;
     esac
   done

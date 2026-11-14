@@ -63,8 +63,11 @@ main() {
   fi
 
   # 交互模式
+  section "Howe Linux 管理工具箱 — 初始化"
+  printf '  系统与公网地址: 查询中...\n' >&2
   detect_distro
   detect_public_ips
+  printf '  系统与公网地址查询已结束; 未获取的地址保持未知.\n' >&2
 
   while true; do
     clear
@@ -109,4 +112,6 @@ main() {
   done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

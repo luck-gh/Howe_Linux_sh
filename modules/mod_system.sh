@@ -129,6 +129,7 @@ manage_swap() {
 # ── 系统信息展示 ─────────────────────────────────────────────────
 show_system_info() {
   section "系统信息"
+  printf '  正在读取系统信息 (CPU 使用率采样约 1 秒)...\n' >&2
 
   get_network_traffic
 

@@ -1019,8 +1019,10 @@ backup_apply_retention() {
   declare -A keep_ts
 
   # 先把每个 scope 在每个备份点出现的时间戳列出来
-  local d ts
-  for d in $(ls -1 "$BACKUP_ROOT" 2>/dev/null | sort -r); do
+  local d ts listing
+  # 两轮必须使用同一份成功读取的目录, 避免首轮读取失败后将全部备份误删.
+  listing=$(timeout 8 ls -1 "$BACKUP_ROOT") || return $?
+  for d in $(printf '%s\n' "$listing" | sort -r); do
     [[ -d "$BACKUP_ROOT/$d" ]] || continue
     ts=$d
     for f in "$BACKUP_ROOT/$d"/*.tar.gz; do
@@ -1035,7 +1037,7 @@ backup_apply_retention() {
 
   # 删除：备份点目录内没有任何 scope 仍在保留集合中的 → 整个删
   local removed=0
-  for d in $(ls -1 "$BACKUP_ROOT" 2>/dev/null); do
+  for d in $listing; do
     [[ -d "$BACKUP_ROOT/$d" ]] || continue
     if [[ -z "${keep_ts[$d]:-}" ]]; then
       rm -rf "$BACKUP_ROOT/$d"
@@ -1133,12 +1135,17 @@ backup_timer_disable() {
 
 # 查询 timer 状态
 backup_timer_status() {
-  systemctl is-active "${BACKUP_TIMER_NAME}.timer" 2>/dev/null
+  local _state
+  _state=$(howe_query "备份 timer 状态" 5 systemctl show "${BACKUP_TIMER_NAME}.timer" --property=ActiveState --value) || return $?
+  case "$_state" in
+    active|inactive|failed|activating|deactivating) printf '%s\n' "$_state" ;;
+    *) return 2 ;;
+  esac
 }
 
 # 下次触发时间
 backup_timer_next_run() {
-  systemctl list-timers --all 2>/dev/null | awk -v t="${BACKUP_TIMER_NAME}.timer" '$NF==t{for(i=1;i<=4;i++)printf "%s ",$i; print ""}' | sed 's/ *$//'
+  howe_query "备份 timer 下次触发" 5 systemctl show "${BACKUP_TIMER_NAME}.timer" --property=NextElapseUSecRealtime --value
 }
 
 # ── 升级 hook：迁移到新存储路径 ──────────────────────────────────

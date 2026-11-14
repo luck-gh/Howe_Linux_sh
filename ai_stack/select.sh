@@ -23,7 +23,7 @@ select_services() {
   )
   local _cnt=${#SVCS[@]}
 
-  detect_installed_services
+  detect_installed_services || return 1
 
   # SEL 默认勾选 = 当前 INST_*（detect 已同步真实状态 + .env 历史值）
   # 这样"安装 / 更新"路径下，用户只需勾选"想新增/想去掉"的项；什么都不改回车就是"保持现状"。

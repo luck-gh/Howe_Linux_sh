@@ -81,6 +81,7 @@ socket.socket.connect_ex = denied
         script = r'''
 set -uo pipefail
 source "$MENU_SHELL"
+howe_query() { shift 2; "$@"; }
 BASE_DIR=$MENU_BASE; _AI_STACK_DIR=$MENU_REPO
 INST_SINGBOX=true; INST_CADDY=false
 DOMAIN=example.com; PREFIX_VPS=sub; VPS_IP=192.0.2.10
@@ -143,6 +144,22 @@ class ClashMenuTests(unittest.TestCase):
         self.assertNotIn('MUTATION_FORBIDDEN', trace)
         self.assertNotIn('EXTERNAL_FORBIDDEN', trace)
 
+    def test_failed_settings_read_blocks_refresh_and_quality_actions(self):
+        for action in ('_clash_menu_auto_refresh', '_refresh_toggle_force_recheck',
+                       '_quality_toggle quality_check_enabled test', '_clash_menu_quality_check'):
+            with self.subTest(action=action):
+                result, trace = self.fixture.run('python3() { return 9; }; '+action, '1\n')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(line.startswith('SYSTEMCTL') for line in trace))
+                self.assertFalse(any(line.startswith('PROMPT') for line in trace))
+
+    def test_failed_originals_read_does_not_create_edit_defaults(self):
+        result, trace = self.fixture.run(
+            'python3() { return 9; }; originals=(sentinel); '
+            '_clash_field_originals_from traffic_gb originals', '')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(line.startswith('PROMPT') for line in trace))
+
     def test_menu_reads_changed_file_on_each_entry(self):
         first, _ = self.fixture.run()
         self.fixture.subscriptions['subscriptions'][0]['traffic_gb'] = 987
@@ -179,6 +196,17 @@ class ClashMenuTests(unittest.TestCase):
         result, _ = self.fixture.run(user_input='0\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('尚无订阅', result.stdout)
+
+    def test_unknown_timer_blocks_refresh_settings(self):
+        result, trace = self.fixture.run(command=r'''
+systemctl() { echo TIMER_QUERY >> "$MENU_TRACE"; return 9; }
+setup_clash_stats_timer() { echo MUTATION_FORBIDDEN >> "$MENU_TRACE"; }
+_clash_menu_auto_refresh
+''', user_input='1\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('TIMER_QUERY', trace)
+        self.assertNotIn('MUTATION_FORBIDDEN', trace)
+        self.assertFalse(any(line.startswith('PROMPT') for line in trace))
 
     def test_missing_files_fail_without_reinitializing_or_installing(self):
         for name in ('clash_subs.py', 'defaults.yaml', 'subs.yaml', 'nodes.yaml', 'template.yaml'):
