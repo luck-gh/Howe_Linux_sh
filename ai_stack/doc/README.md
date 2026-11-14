@@ -2,6 +2,30 @@
 
 本目录(`ai_stack/doc/`)是 Clash 多订阅子系统的核心代码,部署到 `/opt/ai-stack/clash/`。
 
+## 订阅管理页的读取与同步
+
+进入管理页、查看订阅及取消编辑只读取当前磁盘配置, 不复制脚本、重写配置或部署 systemd 单元,
+不启动/重启订阅 HTTP 服务, 不运行统计流水线、质量查询或订阅渲染. 文件缺失明确停止,
+首屏读取 defaults.yaml/subs.yaml, 拒绝空文档、null 或错误顶层结构并向上传递 YAML 解析错误;
+显式 subscriptions: [] 是合法空列表. nodes.yaml/template.yaml 在浏览首屏时仅检查存在,
+不承诺已校验其内容. 不用内存缓存或旧画面掩盖错误.
+每次进入及返回列表均重新读取配置; 用量来自已有统计记录, 详情保留“统计更新于”, 不称为实时采集.
+首次安装、恢复以及用户主动选择 `[7] 同步配置` 仍走完整初始化/部署与证书校验路径;
+保存编辑后的统计、限额执行和配置更新流程不变. 仓库更新不再因浏览菜单自动覆盖已安装的 Python 脚本.
+
+隔离回归与计时入口 (只创建临时合成数据, systemctl 全部模拟, 网络调用被拒绝):
+
+```bash
+python3 -m unittest discover -s tests -p test_clash_menu.py -v
+python3 tests/test_clash_menu.py --benchmark --repetitions 5
+# 对比另存的修改前 clash.sh; 不读取真实安装目录
+python3 tests/test_clash_menu.py --benchmark --shell /private/before-clash.sh --repetitions 5
+```
+
+计时从进入管理函数到首个选择提示, 以及选择编辑到字段提示, 不计人工输入等待.
+分别记录 Python 调用、解释器/模块加载、YAML 读取和展示耗时; 不把模拟 systemctl 耗时视为生产服务延迟.
+HTTP 订阅端的 5 秒防抖不在菜单读取调用链中, 也不是进入页面必须等待的 5 秒.
+
 ## 节点入口与 DNS
 
 `nodes.yaml` 是自建节点连接地址的唯一配置来源. 首次安装可填写稳定域名或 IP;

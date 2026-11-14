@@ -330,7 +330,7 @@ _clash_print_url() {
 # 子菜单：列出（仅简表）
 _clash_menu_list() {
   echo ""
-  python3 "$(_clash_py)" --base "$(_clash_dir)" list --brief
+  python3 "$(_clash_py)" --base "$(_clash_dir)" list --brief || return 1
   echo ""
   local _host="${PREFIX_VPS:-vps}.${DOMAIN}"
   [[ -n "$DOMAIN" ]] || _host="${VPS_IP:-YOUR_IP}"
@@ -1713,13 +1713,21 @@ refresh_clash_subscription() {
     warn "未安装 sing-box，跳过"
     return 1
   fi
-  setup_clash_subscription || return 1
+  # 浏览已安装订阅不等于重新部署. 安装及 [7] 显式同步仍走完整 setup.
+  # 缺文件不能由 load_yaml 的默认值伪装成空配置; 损坏 YAML 由 list 显式报错.
+  local _file
+  for _file in clash_subs.py defaults.yaml subs.yaml nodes.yaml template.yaml; do
+    if [[ ! -f "$(_clash_dir)/$_file" ]]; then
+      warn "订阅组件不完整: 缺少 ${_file}; 请先通过 AI 服务栈安装/恢复流程修复后重试"
+      return 1
+    fi
+  done
 
   while true; do
     print_header "Clash 订阅管理"
-    _clash_menu_list
+    _clash_menu_list || return 1
     echo ""
-    echo -e "    ${W}[1]${N} 查询单条订阅（含 token / URL / 实时用量）"
+    echo -e "    ${W}[1]${N} 查询单条订阅（含 token / URL / 最近统计用量）"
     echo -e "    ${W}[2]${N} 新增订阅"
     echo -e "    ${W}[3]${N} 编辑订阅（流量 / 重置日 / 到期 / 拉取间隔 / 密码 / 端口 / 外购）"
     echo -e "    ${W}[4]${N} 删除订阅"

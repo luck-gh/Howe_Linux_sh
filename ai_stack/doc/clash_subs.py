@@ -1206,8 +1206,19 @@ def dump_yaml(path, data):
 
 
 # ─── 订阅 / 默认值读写 ─────────────────────────────────────────────
+def _read_config_section(path, key, expected_type):
+    # 已存在的外部配置须声明正确结构; 缺文件保留 init 的首次安装路径.
+    if not os.path.exists(path):
+        return expected_type()
+    with open(path) as stream:
+        data = yaml.safe_load(stream)
+    if not isinstance(data, dict) or key not in data or not isinstance(data[key], expected_type):
+        raise SystemExit(f"{os.path.basename(path)} 必须包含 {key} {expected_type.__name__}")
+    return data[key]
+
+
 def read_defaults(base):
-    d = load_yaml(paths(base)["defaults"]).get("defaults", {})
+    d = _read_config_section(paths(base)["defaults"], "defaults", dict)
     out = dict(BUILTIN_DEFAULTS)
     # list/dict 型字段拷副本，避免 BUILTIN_DEFAULTS 被外部 mutation
     for k, v in BUILTIN_DEFAULTS.items():
@@ -1228,7 +1239,7 @@ def write_defaults(base, d):
 
 
 def read_subs(base):
-    return load_yaml(paths(base)["subs"]).get("subscriptions", [])
+    return _read_config_section(paths(base)["subs"], "subscriptions", list)
 
 
 def read_subs_normalized(base):
